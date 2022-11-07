@@ -8,6 +8,7 @@ path = '/Users/hannes/fret-ibra/ibra/GCamp3_cropped2'; % Input folder path (ADD 
 fname = 'GCamp3_cropped2'; % Filename 
 h5_name = 'back.h5'; % h5 suffix
 single_channel = 1;
+bleach = 1; % Bleach correction (set to 0 if not necessary)
 stp = 1; % Start frame number
 smp = 100; % End frame number
 
@@ -44,6 +45,22 @@ if single_channel == 0
     M = h5read(read_path,'/ratio_raw'); % Ratio files
     BT1 = h5read(read_path,'/acceptor'); % Acceptor
     BT2 = h5read(read_path,'/donor'); % Donor
+    if bleach ==1 % Bleach correction with values generated in FRET-IBRA
+        try
+            bleach_corr1 = h5read(read_path, '/acceptorb');
+            for i = 1:smp
+                BT1(:,:,i) = [immultiply(BT1(:,:,i), double(bleach_corr1(i)))];
+            end
+        catch
+        end
+        try
+            bleach_corr2 = h5read(read_path, '/donorb');
+            for i = 1:smp
+                BT2(:,:,i) = [immultiply(BT2(:,:,i), double(bleach_corr2(i)))];
+            end
+        catch
+        end
+    end
 else
     M = h5read(read_path,'/acceptor');
     maxInt = max(M(:));
@@ -57,6 +74,29 @@ else
     end
     BT1 = M; BT2 = M;
 end
+
+% crop image in case of multiple PTs
+AC = BT1(:,:,smp);
+BC = mat2gray(AC);
+[temp, posfront] = imcrop(BC);
+
+T1c = [];
+T2c = [];
+T3c = [];
+
+for counter = stp:smp
+    T1 = imcrop(BT1(:,:,counter), posfront);
+    T1c(:,:,counter) = T1;
+    T2 = imcrop(BT2(:,:,counter), posfront);
+    T2c(:,:,counter) = T2;
+    T3 = imcrop(M(:,:,counter), posfront);
+    T3c(:,:,counter) = T3;
+end
+
+BT1 = uint16(T1c);
+BT2 = uint16(T2c);
+M = T3c;
+
 
 if (max(M(:)) <= 255)
     M = uint8(M);
