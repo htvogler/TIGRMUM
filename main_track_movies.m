@@ -4,7 +4,6 @@ close all
 % Path to Mat file
 path = ''; % Input folder path (ADD PATH TO FILE HERE)
 fname = 'Test'; % Filename 
-h5_name = 'back_ratio.h5'; % h5 suffix
 stp = 1; % Start frame number
 smp = 81; % End frame number
 
@@ -33,14 +32,41 @@ nkymo = 3; % Number of pixels line width average for kymograph (odd number) (0 m
 diamcutoff = 0; % In pixels if pixelsize is not given
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% Input ratio matrix
+% Detect input file and select analysis mode
 pathf = path;
-read_path = [pathf '/' fname '_' h5_name]; 
-M = h5read(read_path,'/ratio'); % Ratio files
-BT1 = h5read(read_path,'/acceptor'); % Acceptor
-BT2 = h5read(read_path,'/donor'); % Donor
+ratio_file = [pathf '/' fname '_ratio_back.h5'];
+back_file  = [pathf '/' fname '_back.h5'];
 
-if (max(M(:)) <= 255)
+if exist(ratio_file, 'file')
+    mode = 'ratio';
+    M   = h5read(ratio_file, '/ratio');
+    BT1 = h5read(ratio_file, '/acceptor');
+    BT2 = h5read(ratio_file, '/donor');
+elseif exist(back_file, 'file')
+    dnames = {h5info(back_file).Datasets.Name};
+    if any(strcmp(dnames, 'donor'))
+        mode = 'two_raw';
+        BT1 = h5read(back_file, '/acceptor');
+        BT2 = h5read(back_file, '/donor');
+    else
+        mode = 'single';
+        BT1 = h5read(back_file, '/acceptor');
+        BT2 = [];
+    end
+    M = BT1;
+    try
+        bc = h5readatt(back_file, '/', 'bleach_corrected');
+    catch
+        bc = false;
+    end
+    if ~bc
+        warning('TIGRMUM: bleach_corrected attribute missing or false in %s. Run FRET-IBRA Module 4 first.', back_file);
+    end
+else
+    error('No suitable HDF5 input file found for %s', fname);
+end
+
+if strcmp(mode, 'ratio') && max(M(:)) <= 255
     M = uint8(M);
 end
 
@@ -54,15 +80,20 @@ if (tip_plot == 1)
     open(V);
 end
 
-if (nkymo > 0 || video_intensity > 0) 
-    K = M(:,:,:)./Cmax;
-    K(isnan(K)) = 0;
-    Cmin_tmp = Cmin;
-    Cmin = Cmin/Cmax;
-
-    L = bsxfun(@rdivide, bsxfun(@minus, K, Cmin),bsxfun(@minus, 1, Cmin));
-    L(L<0) = 0;
-    L = uint8(L.*255);
+if (nkymo > 0 || video_intensity > 0)
+    if strcmp(mode, 'ratio')
+        K = M(:,:,:)./Cmax;
+        K(isnan(K)) = 0;
+        Cmin_tmp = Cmin;
+        Cmin = Cmin/Cmax;
+        L = bsxfun(@rdivide, bsxfun(@minus, K, Cmin), bsxfun(@minus, 1, Cmin));
+        L(L<0) = 0;
+        L = uint8(L.*255);
+    else
+        Mmax = double(max(M(:)));
+        L = uint8(double(M)./Mmax.*255);
+        Cmin_tmp = 0; Cmin = 0; Cmax = Mmax;
+    end
 end
 
 % Make a movie and output min and max intensities of the whole stack
@@ -80,7 +111,11 @@ for count = smp:-1:stp
     elseif (type == 4) O = imrotate(O,180);
     end
     
-    P = imbinarize(O,0.2);
+    if strcmp(mode, 'ratio')
+        P = imbinarize(O, 0.2);
+    else
+        P = imbinarize(O);
+    end
     se = strel('disk',10);
     se2 = strel('disk',1);
     U = imopen(P,se);
@@ -420,9 +455,18 @@ for count = smp:-1:stp
     
     
         % Rotate BT1 and BT2
-        if (type == 1) BT1r = imrotate(BT1(:,:,count),-90); BT2r = imrotate(BT2(:,:,count),-90);
-        elseif (type == 3) BT1r = imrotate(BT1(:,:,count),90); BT2r = imrotate(BT2(:,:,count),90);
-        elseif (type == 4) BT1r = imrotate(BT1(:,:,count),180); BT2r = imrotate(BT2(:,:,count),180);
+        if (type == 1)
+            BT1r = imrotate(BT1(:,:,count),-90);
+            if ~isempty(BT2), BT2r = imrotate(BT2(:,:,count),-90); end
+        elseif (type == 3)
+            BT1r = imrotate(BT1(:,:,count),90);
+            if ~isempty(BT2), BT2r = imrotate(BT2(:,:,count),90); end
+        elseif (type == 4)
+            BT1r = imrotate(BT1(:,:,count),180);
+            if ~isempty(BT2), BT2r = imrotate(BT2(:,:,count),180); end
+        else
+            BT1r = BT1(:,:,count);
+            if ~isempty(BT2), BT2r = BT2(:,:,count); end
         end
         
         
@@ -436,7 +480,7 @@ for count = smp:-1:stp
         intensityM(count) = sum(O(:))/nnz(O);
         intensityM_F(count) = sum(sum(O.*FO))/Fpixelnum(count);
         intensityB1_F(count) = sum(sum(BT1r.*F))/Fpixelnum(count);
-        intensityB2_F(count) = sum(sum(BT2r.*F))/Fpixelnum(count);
+        if ~isempty(BT2), intensityB2_F(count) = sum(sum(BT2r.*F))/Fpixelnum(count); end
         
         if (split)
             if (max(O(:)) <= 255) F1O = uint8(F1); F2O = uint8(F2);
@@ -450,24 +494,26 @@ for count = smp:-1:stp
             F2pixelnum(count) = nnz(O.*F2O);
             intensityM_F1(count) = sum(sum(O.*F1O))/F1pixelnum(count);
             intensityB1_F1(count) = sum(sum(BT1r.*F1))/F1pixelnum(count);
-            intensityB2_F1(count) = sum(sum(BT2r.*F1))/F1pixelnum(count);
+            if ~isempty(BT2), intensityB2_F1(count) = sum(sum(BT2r.*F1))/F1pixelnum(count); end
             intensityM_F2(count) = sum(sum(O.*F2O))/F2pixelnum(count);
             intensityB1_F2(count) = sum(sum(BT1r.*F2))/F2pixelnum(count);
-            intensityB2_F2(count) = sum(sum(BT2r.*F2))/F2pixelnum(count);
+            if ~isempty(BT2), intensityB2_F2(count) = sum(sum(BT2r.*F2))/F2pixelnum(count); end
         end
         
         % Histogram of first and last frame
         if (distributions)
             d = 1;
             if (count == stp || count == smp)
-                Msize = [numel(O),1]; BT1size = [numel(BT1r),1]; BT2size = [numel(BT2r),1];
+                Msize = [numel(O),1]; BT1size = [numel(BT1r),1];
                 Mhist(:,d) = reshape(O,Msize);
                 B1hist(:,d) = reshape(BT1r,BT1size);
-                B2hist(:,d) = reshape(BT2r,BT2size);
-                
                 MhistF(:,d) = reshape(O.*FO,Msize);
                 B1histF(:,d) = reshape(BT1r.*F,BT1size);
-                B2histF(:,d) = reshape(BT2r.*F,BT2size);
+                if ~isempty(BT2)
+                    BT2size = [numel(BT2r),1];
+                    B2hist(:,d) = reshape(BT2r,BT2size);
+                    B2histF(:,d) = reshape(BT2r.*F,BT2size);
+                end
             end
             d = d+1;
         end
@@ -571,8 +617,12 @@ if (split)
     plot(stp:smp,intensityM_F2(stp:smp),'g*') % Ratio and split ROI 2
 end
 xlabel('Frame', 'FontSize',12);
-title('Intensity Ratio', 'FontSize',16)
-axis([stp-1 smp+1 1 max(intensityM)*1.25]);
+if strcmp(mode, 'ratio')
+    title('Intensity Ratio', 'FontSize',16)
+else
+    title('Intensity (Acceptor)', 'FontSize',16)
+end
+axis([stp-1 smp+1 min(intensityM)*0.75 max(intensityM)*1.25]);
 
 % Kymograph
 if (nkymo > 0)
@@ -583,10 +633,10 @@ if (nkymo > 0)
     imshow(uint8(kymo_avg.*255/max(kymo_avg(:))),map);
 end
 
-% Total intensity plots
-if (ROItype > 0)
+% Total intensity plots (ratio trace only available in two-channel modes)
+if (ROItype > 0) && ~strcmp(mode, 'single')
     figure
-    if (split) 
+    if (split)
         F1ratio = intensityB1_F1(stp:smp)./intensityB2_F1(stp:smp);
         subplot(1,3,2)
         hold on
