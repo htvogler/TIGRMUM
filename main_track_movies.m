@@ -37,6 +37,13 @@ pathf = path;
 ratio_file = [pathf '/' fname '_ratio_back.h5'];
 back_file  = [pathf '/' fname '_back.h5'];
 
+% Build output path: {root}/TIGRMUM_results/{fname}/
+% Assumes input is at {root}/FRET-IBRA_results/{fname}/
+[fribra_dir, ~, ~] = fileparts(pathf);
+[root_dir,   ~, ~] = fileparts(fribra_dir);
+outpath = fullfile(root_dir, 'TIGRMUM_results', fname);
+if ~exist(outpath, 'dir'), mkdir(outpath); end
+
 if exist(ratio_file, 'file')
     mode = 'ratio';
     M   = h5read(ratio_file, '/ratio');
@@ -75,7 +82,7 @@ type = find_orient(M(:,:,1));
         
 % Scaled plot of the growing tube with tip and ROI
 if (tip_plot == 1)
-    V = VideoWriter([pathf '/' fname '_growth.avi']);
+    V = VideoWriter([outpath '/' fname '_growth.avi']);
     V.FrameRate = 100;
     open(V);
 end
@@ -98,7 +105,7 @@ end
 
 % Make a movie and output min and max intensities of the whole stack
 if (video_intensity)
-    video_processing(pathf,fname,stp,smp,frame_rate,L(:,:,stp:smp),Cmin,Cmin_tmp,Cmax);
+    video_processing(outpath,fname,stp,smp,frame_rate,L(:,:,stp:smp),Cmin,Cmin_tmp,Cmax);
 end
 
 % Loop backwards over stack
@@ -700,4 +707,4 @@ if (distributions == 1)
     title('Histogram B2F')
 end
 
-if (workspace) save([pathf '/' fname '_result.mat']); end
+if (workspace) save([outpath '/' fname '_result.mat']); end
