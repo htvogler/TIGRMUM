@@ -1,8 +1,9 @@
-function L = video_processing(pathf,fname,stp,smp,timestep,L,Cmin,Cmin_tmp,Cmax)
+function L = video_processing(pathf,fname,stp,smp,timestep,L,Cmin,Cmin_tmp,Cmax,suffix)
 
-movie = [pathf '/' fname '_ratio.avi'];
+if nargin < 10 || isempty(suffix), suffix = '_ratio'; end
+movie = [pathf '/' fname suffix '.avi'];
 
-V = VideoWriter(movie);
+V = VideoWriter(movie, 'Uncompressed AVI');
 V.FrameRate = 50;
 open(V);    
 

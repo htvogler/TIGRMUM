@@ -2,10 +2,10 @@ clear all
 close all
 
 % Path to Mat file
-path = ''; % Input folder path (ADD PATH TO FILE HERE)
-fname = 'Test'; % Filename 
+path = '/Users/htv/Downloads/Claude_test/FRET-IBRA_results/YC11'; % Input folder path (ADD PATH TO FILE HERE)
+fname = 'YC11'; % Filename 
 stp = 1; % Start frame number
-smp = 81; % End frame number
+smp = 61; % End frame number
 
 % Options for analysis
 tip_plot = 1; % Video tip detection
@@ -43,18 +43,27 @@ back_file  = [pathf '/' fname '_back.h5'];
 [root_dir,   ~, ~] = fileparts(fribra_dir);
 outpath = fullfile(root_dir, 'TIGRMUM_results', fname);
 if ~exist(outpath, 'dir'), mkdir(outpath); end
+figpath = fullfile(outpath, 'Figures');
+if ~exist(figpath, 'dir'), mkdir(figpath); end
 
 if exist(ratio_file, 'file')
     mode = 'ratio';
-    M   = h5read(ratio_file, '/ratio');
+    M   = h5read(ratio_file, '/ratio_raw');
     BT1 = h5read(ratio_file, '/acceptor');
     BT2 = h5read(ratio_file, '/donor');
+    disp('NOTE: Running analysis on ratio stack from _ratio_back.h5.');
+    disp('      Ratio scaling for display and kymograph uses Cmin/Cmax as set in this script.');
+    disp('      For custom registration, masking, or union parameters, run main_ratio_movies.m');
+    disp('      first, then re-run main_track_movies.m.');
 elseif exist(back_file, 'file')
     dnames = {h5info(back_file).Datasets.Name};
     if any(strcmp(dnames, 'donor'))
         mode = 'two_raw';
         BT1 = h5read(back_file, '/acceptor');
         BT2 = h5read(back_file, '/donor');
+        disp('NOTE: Two-channel data found in _back.h5 but no ratio stack (_ratio_back.h5) available.');
+        disp('      Tip tracking and diameter analysis will use the acceptor channel only.');
+        disp('      For ratio analysis, run FRET-IBRA module 2 first, then re-run main_track_movies.m.');
     else
         mode = 'single';
         BT1 = h5read(back_file, '/acceptor');
@@ -63,6 +72,9 @@ elseif exist(back_file, 'file')
     M = BT1;
     try
         bc = h5readatt(back_file, '/', 'bleach_corrected');
+        if iscell(bc), bc = bc{1}; end
+        if ischar(bc), bc = strcmpi(bc, 'true'); end
+        bc = logical(bc);
     catch
         bc = false;
     end
@@ -73,16 +85,13 @@ else
     error('No suitable HDF5 input file found for %s', fname);
 end
 
-if strcmp(mode, 'ratio') && max(M(:)) <= 255
-    M = uint8(M);
-end
 
 % Orient image
 type = find_orient(M(:,:,1));
         
 % Scaled plot of the growing tube with tip and ROI
 if (tip_plot == 1)
-    V = VideoWriter([outpath '/' fname '_growth.avi']);
+    V = VideoWriter([outpath '/' fname '_growth.avi'], 'Uncompressed AVI');
     V.FrameRate = 100;
     open(V);
 end
@@ -104,8 +113,12 @@ if (nkymo > 0 || video_intensity > 0)
 end
 
 % Make a movie and output min and max intensities of the whole stack
-if (video_intensity)
-    video_processing(outpath,fname,stp,smp,frame_rate,L(:,:,stp:smp),Cmin,Cmin_tmp,Cmax);
+if (video_intensity) && ~strcmp(mode, 'two_raw')
+    if strcmp(mode, 'single')
+        video_processing(outpath,fname,stp,smp,frame_rate,L(:,:,stp:smp),Cmin,Cmin_tmp,Cmax,'_intensity');
+    else
+        video_processing(outpath,fname,stp,smp,frame_rate,L(:,:,stp:smp),Cmin,Cmin_tmp,Cmax);
+    end
 end
 
 % Loop backwards over stack
@@ -485,26 +498,30 @@ for count = smp:-1:stp
         
         Fpixelnum(count) = nnz(O.*FO);
         intensityM(count) = sum(O(:))/nnz(O);
-        intensityM_F(count) = sum(sum(O.*FO))/Fpixelnum(count);
-        intensityB1_F(count) = sum(sum(BT1r.*F))/Fpixelnum(count);
-        if ~isempty(BT2), intensityB2_F(count) = sum(sum(BT2r.*F))/Fpixelnum(count); end
-        
+        if ~strcmp(mode, 'two_raw')
+            intensityM_F(count) = sum(sum(O.*FO))/Fpixelnum(count);
+            intensityB1_F(count) = sum(sum(BT1r.*F))/Fpixelnum(count);
+            if ~isempty(BT2), intensityB2_F(count) = sum(sum(BT2r.*F))/Fpixelnum(count); end
+        end
+
         if (split)
             if (max(O(:)) <= 255) F1O = uint8(F1); F2O = uint8(F2);
-            else F1O = uint16(F1); F2O = uint16(F2);   
+            else F1O = uint16(F1); F2O = uint16(F2);
             end
-        
+
             F1 = uint16(F1);
             F2 = uint16(F2);
-            
+
             F1pixelnum(count) = nnz(O.*F1O);
             F2pixelnum(count) = nnz(O.*F2O);
-            intensityM_F1(count) = sum(sum(O.*F1O))/F1pixelnum(count);
-            intensityB1_F1(count) = sum(sum(BT1r.*F1))/F1pixelnum(count);
-            if ~isempty(BT2), intensityB2_F1(count) = sum(sum(BT2r.*F1))/F1pixelnum(count); end
-            intensityM_F2(count) = sum(sum(O.*F2O))/F2pixelnum(count);
-            intensityB1_F2(count) = sum(sum(BT1r.*F2))/F2pixelnum(count);
-            if ~isempty(BT2), intensityB2_F2(count) = sum(sum(BT2r.*F2))/F2pixelnum(count); end
+            if ~strcmp(mode, 'two_raw')
+                intensityM_F1(count) = sum(sum(O.*F1O))/F1pixelnum(count);
+                intensityB1_F1(count) = sum(sum(BT1r.*F1))/F1pixelnum(count);
+                if ~isempty(BT2), intensityB2_F1(count) = sum(sum(BT2r.*F1))/F1pixelnum(count); end
+                intensityM_F2(count) = sum(sum(O.*F2O))/F2pixelnum(count);
+                intensityB1_F2(count) = sum(sum(BT1r.*F2))/F2pixelnum(count);
+                if ~isempty(BT2), intensityB2_F2(count) = sum(sum(BT2r.*F2))/F2pixelnum(count); end
+            end
         end
         
         % Histogram of first and last frame
@@ -603,46 +620,58 @@ end
 if (tip_plot == 1) close(V); end
 
 % Final tip movement/diameter/pixel number on a per frame basis
-figure
-subplot(3,1,1)
+fig1 = figure;
+if strcmp(mode, 'two_raw')
+    nsp = 2;
+else
+    nsp = 3;
+end
+subplot(nsp,1,1)
 plot(tip_final(stp:smp,2),tip_final(stp:smp,1),'b')
 axis([min(tip_final(stp:smp,2))-5  max(tip_final(stp:smp,2))+5 min(tip_final(stp:smp,1))-5 max(tip_final(stp:smp,1))+5]);
 title('Tip Final Position', 'FontSize',16);
 
-subplot(3,1,2)
+subplot(nsp,1,2)
 plot(stp:smp,diamf_avg(stp:smp),'b')
 xlabel('Frame', 'FontSize',12);
 title('Average Diameter','FontSize',16)
 axis([stp-1 smp+1 0.5*max(diamf_avg) 1.25*max(diamf_avg)])
 
-subplot(3,1,3)
-plot(stp:smp,intensityM(stp:smp),'k') % Ratio only
-hold on
-plot(stp:smp,intensityM_F(stp:smp),'r') % Ratio and full ROI
-if (split)
-    plot(stp:smp,intensityM_F1(stp:smp),'b*') % Ratio and split ROI 1
-    plot(stp:smp,intensityM_F2(stp:smp),'g*') % Ratio and split ROI 2
+if ~strcmp(mode, 'two_raw')
+    subplot(nsp,1,3)
+    plot(stp:smp,intensityM(stp:smp),'k') % whole-image intensity
+    hold on
+    plot(stp:smp,intensityM_F(stp:smp),'r') % full ROI
+    if (split)
+        plot(stp:smp,intensityM_F1(stp:smp),'b*') % split ROI 1
+        plot(stp:smp,intensityM_F2(stp:smp),'g*') % split ROI 2
+    end
+    xlabel('Frame', 'FontSize',12);
+    if strcmp(mode, 'ratio')
+        title('Intensity Ratio', 'FontSize',16)
+    else
+        title('Intensity (Acceptor)', 'FontSize',16)
+    end
+    axis([stp-1 smp+1 min(intensityM)*0.75 max(intensityM)*1.25]);
 end
-xlabel('Frame', 'FontSize',12);
-if strcmp(mode, 'ratio')
-    title('Intensity Ratio', 'FontSize',16)
-else
-    title('Intensity (Acceptor)', 'FontSize',16)
-end
-axis([stp-1 smp+1 min(intensityM)*0.75 max(intensityM)*1.25]);
+savefig(fig1, fullfile(figpath, [fname '_tip_diam_intensity.fig']));
+exportgraphics(fig1, fullfile(figpath, [fname '_tip_diam_intensity.pdf']));
 
 % Kymograph
 if (nkymo > 0)
     kymo_avg(find(kymo_avg<0)) = 0;
-    figure
+    fig2 = figure;
     map = colormap(jet(255));
     map = vertcat([0 0 0],map);
-    imshow(uint8(kymo_avg.*255/max(kymo_avg(:))),map);
+    kymo_img = uint8(kymo_avg.*255/max(kymo_avg(:)));
+    imshow(kymo_img, map);
+    savefig(fig2, fullfile(figpath, [fname '_kymograph.fig']));
+    imwrite(ind2rgb(kymo_img, map), fullfile(figpath, [fname '_kymograph.tif']));
 end
 
-% Total intensity plots (ratio trace only available in two-channel modes)
-if (ROItype > 0) && ~strcmp(mode, 'single')
-    figure
+% Total intensity plots (ratio trace only available with ratio stack)
+if (ROItype > 0) && strcmp(mode, 'ratio')
+    fig3 = figure;
     if (split)
         F1ratio = intensityB1_F1(stp:smp)./intensityB2_F1(stp:smp);
         subplot(1,3,2)
@@ -669,42 +698,47 @@ if (ROItype > 0) && ~strcmp(mode, 'single')
         axis([stp-1 smp+1 0.8 max(Fratio(:))*1.25]);
         title('Intensity F'); xlabel('Frame');
     end
+    savefig(fig3, fullfile(figpath, [fname '_intensity_ratio.fig']));
+    exportgraphics(fig3, fullfile(figpath, [fname '_intensity_ratio.pdf']));
 end
 
 % Distributions of intensity on the first and last frames
-if (distributions == 1)    
-    figure
+if (distributions == 1)
+    figd1 = figure;
     subplot(1,2,1)
     histogram(Chist1(Chist1>0.1))
     hold on; histogram(Chist2(Chist2>0.1))
     title('Histogram C')
-    
     subplot(1,2,2)
     histogram(ChistF1(ChistF1>0.1))
     hold on; histogram(ChistF2(ChistF2>0.1))
     title('Histogram CF')
-    
-    figure
+    savefig(figd1, fullfile(figpath, [fname '_hist_C.fig']));
+    exportgraphics(figd1, fullfile(figpath, [fname '_hist_C.pdf']));
+
+    figd2 = figure;
     subplot(1,2,1)
     histogram(B1hist1(B1hist1>0.1))
     hold on; histogram(B1hist2(B1hist2>0.1))
     title('Histogram B1')
-    
     subplot(1,2,2)
     histogram(B1histF1(B1histF1>0.1))
     hold on; histogram(B1histF2(B1histF2>0.1))
     title('Histogram B1F')
-    
-    figure
+    savefig(figd2, fullfile(figpath, [fname '_hist_B1.fig']));
+    exportgraphics(figd2, fullfile(figpath, [fname '_hist_B1.pdf']));
+
+    figd3 = figure;
     subplot(1,2,1)
     histogram(B2hist1(B2hist1>0.1))
     hold on; histogram(B2hist2(B2hist2>0.1))
     title('Histogram B2')
-    
     subplot(1,2,2)
     histogram(B2histF1(B2histF1>0.1))
     hold on; histogram(B2histF2(B2histF2>0.1))
     title('Histogram B2F')
+    savefig(figd3, fullfile(figpath, [fname '_hist_B2.fig']));
+    exportgraphics(figd3, fullfile(figpath, [fname '_hist_B2.pdf']));
 end
 
 if (workspace) save([outpath '/' fname '_result.mat']); end
