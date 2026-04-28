@@ -734,8 +734,8 @@ if ~strcmp(mode, 'two_raw')
         title('Intensity (Acceptor)', 'FontSize',16)
     end
     % Scale axis to include all plotted values (whole-tube + ROI)
-    all_vals = [intensityM(stp:smp); intensityM_F(stp:smp)];
-    if (split), all_vals = [all_vals; intensityM_F1(stp:smp)'; intensityM_F2(stp:smp)']; end
+    all_vals = [intensityM(stp:smp), intensityM_F(stp:smp)];
+    if (split), all_vals = [all_vals, intensityM_F1(stp:smp), intensityM_F2(stp:smp)]; end
     all_vals = all_vals(isfinite(all_vals) & all_vals > 0);
     if ~isempty(all_vals)
         axis([stp-1 smp+1 min(all_vals)*0.75 max(all_vals)*1.25]);
@@ -809,7 +809,7 @@ if (ROItype > 0) && ~strcmp(mode, 'ratio')
         plot(stp:smp, Fv,  'k'); plot(stp:smp, F1v, 'b'); plot(stp:smp, F2v, 'g');
         legend('Full ROI','Half 1','Half 2','Location','best');
         xlabel('Frame'); title('ROI Intensity (Acceptor)', 'FontSize',14);
-        all_v = [Fv; F1v'; F2v']; all_v = all_v(isfinite(all_v) & all_v > 0);
+        all_v = [Fv, F1v, F2v]; all_v = all_v(isfinite(all_v) & all_v > 0);
         if ~isempty(all_v), axis([stp-1 smp+1 min(all_v)*0.85 max(all_v)*1.15]); end
 
         subplot(1,2,2)
@@ -827,6 +827,63 @@ if (ROItype > 0) && ~strcmp(mode, 'ratio')
     savefig(fig3, fullfile(figpath, [fname '_roi_intensity.fig']));
     exportgraphics(fig3, fullfile(figpath, [fname '_roi_intensity.png']));
 end
+
+% CSV export of per-frame measurements
+% Intensities are mean per non-zero pixel inside each mask.
+% Total signal = mean × pixel_count.
+csv_frames  = (stp:smp)';
+csv_time_s  = csv_frames .* frame_rate;
+csv_tip_row = tip_final(stp:smp, 1);
+csv_tip_col = tip_final(stp:smp, 2);
+csv_diam_px = diamf_avg(stp:smp)';
+csv_diam_um = csv_diam_px .* pixelsize;
+csv_wtmean  = intensityM(stp:smp)';
+csv_overlap = Ucount(stp:smp)';
+
+if (ROItype > 0)
+    csv_roi_npx   = Fpixelnum(stp:smp)';
+    csv_roi_mean  = intensityM_F(stp:smp)';
+    csv_roi_total = csv_roi_mean .* csv_roi_npx;
+
+    if (split)
+        csv_h1_npx   = F1pixelnum(stp:smp)';
+        csv_h1_mean  = intensityM_F1(stp:smp)';
+        csv_h1_total = csv_h1_mean .* csv_h1_npx;
+        csv_h2_npx   = F2pixelnum(stp:smp)';
+        csv_h2_mean  = intensityM_F2(stp:smp)';
+        csv_h2_total = csv_h2_mean .* csv_h2_npx;
+        csv_ratio_h2h1 = csv_h2_mean ./ csv_h1_mean;
+
+        T = table(csv_frames, csv_time_s, csv_tip_row, csv_tip_col, ...
+                  csv_diam_px, csv_diam_um, csv_overlap, csv_wtmean, ...
+                  csv_roi_npx, csv_roi_mean, csv_roi_total, ...
+                  csv_h1_npx, csv_h1_mean, csv_h1_total, ...
+                  csv_h2_npx, csv_h2_mean, csv_h2_total, csv_ratio_h2h1, ...
+                  'VariableNames', { ...
+                  'Frame', 'Time_s', 'Tip_row_px', 'Tip_col_px', ...
+                  'Diameter_px', 'Diameter_um', 'Frame_overlap_ratio', 'WholeTube_mean_intensity', ...
+                  'ROI_pixel_count', 'ROI_mean_intensity', 'ROI_total_signal', ...
+                  'Half1_pixel_count', 'Half1_mean_intensity', 'Half1_total_signal', ...
+                  'Half2_pixel_count', 'Half2_mean_intensity', 'Half2_total_signal', ...
+                  'Ratio_Half2_Half1'});
+    else
+        T = table(csv_frames, csv_time_s, csv_tip_row, csv_tip_col, ...
+                  csv_diam_px, csv_diam_um, csv_overlap, csv_wtmean, ...
+                  csv_roi_npx, csv_roi_mean, csv_roi_total, ...
+                  'VariableNames', { ...
+                  'Frame', 'Time_s', 'Tip_row_px', 'Tip_col_px', ...
+                  'Diameter_px', 'Diameter_um', 'Frame_overlap_ratio', 'WholeTube_mean_intensity', ...
+                  'ROI_pixel_count', 'ROI_mean_intensity', 'ROI_total_signal'});
+    end
+else
+    T = table(csv_frames, csv_time_s, csv_tip_row, csv_tip_col, ...
+              csv_diam_px, csv_diam_um, csv_overlap, csv_wtmean, ...
+              'VariableNames', { ...
+              'Frame', 'Time_s', 'Tip_row_px', 'Tip_col_px', ...
+              'Diameter_px', 'Diameter_um', 'Frame_overlap_ratio', 'WholeTube_mean_intensity'});
+end
+writetable(T, fullfile(outpath, [fname '_measurements.csv']));
+disp(['CSV saved: ' fullfile(outpath, [fname '_measurements.csv'])]);
 
 % Distributions of intensity on the first and last frames (col1=smp, col2=stp)
 if (distributions == 1)
