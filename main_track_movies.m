@@ -5,12 +5,12 @@ close all
 path = '/Users/htv/Downloads/Claude_test/FRET-IBRA_results/HV202_1_7'; % Input folder path (ADD PATH TO FILE HERE)
 fname = 'HV202_1_7'; % Filename 
 stp = 1; % Start frame number
-smp = 50; % End frame number
+smp = 2402; % End frame number
 
 % Options for analysis
 tip_plot = 1; % Video tip detection
 video_intensity = 1; % Video intensity
-frame_rate = 1; % Number of seconds per frame of input video
+frame_rate = 0.3; % Number of seconds per frame of input video
 distributions = 1;  % Show histogram of results in the end
 workspace = 0; % Save workspace
 
@@ -23,7 +23,7 @@ split = 1; % Split ROI along center line
 circle = 0; % Circle ROI as fraction of diameter
 starti = 0; % Rectangle ROI Start length / no pixelsize means percentage as a fraction of length of tube
 stopi = 10; % Rectangle/Circle ROI Stop length / no pixelsize means percentage as a fraction of length of tube
-pixelsize = 0.17; % Pixel to um conversion
+pixelsize = 0.3225; % Pixel to um conversion
 
 % Kymo, movie and measurements options
 Cmin = 1.5; % Min pixel value in Ratio stack
@@ -341,69 +341,98 @@ for count = smp:-1:stp
         total2(find(total2(:,2) >= max(total2(:,2))),:) = [];
     end 
     
-    % Find center line
-    Q2line = drawline(Q2,tip_final(count,1),tip_final(count,2),Qef(1),Qef(2),1);  
-    Q2bline1 = bwmorph(Q2line,'branchpoints');
-    if (nnz(Q2bline1) > 0) 
-        Q2line = imclose(Q2line,se2); 
-        Q2line = bwmorph(Q2line,'thin',Inf); 
-    end
-    
-    % Anchor right end of centerline to tube centre at right image edge
-    % Use size(U,2)-1 to match locate_tip convention and avoid drawline overshoot
+    % Centerline: minimum-cost path through tube, weighted by distance from
+    % wall — paths near the tube centre are cheap, so the optimal path
+    % naturally follows the medial axis regardless of bends or branches.
     right_col = size(U,2) - 1;
     right_pix = find(U(:, right_col));
-    if isempty(right_pix), right_pix = find(U(:, right_col-1)); end
-    right_anchor = [round(mean(right_pix)), right_col];
+    if isempty(right_pix)
+        right_col = right_col - 1;
+        right_pix = find(U(:, right_col));
+    end
+    % If mean of right_pix falls in a gap, snap to nearest actual U pixel
+    ra_row = round(mean(right_pix));
+    if ~U(ra_row, right_col)
+        [~, snap] = min(abs(right_pix - ra_row));
+        ra_row = right_pix(snap);
+    end
+    right_anchor = [ra_row, right_col];
 
-    % Connect rightmost Q2 skeleton endpoint to the right-edge anchor
-    [Q2er, Q2ec] = find(bwmorph(Q2,'endpoints'));
-    [~, rpos] = max(Q2ec);
-    Q2line = drawline(Q2line, Q2er(rpos), Q2ec(rpos), right_anchor(1), right_anchor(2), 1);
-    Q2bline2 = bwmorph(Q2line,'branchpoints');
-    if (nnz(Q2bline2) > 0) 
-        Q2line = imclose(Q2line,se2);
-        Q2line = bwmorph(Q2line,'hbreak');
-        Q2line = bwmorph(Q2line,'thin',Inf); 
+    % Weight: inversely proportional to distance from tube boundary
+    D_tube = bwdist(~U);
+    W_tube = Inf(size(U));
+    W_tube(U) = 1 ./ (D_tube(U) + 1);
+
+    % Geodesic cost from right_anchor (low cost = centre of tube)
+    GD = graydist(W_tube, right_anchor(2), right_anchor(1));
+    GD(~U) = Inf;
+
+    % Nearest U pixel to tip_final as trace start
+    [Ur_all, Uc_all] = find(U);
+    [~, tpos] = min(pdist2([Ur_all Uc_all], tip_final(count,:)));
+    r = Ur_all(tpos); c = Uc_all(tpos);
+
+    % Safety: if GD at start is Inf the tube is disconnected — fall back to Q endpoint
+    if ~isfinite(GD(r,c))
+        [~, epos] = max(Qec);
+        r = Qel(epos,1); c = Qel(epos,2);
     end
-    
-    fuse = 0;
-    while(fuse == 0)
-        Q2lineo = bwconncomp(Q2line);
-        if (Q2lineo.NumObjects > 1)
-            Q2line = imdilate(Q2line,se2);
-        else
-            fuse = 1;
-            Q2line = bwmorph(Q2line,'thin',Inf);    
-            break;
+
+    % Gradient descent from tip to right_anchor; visited mask prevents loops
+    max_path = 3*nnz(U);
+    path = zeros(max_path, 2);
+    path(1,:) = [r c];
+    n_path = 1;
+    visited = false(size(U));
+    visited(r,c) = true;
+    for step = 1:max_path-1
+        if GD(r,c) == 0, break; end
+        r0 = max(1,r-1); r1 = min(size(U,1),r+1);
+        c0 = max(1,c-1); c1 = min(size(U,2),c+1);
+        nbhd = GD(r0:r1, c0:c1);
+        nbhd(visited(r0:r1, c0:c1)) = Inf;
+        [min_val, idx] = min(nbhd(:));
+        if min_val >= GD(r,c), break; end
+        [dr, dc] = ind2sub(size(nbhd), idx);
+        r = r0+dr-1; c = c0+dc-1;
+        n_path = n_path + 1;
+        path(n_path,:) = [r c];
+        visited(r,c) = true;
+    end
+    path = path(1:n_path,:);
+    yctk = path(:,1); xctk = path(:,2);
+
+    % Cumulative arc length along path (0 at tip, max at base)
+    path_dist = [0; cumsum(sqrt(sum(diff(path).^2, 2)))];
+
+    % DEBUG: save overlay for the last frame only
+    if (count == smp)
+        dbg = zeros(size(U,1), size(U,2), 3);
+        dbg(:,:,3) = double(U) * 0.4;   % tube mask: dark blue
+        dbg(:,:,2) = double(Q) * 0.8;   % Q skeleton: green
+        % traced path in white
+        for di = 1:size(path,1)
+            dbg(path(di,1), path(di,2), :) = [1 1 1];
         end
+        % right anchor in cyan
+        dbg(right_anchor(1), right_anchor(2), :) = [0 1 1];
+        % tip_final in magenta
+        dbg(tip_final(count,1), tip_final(count,2), :) = [1 0 1];
+        imwrite(dbg, fullfile(outpath, [fname '_debug_skel.png']));
+        disp(['DEBUG saved: ' fullfile(outpath, [fname '_debug_skel.png'])]);
     end
-    
-    Q2bline = bwmorph(Q2line,'branchpoints');
-    [Qbrline,Qbcline] = find(Q2bline > 0);
-    
-    Q2eline = bwmorph(Q2line,'endpoints');
-    [Qerline,Qecline] = find(Q2eline > 0);
-    
-    xct = []; yct = []; xc =[]; yc =[]; distct = []; distc = [];
-    [Q3, tmp, tmp] = branch_removal(Q2line,[Qbrline Qbcline],[Qerline Qecline],0,2);
-    
-    Q3eline = bwmorph(Q3,'endpoints');
-    [Q3erline,Q3ecline] = find(Q3eline > 0);
-    [tmp,Q3pos] = min(Q3ecline);
-    Q3geo = bwdistgeodesic(logical(Q3),Q3ecline(Q3pos),Q3erline(Q3pos),'quasi-euclidean');
-    Q3geo(isnan(Q3geo)) = 0;
-    [yct, xct, distct] = find(Q3geo);
-    [distct geo_order] = sort(distct);
-    yctk = yct(geo_order,:); xctk = xct(geo_order,:); 
-    nline = 1:100; norder = floor(nline*max(distct)/100); nfinal = dsearchn(distct,norder');
-    
-    yct = yctk(nfinal); xct = xctk(nfinal); distct = distct(nfinal);
-    xct = round(sgolayfilt(xct,3,15)); yct = round(sgolayfilt(yct,3,15));
+
+    % Subsample to 100 evenly-spaced points and smooth
+    if (count == smp) npoints = ceil(path_dist(end)*1.1); end
+    nline = 1:100; norder = floor(nline*path_dist(end)/100);
+    nfinal = dsearchn(path_dist, norder');
+    yct = yctk(nfinal); xct = xctk(nfinal); distct = path_dist(nfinal);
+    xct = round(sgolayfilt(double(xct),3,15)); yct = round(sgolayfilt(double(yct),3,15));
     xct = max(1, min(xct, size(U,2))); yct = max(1, min(yct, size(U,1)));
-    distc_t = pdist2(tip_final(count,:),Qef);
+
+    distc_t = pdist2(tip_final(count,:), Qef);
     [tmp, cut] = min(abs(distct - distc_t));
-    xc = xct(cut:end); yc = yct(cut:end); distc = distct(cut:end); 
+    xc = xct(cut:end); yc = yct(cut:end); distc = distct(cut:end);
     
     % Calculate the gradient of the center line to get the normals
     dx = gradient(xc); dx(find(dx == 0)) = 0.01;
@@ -571,7 +600,7 @@ for count = smp:-1:stp
     
     % Kymograph
     if (nkymo > 0)
-        if (count == smp) npoints = ceil(distct(end)*1.1); end
+        kymo_len = ceil(path_dist(end));
 
         % Rotate L frame to match the rotated coordinate frame used for centerline
         Lframe = L(:,:,count);
@@ -600,10 +629,10 @@ for count = smp:-1:stp
         end
         kymo = [];
         for a = 1:nkymo
-            kymo(:,a) = improfile(imgaussfilt(Lframe,1.5), linecte(:,2,a), linecte(:,1,a), double(ceil(distct(end))));
+            kymo(:,a) = improfile(imgaussfilt(Lframe,1.5), linecte(:,2,a), linecte(:,1,a), double(kymo_len));
         end
         kymo(isnan(kymo)) = 0;
-        kymo_avg(:,count-stp+1) = vertcat(zeros((5 + npoints - ceil(distct(end))),1), mean(kymo,2));
+        kymo_avg(:,count-stp+1) = vertcat(zeros((5 + npoints - kymo_len),1), mean(kymo,2));
     end
 
     % Tip plot
