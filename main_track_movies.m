@@ -2,16 +2,16 @@ clear all
 close all
 
 % Path to Mat file
-path = '/Users/htv/Downloads/Claude_test/FRET-IBRA_results/YC11'; % Input folder path (ADD PATH TO FILE HERE)
-fname = 'YC11'; % Filename 
+path = '/Users/htv/Downloads/Claude_test/FRET-IBRA_results/HV202_1_7'; % Input folder path (ADD PATH TO FILE HERE)
+fname = 'HV202_1_7'; % Filename 
 stp = 1; % Start frame number
-smp = 61; % End frame number
+smp = 50; % End frame number
 
 % Options for analysis
 tip_plot = 1; % Video tip detection
 video_intensity = 1; % Video intensity
 frame_rate = 1; % Number of seconds per frame of input video
-distributions = 0;  % Show histogram of results in the end
+distributions = 1;  % Show histogram of results in the end
 workspace = 0; % Save workspace
 
 % Tip detection parameters
@@ -85,6 +85,21 @@ else
     error('No suitable HDF5 input file found for %s', fname);
 end
 
+% Zero background for non-ratio modes using per-frame Otsu thresholding
+% (for ratio mode this was already done in main_ratio_movies / FRET-IBRA)
+if ~strcmp(mode, 'ratio')
+    for fc = 1:size(BT1,3)
+        frm = BT1(:,:,fc);
+        BT1(:,:,fc) = frm .* cast(imbinarize(frm), class(BT1));
+    end
+    if ~isempty(BT2)
+        for fc = 1:size(BT2,3)
+            frm = BT2(:,:,fc);
+            BT2(:,:,fc) = frm .* cast(imbinarize(frm), class(BT2));
+        end
+    end
+    M = BT1;
+end
 
 % Orient image
 type = find_orient(M(:,:,1));
@@ -122,6 +137,7 @@ if (video_intensity) && ~strcmp(mode, 'two_raw')
 end
 
 % Loop backwards over stack
+if (distributions), d = 1; end
 for count = smp:-1:stp
     disp(['Image Analysis:' num2str(count)]);
     O = M(:,:,count);
@@ -333,17 +349,17 @@ for count = smp:-1:stp
         Q2line = bwmorph(Q2line,'thin',Inf); 
     end
     
-    Sbdist = [];
-    if (count == smp)
-        Sbdist = pdist2(Sbl,[edges; round(mean(edges(:,1))),edges(2,2)]);
-        [tmp, Sbpos] = min(Sbdist(:,3).*Sbdist(:,1)./Sbdist(:,2));
-    else 
-        Sbdist = pdist2(Sbl,Sb_last);  
-        [tmp, Sbpos] = min(Sbdist);        
-    end
-    Sb_last = Sbl(Sbpos,:);
+    % Anchor right end of centerline to tube centre at right image edge
+    % Use size(U,2)-1 to match locate_tip convention and avoid drawline overshoot
+    right_col = size(U,2) - 1;
+    right_pix = find(U(:, right_col));
+    if isempty(right_pix), right_pix = find(U(:, right_col-1)); end
+    right_anchor = [round(mean(right_pix)), right_col];
 
-    Q2line = drawline(Q2line,round(mean(edges(:,1))),edges(2,2),Sb_last(:,1),Sb_last(:,2),1);
+    % Connect rightmost Q2 skeleton endpoint to the right-edge anchor
+    [Q2er, Q2ec] = find(bwmorph(Q2,'endpoints'));
+    [~, rpos] = max(Q2ec);
+    Q2line = drawline(Q2line, Q2er(rpos), Q2ec(rpos), right_anchor(1), right_anchor(2), 1);
     Q2bline2 = bwmorph(Q2line,'branchpoints');
     if (nnz(Q2bline2) > 0) 
         Q2line = imclose(Q2line,se2);
@@ -383,7 +399,8 @@ for count = smp:-1:stp
     nline = 1:100; norder = floor(nline*max(distct)/100); nfinal = dsearchn(distct,norder');
     
     yct = yctk(nfinal); xct = xctk(nfinal); distct = distct(nfinal);
-    xct = round(sgolayfilt(xct,3,15)); yct = round(sgolayfilt(yct,3,15)); 
+    xct = round(sgolayfilt(xct,3,15)); yct = round(sgolayfilt(yct,3,15));
+    xct = max(1, min(xct, size(U,2))); yct = max(1, min(yct, size(U,1)));
     distc_t = pdist2(tip_final(count,:),Qef);
     [tmp, cut] = min(abs(distct - distc_t));
     xc = xct(cut:end); yc = yct(cut:end); distc = distct(cut:end); 
@@ -524,9 +541,8 @@ for count = smp:-1:stp
             end
         end
         
-        % Histogram of first and last frame
+        % Histogram of first and last frame (smp=col1, stp=col2)
         if (distributions)
-            d = 1;
             if (count == stp || count == smp)
                 Msize = [numel(O),1]; BT1size = [numel(BT1r),1];
                 Mhist(:,d) = reshape(O,Msize);
@@ -538,8 +554,8 @@ for count = smp:-1:stp
                     B2hist(:,d) = reshape(BT2r,BT2size);
                     B2histF(:,d) = reshape(BT2r.*F,BT2size);
                 end
+                d = d+1;
             end
-            d = d+1;
         end
     end
     
@@ -556,7 +572,14 @@ for count = smp:-1:stp
     % Kymograph
     if (nkymo > 0)
         if (count == smp) npoints = ceil(distct(end)*1.1); end
-        
+
+        % Rotate L frame to match the rotated coordinate frame used for centerline
+        Lframe = L(:,:,count);
+        if (type == 1) Lframe = imrotate(Lframe,-90);
+        elseif (type == 3) Lframe = imrotate(Lframe,90);
+        elseif (type == 4) Lframe = imrotate(Lframe,180);
+        end
+
         % Average number of points across the tube width in kymo based on orientation
         linecte = []; linecte(:,:,1) = [yctk, xctk];
         for a = 2:nkymo
@@ -577,11 +600,11 @@ for count = smp:-1:stp
         end
         kymo = [];
         for a = 1:nkymo
-            kymo(:,a) = improfile(imgaussfilt(L(:,:,count),1.5), linecte(:,2,a), linecte(:,1,a), double(ceil(distct(end))));
+            kymo(:,a) = improfile(imgaussfilt(Lframe,1.5), linecte(:,2,a), linecte(:,1,a), double(ceil(distct(end))));
         end
         kymo(isnan(kymo)) = 0;
         kymo_avg(:,count-stp+1) = vertcat(zeros((5 + npoints - ceil(distct(end))),1), mean(kymo,2));
-    end 
+    end
 
     % Tip plot
     Splot = zeros(size(Q2));
@@ -600,7 +623,7 @@ for count = smp:-1:stp
     end
     
     %subplot(1,2,2)
-    image2 = U*20+Splot*40;
+    image2 = U*20+Splot*40+Cplot*30;
     if (ROItype > 0) image2 = image2 + double(F1*60 + F2*80); end
     imagesc(image2);
     
@@ -655,7 +678,7 @@ if ~strcmp(mode, 'two_raw')
     axis([stp-1 smp+1 min(intensityM)*0.75 max(intensityM)*1.25]);
 end
 savefig(fig1, fullfile(figpath, [fname '_tip_diam_intensity.fig']));
-exportgraphics(fig1, fullfile(figpath, [fname '_tip_diam_intensity.pdf']));
+exportgraphics(fig1, fullfile(figpath, [fname '_tip_diam_intensity.png']));
 
 % Kymograph
 if (nkymo > 0)
@@ -666,7 +689,7 @@ if (nkymo > 0)
     kymo_img = uint8(kymo_avg.*255/max(kymo_avg(:)));
     imshow(kymo_img, map);
     savefig(fig2, fullfile(figpath, [fname '_kymograph.fig']));
-    imwrite(ind2rgb(kymo_img, map), fullfile(figpath, [fname '_kymograph.tif']));
+    imwrite(ind2rgb(kymo_img, map), fullfile(figpath, [fname '_kymograph.png']));
 end
 
 % Total intensity plots (ratio trace only available with ratio stack)
@@ -699,46 +722,46 @@ if (ROItype > 0) && strcmp(mode, 'ratio')
         title('Intensity F'); xlabel('Frame');
     end
     savefig(fig3, fullfile(figpath, [fname '_intensity_ratio.fig']));
-    exportgraphics(fig3, fullfile(figpath, [fname '_intensity_ratio.pdf']));
+    exportgraphics(fig3, fullfile(figpath, [fname '_intensity_ratio.png']));
 end
 
-% Distributions of intensity on the first and last frames
+% Distributions of intensity on the first and last frames (col1=smp, col2=stp)
 if (distributions == 1)
+    Mhist = double(Mhist); MhistF = double(MhistF);
+    B1hist = double(B1hist); B1histF = double(B1histF);
+
     figd1 = figure;
     subplot(1,2,1)
-    histogram(Chist1(Chist1>0.1))
-    hold on; histogram(Chist2(Chist2>0.1))
+    histogram(Mhist(Mhist(:,1)>0.1,1)); hold on; histogram(Mhist(Mhist(:,2)>0.1,2))
     title('Histogram C')
     subplot(1,2,2)
-    histogram(ChistF1(ChistF1>0.1))
-    hold on; histogram(ChistF2(ChistF2>0.1))
+    histogram(MhistF(MhistF(:,1)>0.1,1)); hold on; histogram(MhistF(MhistF(:,2)>0.1,2))
     title('Histogram CF')
     savefig(figd1, fullfile(figpath, [fname '_hist_C.fig']));
-    exportgraphics(figd1, fullfile(figpath, [fname '_hist_C.pdf']));
+    exportgraphics(figd1, fullfile(figpath, [fname '_hist_C.png']));
 
     figd2 = figure;
     subplot(1,2,1)
-    histogram(B1hist1(B1hist1>0.1))
-    hold on; histogram(B1hist2(B1hist2>0.1))
+    histogram(B1hist(B1hist(:,1)>0.1,1)); hold on; histogram(B1hist(B1hist(:,2)>0.1,2))
     title('Histogram B1')
     subplot(1,2,2)
-    histogram(B1histF1(B1histF1>0.1))
-    hold on; histogram(B1histF2(B1histF2>0.1))
+    histogram(B1histF(B1histF(:,1)>0.1,1)); hold on; histogram(B1histF(B1histF(:,2)>0.1,2))
     title('Histogram B1F')
     savefig(figd2, fullfile(figpath, [fname '_hist_B1.fig']));
-    exportgraphics(figd2, fullfile(figpath, [fname '_hist_B1.pdf']));
+    exportgraphics(figd2, fullfile(figpath, [fname '_hist_B1.png']));
 
-    figd3 = figure;
-    subplot(1,2,1)
-    histogram(B2hist1(B2hist1>0.1))
-    hold on; histogram(B2hist2(B2hist2>0.1))
-    title('Histogram B2')
-    subplot(1,2,2)
-    histogram(B2histF1(B2histF1>0.1))
-    hold on; histogram(B2histF2(B2histF2>0.1))
-    title('Histogram B2F')
-    savefig(figd3, fullfile(figpath, [fname '_hist_B2.fig']));
-    exportgraphics(figd3, fullfile(figpath, [fname '_hist_B2.pdf']));
+    if ~isempty(BT2)
+        B2hist = double(B2hist); B2histF = double(B2histF);
+        figd3 = figure;
+        subplot(1,2,1)
+        histogram(B2hist(B2hist(:,1)>0.1,1)); hold on; histogram(B2hist(B2hist(:,2)>0.1,2))
+        title('Histogram B2')
+        subplot(1,2,2)
+        histogram(B2histF(B2histF(:,1)>0.1,1)); hold on; histogram(B2histF(B2histF(:,2)>0.1,2))
+        title('Histogram B2F')
+        savefig(figd3, fullfile(figpath, [fname '_hist_B2.fig']));
+        exportgraphics(figd3, fullfile(figpath, [fname '_hist_B2.png']));
+    end
 end
 
 if (workspace) save([outpath '/' fname '_result.mat']); end
