@@ -1,5 +1,10 @@
 function [tip_final,center,phi,axes,tip_check] = ellipse_data(tip_new)
 
+if isempty(tip_new) || size(tip_new,2) < 2 || size(tip_new,1) < 5
+    tip_final = [0 0]; center = [0 0]; phi = 0; axes = [0 0]; tip_check = [0 0];
+    return;
+end
+
     tip_news = zeros(length(tip_new),2);
     tip_news(:,2) = smooth(tip_new(:,2));
     tip_news(:,1) = smooth(tip_new(:,1));
