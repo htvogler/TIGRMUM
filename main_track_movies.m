@@ -602,6 +602,13 @@ for count = smp:-1:stp
     if (nkymo > 0)
         kymo_len = ceil(path_dist(end));
 
+        % Save smp centerline for the fixed-line kymograph
+        if (count == smp)
+            yctk_smp = yctk; xctk_smp = xctk;
+            kymo_len_smp = kymo_len;
+            start_nfitc_smp = start_nfitc;
+        end
+
         % Rotate L frame to match the rotated coordinate frame used for centerline
         Lframe = L(:,:,count);
         if (type == 1) Lframe = imrotate(Lframe,-90);
@@ -609,22 +616,17 @@ for count = smp:-1:stp
         elseif (type == 4) Lframe = imrotate(Lframe,180);
         end
 
-        % Average number of points across the tube width in kymo based on orientation
+        % Per-frame centerline kymograph
         linecte = []; linecte(:,:,1) = [yctk, xctk];
         for a = 2:nkymo
-            if (mod(a,2) == 0)
-                ind = floor(a*0.5);
-            else
-                ind = -floor(a*0.5);
-            end
+            if (mod(a,2) == 0), ind = floor(a*0.5);
+            else, ind = -floor(a*0.5); end
             if (start_nfitc(1) < 0)
-                if (mod(a,2) == 0) linecte(:,:,a) = [yctk+ind, xctk-ind];
-                else linecte(:,:,a) = [yctk-ind, xctk+ind];
-                end
+                if (mod(a,2) == 0), linecte(:,:,a) = [yctk+ind, xctk-ind];
+                else, linecte(:,:,a) = [yctk-ind, xctk+ind]; end
             else
-                if (mod(a,2) == 0) linecte(:,:,a) = [yctk+ind, xctk+ind];
-                else linecte(:,:,a) = [yctk-ind, xctk-ind];
-                end
+                if (mod(a,2) == 0), linecte(:,:,a) = [yctk+ind, xctk+ind];
+                else, linecte(:,:,a) = [yctk-ind, xctk-ind]; end
             end
         end
         kymo = [];
@@ -633,6 +635,26 @@ for count = smp:-1:stp
         end
         kymo(isnan(kymo)) = 0;
         kymo_avg(:,count-stp+1) = vertcat(zeros((5 + npoints - kymo_len),1), mean(kymo,2));
+
+        % Fixed-line kymograph using smp centerline for all frames
+        linecte_f = []; linecte_f(:,:,1) = [yctk_smp, xctk_smp];
+        for a = 2:nkymo
+            if (mod(a,2) == 0), ind = floor(a*0.5);
+            else, ind = -floor(a*0.5); end
+            if (start_nfitc_smp(1) < 0)
+                if (mod(a,2) == 0), linecte_f(:,:,a) = [yctk_smp+ind, xctk_smp-ind];
+                else, linecte_f(:,:,a) = [yctk_smp-ind, xctk_smp+ind]; end
+            else
+                if (mod(a,2) == 0), linecte_f(:,:,a) = [yctk_smp+ind, xctk_smp+ind];
+                else, linecte_f(:,:,a) = [yctk_smp-ind, xctk_smp-ind]; end
+            end
+        end
+        kymo_f = [];
+        for a = 1:nkymo
+            kymo_f(:,a) = improfile(imgaussfilt(Lframe,1.5), linecte_f(:,2,a), linecte_f(:,1,a), double(kymo_len_smp));
+        end
+        kymo_f(isnan(kymo_f)) = 0;
+        kymo_avg_fixed(:,count-stp+1) = vertcat(zeros((5 + npoints - kymo_len_smp),1), mean(kymo_f,2));
     end
 
     % Tip plot
@@ -684,10 +706,17 @@ axis([min(tip_final(stp:smp,2))-5  max(tip_final(stp:smp,2))+5 min(tip_final(stp
 title('Tip Final Position', 'FontSize',16);
 
 subplot(nsp,1,2)
-plot(stp:smp,diamf_avg(stp:smp),'b')
+if (pixelsize > 0)
+    plot(stp:smp, diamf_avg(stp:smp)*pixelsize, 'b')
+    ylabel('µm', 'FontSize',12);
+    axis([stp-1 smp+1 0.5*max(diamf_avg)*pixelsize 1.25*max(diamf_avg)*pixelsize])
+else
+    plot(stp:smp, diamf_avg(stp:smp), 'b')
+    ylabel('pixels', 'FontSize',12);
+    axis([stp-1 smp+1 0.5*max(diamf_avg) 1.25*max(diamf_avg)])
+end
 xlabel('Frame', 'FontSize',12);
 title('Average Diameter','FontSize',16)
-axis([stp-1 smp+1 0.5*max(diamf_avg) 1.25*max(diamf_avg)])
 
 if ~strcmp(mode, 'two_raw')
     subplot(nsp,1,3)
@@ -704,12 +733,18 @@ if ~strcmp(mode, 'two_raw')
     else
         title('Intensity (Acceptor)', 'FontSize',16)
     end
-    axis([stp-1 smp+1 min(intensityM)*0.75 max(intensityM)*1.25]);
+    % Scale axis to include all plotted values (whole-tube + ROI)
+    all_vals = [intensityM(stp:smp); intensityM_F(stp:smp)];
+    if (split), all_vals = [all_vals; intensityM_F1(stp:smp)'; intensityM_F2(stp:smp)']; end
+    all_vals = all_vals(isfinite(all_vals) & all_vals > 0);
+    if ~isempty(all_vals)
+        axis([stp-1 smp+1 min(all_vals)*0.75 max(all_vals)*1.25]);
+    end
 end
 savefig(fig1, fullfile(figpath, [fname '_tip_diam_intensity.fig']));
 exportgraphics(fig1, fullfile(figpath, [fname '_tip_diam_intensity.png']));
 
-% Kymograph
+% Kymograph (per-frame centerline)
 if (nkymo > 0)
     kymo_avg(find(kymo_avg<0)) = 0;
     fig2 = figure;
@@ -719,6 +754,16 @@ if (nkymo > 0)
     imshow(kymo_img, map);
     savefig(fig2, fullfile(figpath, [fname '_kymograph.fig']));
     imwrite(ind2rgb(kymo_img, map), fullfile(figpath, [fname '_kymograph.png']));
+
+    % Fixed-line kymograph (smp centerline applied to all frames)
+    kymo_avg_fixed(find(kymo_avg_fixed<0)) = 0;
+    fig2b = figure;
+    map = colormap(jet(255));
+    map = vertcat([0 0 0],map);
+    kymo_img_f = uint8(kymo_avg_fixed.*255/max(kymo_avg_fixed(:)));
+    imshow(kymo_img_f, map);
+    savefig(fig2b, fullfile(figpath, [fname '_kymograph_fixed_line.fig']));
+    imwrite(ind2rgb(kymo_img_f, map), fullfile(figpath, [fname '_kymograph_fixed_line.png']));
 end
 
 % Total intensity plots (ratio trace only available with ratio stack)
@@ -752,6 +797,35 @@ if (ROItype > 0) && strcmp(mode, 'ratio')
     end
     savefig(fig3, fullfile(figpath, [fname '_intensity_ratio.fig']));
     exportgraphics(fig3, fullfile(figpath, [fname '_intensity_ratio.png']));
+end
+
+% ROI intensity figure for single-channel and two_raw modes
+if (ROItype > 0) && ~strcmp(mode, 'ratio')
+    fig3 = figure;
+    F1v = intensityM_F1(stp:smp); F2v = intensityM_F2(stp:smp); Fv = intensityM_F(stp:smp);
+    if (split)
+        subplot(1,2,1)
+        hold on
+        plot(stp:smp, Fv,  'k'); plot(stp:smp, F1v, 'b'); plot(stp:smp, F2v, 'g');
+        legend('Full ROI','Half 1','Half 2','Location','best');
+        xlabel('Frame'); title('ROI Intensity (Acceptor)', 'FontSize',14);
+        all_v = [Fv; F1v'; F2v']; all_v = all_v(isfinite(all_v) & all_v > 0);
+        if ~isempty(all_v), axis([stp-1 smp+1 min(all_v)*0.85 max(all_v)*1.15]); end
+
+        subplot(1,2,2)
+        ratio_12 = F2v ./ F1v;
+        plot(stp:smp, ratio_12, 'k');
+        xlabel('Frame'); title('Intensity Ratio Half2/Half1', 'FontSize',14);
+        rv = ratio_12(isfinite(ratio_12) & ratio_12 > 0);
+        if ~isempty(rv), axis([stp-1 smp+1 min(rv)*0.85 max(rv)*1.15]); end
+    else
+        plot(stp:smp, Fv, 'r');
+        xlabel('Frame'); title('ROI Intensity (Acceptor)', 'FontSize',14);
+        all_v = Fv(isfinite(Fv) & Fv > 0);
+        if ~isempty(all_v), axis([stp-1 smp+1 min(all_v)*0.85 max(all_v)*1.15]); end
+    end
+    savefig(fig3, fullfile(figpath, [fname '_roi_intensity.fig']));
+    exportgraphics(fig3, fullfile(figpath, [fname '_roi_intensity.png']));
 end
 
 % Distributions of intensity on the first and last frames (col1=smp, col2=stp)
