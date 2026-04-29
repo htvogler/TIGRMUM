@@ -5,7 +5,7 @@ close all
 path = '/Users/htv/Downloads/20260407/movies/tiff/FRET-IBRA_results/HV203_4_21'; % Input folder path (ADD PATH TO FILE HERE)
 fname = 'HV203_4_21'; % Filename 
 stp = 1701; % Start frame number
-smp = 1701; % End frame number
+smp = 1702; % End frame number
 
 % Options for analysis
 tip_plot = 1; % Video tip detection, has no effect if video_intensity = 2
@@ -109,6 +109,11 @@ if (tip_plot == 1) && (video_intensity ~= 2)
     V = VideoWriter([outpath '/' fname '_growth.avi'], 'Uncompressed AVI');
     V.FrameRate = 100;
     open(V);
+    hdum = figure('visible','off');
+    imagesc(zeros(size(M,1), size(M,2)));
+    fdum = getframe(gcf);
+    V_frame_size = size(fdum.cdata);
+    close(hdum);
 end
 
 if (nkymo > 0 || video_intensity > 0)
@@ -144,12 +149,23 @@ if (video_intensity == 2), return; end
 if (distributions), d = 1; end
 U_prev = [];
 frame_failed = false(smp, 1);
-V_frame_size = [];
+if ~exist('V_frame_size','var'), V_frame_size = []; end
 tip_final    = NaN(smp, 2);
 diamf_avg    = NaN(1, smp);
 Ucount       = NaN(1, smp);
 intensityM   = NaN(1, smp);
 intensityM_F = NaN(1, smp);
+Fpixelnum    = NaN(1, smp);
+intensityB1_F  = NaN(1, smp);
+intensityB2_F  = NaN(1, smp);
+intensityM_F1  = NaN(1, smp);
+intensityM_F2  = NaN(1, smp);
+F1pixelnum     = NaN(1, smp);
+F2pixelnum     = NaN(1, smp);
+intensityB1_F1 = NaN(1, smp);
+intensityB2_F1 = NaN(1, smp);
+intensityB1_F2 = NaN(1, smp);
+intensityB2_F2 = NaN(1, smp);
 for count = smp:-1:stp
     disp(['Image Analysis:' num2str(count)]);
     try
@@ -914,7 +930,7 @@ savefig(fig1, fullfile(figpath, [fname '_tip_diam_intensity.fig']));
 exportgraphics(fig1, fullfile(figpath, [fname '_tip_diam_intensity.png']));
 
 % Kymograph (per-frame centerline)
-if (nkymo > 0)
+if (nkymo > 0) && exist('kymo_avg','var') && ~isempty(kymo_avg)
     kymo_avg(find(kymo_avg<0)) = 0;
     fig2 = figure;
     map = colormap(jet(255));
@@ -925,6 +941,7 @@ if (nkymo > 0)
     imwrite(ind2rgb(kymo_img, map), fullfile(figpath, [fname '_kymograph.png']));
 
     % Fixed-line kymograph (smp centerline applied to all frames)
+    if exist('kymo_avg_fixed','var') && ~isempty(kymo_avg_fixed)
     kymo_avg_fixed(find(kymo_avg_fixed<0)) = 0;
     fig2b = figure;
     map = colormap(jet(255));
@@ -933,7 +950,8 @@ if (nkymo > 0)
     imshow(kymo_img_f, map);
     savefig(fig2b, fullfile(figpath, [fname '_kymograph_fixed_line.fig']));
     imwrite(ind2rgb(kymo_img_f, map), fullfile(figpath, [fname '_kymograph_fixed_line.png']));
-end
+    end  % kymo_avg_fixed guard
+end  % nkymo > 0
 
 % Total intensity plots (ratio trace only available with ratio stack)
 if (ROItype > 0) && strcmp(mode, 'ratio')
