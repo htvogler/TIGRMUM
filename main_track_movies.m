@@ -2,10 +2,10 @@ clear all
 close all
 
 % Path to Mat file
-path = '/Users/htv/Downloads/Claude_test/FRET-IBRA_results/HV202_1_7'; % Input folder path (ADD PATH TO FILE HERE)
-fname = 'HV202_1_7'; % Filename 
+path = '/Users/htv/Downloads/Claude_test/FRET-IBRA_results/HV202_1_3'; % Input folder path (ADD PATH TO FILE HERE)
+fname = 'HV202_1_3'; % Filename 
 stp = 1; % Start frame number
-smp = 2402; % End frame number
+smp = 7032; % End frame number
 
 % Options for analysis
 tip_plot = 1; % Video tip detection
@@ -256,20 +256,28 @@ for count = smp:-1:stp
     [Sbr,Sbc] = find(Sb > 0);
     Sbl = [Sbr Sbc];
     
-    % Find branch point closest to thin edge
-    if (last_flag == 0) Sbf = Sbl(dsearchn(Sbl,Qef),:);
-    else [tmp, Sbmin] = min(pdist2(Sbl,tip_final_last) + pdist2(Sbl,Qef));
-        Sbf = Sbl(Sbmin,:);
-    end
-    
-    % Try and remove branches within some parameters
-    close_dist = 0; 
     if (count == smp) diamo = diam; end
-    if (pdist2(Qef,Sbf) > weight*diamo) close_dist = 1; end
-    if (weight == 0) kill_angle = 0;
-    else kill_angle = 75;
+
+    if isempty(Sbl)
+        % Skeleton is a simple unbranched path — select tip endpoint directly
+        S2 = S; S2area = 1;
+        [~, base_pos] = max(Sel(:,2));
+        Sef = Sel; Sef(base_pos,:) = [];
+    else
+        % Find branch point closest to thin edge
+        if (last_flag == 0) Sbf = Sbl(dsearchn(Sbl,Qef),:);
+        else [tmp, Sbmin] = min(pdist2(Sbl,tip_final_last) + pdist2(Sbl,Qef));
+            Sbf = Sbl(Sbmin,:);
+        end
+
+        % Try and remove branches within some parameters
+        close_dist = 0;
+        if (pdist2(Qef,Sbf) > weight*diamo) close_dist = 1; end
+        if (weight == 0) kill_angle = 0;
+        else kill_angle = 75;
+        end
+        [S2,Sef,S2area] = branch_removal(S,Sbf,Sel,kill_angle,close_dist);
     end
-    [S2,Sef,S2area] = branch_removal(S,Sbf,Sel,kill_angle,close_dist);
         
     % If more than 2 branches, further evaluation is needed
     if (size(Sef,1) > 1)
