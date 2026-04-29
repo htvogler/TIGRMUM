@@ -2,10 +2,10 @@ clear all
 close all
 
 % Path to Mat file
-path = '/Users/htv/Downloads/Claude_test/FRET-IBRA_results/HV202_1_3'; % Input folder path (ADD PATH TO FILE HERE)
-fname = 'HV202_1_3'; % Filename 
+path = '/Users/htv/Downloads/20260407/movies/tiff/FRET-IBRA_results/HV203_4_21'; % Input folder path (ADD PATH TO FILE HERE)
+fname = 'HV203_4_21'; % Filename 
 stp = 1; % Start frame number
-smp = 7032; % End frame number
+smp = 100; % End frame number
 
 % Options for analysis
 tip_plot = 1; % Video tip detection, has no effect if video_intensity = 2
@@ -88,16 +88,14 @@ end
 % Zero background for non-ratio modes using per-frame Otsu thresholding
 % (for ratio mode this was already done in main_ratio_movies / FRET-IBRA)
 if ~strcmp(mode, 'ratio')
-    BT1_class = class(BT1);
-    parfor fc = 1:size(BT1,3)
+    for fc = 1:size(BT1,3)
         frm = BT1(:,:,fc);
-        BT1(:,:,fc) = frm .* cast(imbinarize(mat2gray(frm)), BT1_class);
+        BT1(:,:,fc) = frm .* cast(imbinarize(mat2gray(frm)), class(BT1));
     end
     if ~isempty(BT2)
-        BT2_class = class(BT2);
-        parfor fc = 1:size(BT2,3)
+        for fc = 1:size(BT2,3)
             frm = BT2(:,:,fc);
-            BT2(:,:,fc) = frm .* cast(imbinarize(mat2gray(frm)), BT2_class);
+            BT2(:,:,fc) = frm .* cast(imbinarize(mat2gray(frm)), class(BT2));
         end
     end
     M = BT1;
