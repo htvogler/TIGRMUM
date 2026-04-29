@@ -824,6 +824,32 @@ for count = smp:-1:stp
         if tip_plot && ~isempty(V_frame_size)
             writeVideo(V, zeros(V_frame_size, 'uint8'));
         end
+        % Fixed-line kymograph: computable from L alone, fill even on failure
+        if nkymo > 0 && exist('yctk_smp','var')
+            Lframe = L(:,:,count);
+            if (type == 1), Lframe = imrotate(Lframe,-90);
+            elseif (type == 3), Lframe = imrotate(Lframe,90);
+            elseif (type == 4), Lframe = imrotate(Lframe,180);
+            end
+            linecte_f = []; linecte_f(:,:,1) = [yctk_smp, xctk_smp];
+            for a = 2:nkymo
+                if (mod(a,2) == 0), ind = floor(a*0.5);
+                else, ind = -floor(a*0.5); end
+                if (start_nfitc_smp(1) < 0)
+                    if (mod(a,2) == 0), linecte_f(:,:,a) = [yctk_smp+ind, xctk_smp-ind];
+                    else, linecte_f(:,:,a) = [yctk_smp-ind, xctk_smp+ind]; end
+                else
+                    if (mod(a,2) == 0), linecte_f(:,:,a) = [yctk_smp+ind, xctk_smp+ind];
+                    else, linecte_f(:,:,a) = [yctk_smp-ind, xctk_smp-ind]; end
+                end
+            end
+            kymo_f = [];
+            for a = 1:nkymo
+                kymo_f(:,a) = improfile(imgaussfilt(Lframe,1.5), linecte_f(:,2,a), linecte_f(:,1,a), double(kymo_len_smp));
+            end
+            kymo_f(isnan(kymo_f)) = 0;
+            kymo_avg_fixed(:,count-stp+1) = vertcat(zeros((5 + npoints - kymo_len_smp),1), mean(kymo_f,2));
+        end
     end
 end
 
