@@ -5,7 +5,7 @@ close all
 path = '/Users/htv/Downloads/20260407/movies/tiff/FRET-IBRA_results/HV203_4_21'; % Input folder path (ADD PATH TO FILE HERE)
 fname = 'HV203_4_21'; % Filename 
 stp = 1; % Start frame number
-smp = 100; % End frame number
+smp = 9001; % End frame number
 
 % Options for analysis
 tip_plot = 1; % Video tip detection, has no effect if video_intensity = 2
