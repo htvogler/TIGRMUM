@@ -4,8 +4,8 @@ close all
 % Path to Mat file
 path = '/Users/htv/Downloads/20260407/movies/tiff/FRET-IBRA_results/HV203_4_21'; % Input folder path (ADD PATH TO FILE HERE)
 fname = 'HV203_4_21'; % Filename 
-stp = 1; % Start frame number
-smp = 9001; % End frame number
+stp = 1701; % Start frame number
+smp = 1701; % End frame number
 
 % Options for analysis
 tip_plot = 1; % Video tip detection, has no effect if video_intensity = 2
@@ -142,8 +142,12 @@ if (video_intensity == 2), return; end
 
 % Loop backwards over stack
 if (distributions), d = 1; end
+U_prev = [];
+frame_failed = false(smp, 1);
+V_frame_size = [];
 for count = smp:-1:stp
     disp(['Image Analysis:' num2str(count)]);
+    try
     O = M(:,:,count);
     
     if (type == 1) O = imrotate(O,-90); 
@@ -161,10 +165,39 @@ for count = smp:-1:stp
     U = imopen(P,se);
     U = bwareaopen(U,100);
     U = bwareafilt(P,1);
+    % Gap repair: recover disconnected P pieces close to U and aligned with its axis
+    Ustats = regionprops(U, 'Centroid', 'Orientation', 'MajorAxisLength');
+    if ~isempty(Ustats)
+        prox_dist = max(30, round(Ustats.MajorAxisLength * 0.15));
+        U_grown = imdilate(U, strel('disk', prox_dist));
+        Pother = bwlabel(P & ~U);
+        U_prev_grown = [];
+        if ~isempty(U_prev)
+            U_prev_grown = imdilate(U_prev, strel('disk', prox_dist));
+        end
+        for k = 1:max(Pother(:))
+            piece = Pother == k;
+            if ~any(U_grown(:) & piece(:)), continue; end
+            % Temporal test: piece overlaps previous frame's mask → include unconditionally
+            if ~isempty(U_prev_grown) && any(U_prev_grown(:) & piece(:))
+                U = U | piece;
+                continue;
+            end
+            % Fallback: orientation check (first frame or no U_prev overlap)
+            ps = regionprops(piece, 'Centroid');
+            v = ps.Centroid - Ustats.Centroid;
+            ang = abs(mod(atan2d(-v(2), v(1)) - Ustats.Orientation + 90, 180) - 90);
+            if ang <= 35
+                U = U | piece;
+            end
+        end
+    end
     U = bwmorph(U,'clean');
     U = medfilt2(U);
     U = imclose(U,se);
-    
+    U = bwareafilt(U, 1);
+    U_prev = U;
+
     if (count == smp) Ub = logical(ones(size(P)));
     else Ub = U;
     end
@@ -237,9 +270,12 @@ for count = smp:-1:stp
         if (nnz(Kd) == 2) connect = true; end
         Ks = [sum(K(:,1)) sum(K(1,:)) sum(K(:,end)) sum(K(end,:))];
         if (nnz(Ks) <= 2)
-            bou = bwboundaries(K); Kb = bou{1};
-            Kbl = [find(Kb(:,1) == 1); find(Kb(:,2) == 1); find(Kb(:,1) == size(K,1)); find(Kb(:,2) == size(K,1))];
-            if (size(Kbl,1) < size(K,1)) sides = true; end
+            bou = bwboundaries(K);
+            if ~isempty(bou)
+                Kb = bou{1};
+                Kbl = [find(Kb(:,1) == 1); find(Kb(:,2) == 1); find(Kb(:,1) == size(K,1)); find(Kb(:,2) == size(K,1))];
+                if (size(Kbl,1) < size(K,1)) sides = true; end
+            end
         end
         if(connect == true && sides == true) tols = rad; end
         rad = rad + 1;
@@ -779,7 +815,15 @@ for count = smp:-1:stp
         set(gca,'yticklabel',[]);
         frame = getframe(gcf);
         writeVideo(V,frame);
+        if isempty(V_frame_size), V_frame_size = size(frame.cdata); end
         close(h);
+    end
+    catch ME
+        warning('TIGRMUM: frame %d failed — %s', count, ME.message);
+        frame_failed(count) = true;
+        if tip_plot && ~isempty(V_frame_size)
+            writeVideo(V, zeros(V_frame_size, 'uint8'));
+        end
     end
 end
 
@@ -918,6 +962,25 @@ if (ROItype > 0) && ~strcmp(mode, 'ratio')
     end
     savefig(fig3, fullfile(figpath, [fname '_roi_intensity.fig']));
     exportgraphics(fig3, fullfile(figpath, [fname '_roi_intensity.png']));
+end
+
+% NaN-fill failed frames so CSV shows NaN instead of 0
+if any(frame_failed(stp:smp))
+    fi = find(frame_failed);
+    fi = fi(fi >= stp & fi <= smp);
+    tip_final(fi,:) = NaN;
+    Ucount(fi) = NaN;
+    diamf_avg(fi) = NaN;
+    intensityM(fi) = NaN;
+    if ROItype > 0
+        intensityM_F(fi) = NaN; Fpixelnum(fi) = NaN;
+        intensityB1_F(fi) = NaN;
+        if ~isempty(BT2), intensityB2_F(fi) = NaN; end
+        if split
+            intensityM_F1(fi) = NaN; F1pixelnum(fi) = NaN;
+            intensityM_F2(fi) = NaN; F2pixelnum(fi) = NaN;
+        end
+    end
 end
 
 % CSV export of per-frame measurements

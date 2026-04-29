@@ -26,10 +26,17 @@ ver = [bound(hullo,1) bound(hullo,2)];
 % Find the diameter, midpoint at the cutoff along with the positions along
 % the entire boundary
 yedge = find(ver(:,2) == maxy-1);
+if isempty(yedge)
+    [~, ri] = max(ver(:,2));
+    yedge = find(ver(:,2) == ver(ri,2));
+end
 [diam start edges] = edge_quant(ver,yedge);
 
 % Tip finding algorithm
 ybound = find(bound(:,2) == maxy-1);
+if isempty(ybound)
+    [~, ybound] = max(bound(:,2));
+end
 boundc = circshift(bound,-ybound(1));
 
 toln = tol*1.25; tip_final = [0 0];
