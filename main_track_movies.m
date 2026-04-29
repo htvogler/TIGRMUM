@@ -8,8 +8,8 @@ stp = 1; % Start frame number
 smp = 7032; % End frame number
 
 % Options for analysis
-tip_plot = 1; % Video tip detection
-video_intensity = 1; % Video intensity
+tip_plot = 1; % Video tip detection, has no effect if video_intensity = 2
+video_intensity = 2; % Intensity video: 0 = off, 1 = on + analysis, 2 = video only
 frame_rate = 0.3; % Number of seconds per frame of input video
 distributions = 0;  % Show histogram of results in the end
 workspace = 0; % Save workspace
@@ -105,7 +105,7 @@ end
 type = find_orient(M(:,:,1));
         
 % Scaled plot of the growing tube with tip and ROI
-if (tip_plot == 1)
+if (tip_plot == 1) && (video_intensity ~= 2)
     V = VideoWriter([outpath '/' fname '_growth.avi'], 'Uncompressed AVI');
     V.FrameRate = 100;
     open(V);
@@ -121,20 +121,22 @@ if (nkymo > 0 || video_intensity > 0)
         L(L<0) = 0;
         L = uint8(L.*255);
     else
-        Mmax = double(max(M(:)));
+        nz = sort(double(M(M > 0)));
+        Mmax = nz(round(0.99 * numel(nz)));
         L = uint8(double(M)./Mmax.*255);
         Cmin_tmp = 0; Cmin = 0; Cmax = Mmax;
     end
 end
 
 % Make a movie and output min and max intensities of the whole stack
-if (video_intensity) && ~strcmp(mode, 'two_raw')
+if (video_intensity > 0) && ~strcmp(mode, 'two_raw')
     if strcmp(mode, 'single')
         video_processing(outpath,fname,stp,smp,frame_rate,L(:,:,stp:smp),Cmin,Cmin_tmp,Cmax,'_intensity');
     else
         video_processing(outpath,fname,stp,smp,frame_rate,L(:,:,stp:smp),Cmin,Cmin_tmp,Cmax);
     end
 end
+if (video_intensity == 2), return; end
 
 % Loop backwards over stack
 if (distributions), d = 1; end
