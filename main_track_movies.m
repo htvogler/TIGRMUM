@@ -90,12 +90,12 @@ end
 if ~strcmp(mode, 'ratio')
     for fc = 1:size(BT1,3)
         frm = BT1(:,:,fc);
-        BT1(:,:,fc) = frm .* cast(imbinarize(frm), class(BT1));
+        BT1(:,:,fc) = frm .* cast(imbinarize(mat2gray(frm)), class(BT1));
     end
     if ~isempty(BT2)
         for fc = 1:size(BT2,3)
             frm = BT2(:,:,fc);
-            BT2(:,:,fc) = frm .* cast(imbinarize(frm), class(BT2));
+            BT2(:,:,fc) = frm .* cast(imbinarize(mat2gray(frm)), class(BT2));
         end
     end
     M = BT1;
