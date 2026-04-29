@@ -145,6 +145,11 @@ if (distributions), d = 1; end
 U_prev = [];
 frame_failed = false(smp, 1);
 V_frame_size = [];
+tip_final    = NaN(smp, 2);
+diamf_avg    = NaN(1, smp);
+Ucount       = NaN(1, smp);
+intensityM   = NaN(1, smp);
+intensityM_F = NaN(1, smp);
 for count = smp:-1:stp
     disp(['Image Analysis:' num2str(count)]);
     try
@@ -864,18 +869,20 @@ else
 end
 subplot(nsp,1,1)
 plot(tip_final(stp:smp,2),tip_final(stp:smp,1),'b')
-axis([min(tip_final(stp:smp,2))-5  max(tip_final(stp:smp,2))+5 min(tip_final(stp:smp,1))-5 max(tip_final(stp:smp,1))+5]);
+tf = tip_final(stp:smp,:); tf = tf(all(isfinite(tf),2),:);
+if ~isempty(tf), axis([min(tf(:,2))-5 max(tf(:,2))+5 min(tf(:,1))-5 max(tf(:,1))+5]); end
 title('Tip Final Position', 'FontSize',16);
 
 subplot(nsp,1,2)
+dvals = diamf_avg(stp:smp); dvals = dvals(isfinite(dvals));
 if (pixelsize > 0)
     plot(stp:smp, diamf_avg(stp:smp)*pixelsize, 'b')
     ylabel('µm', 'FontSize',12);
-    axis([stp-1 smp+1 0.5*max(diamf_avg)*pixelsize 1.25*max(diamf_avg)*pixelsize])
+    if ~isempty(dvals), axis([stp-1 smp+1 0.5*max(dvals)*pixelsize 1.25*max(dvals)*pixelsize]); end
 else
     plot(stp:smp, diamf_avg(stp:smp), 'b')
     ylabel('pixels', 'FontSize',12);
-    axis([stp-1 smp+1 0.5*max(diamf_avg) 1.25*max(diamf_avg)])
+    if ~isempty(dvals), axis([stp-1 smp+1 0.5*max(dvals) 1.25*max(dvals)]); end
 end
 xlabel('Frame', 'FontSize',12);
 title('Average Diameter','FontSize',16)
