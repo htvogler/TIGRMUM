@@ -9,7 +9,7 @@ smp = 7032; % End frame number
 
 % Options for analysis
 tip_plot = 1; % Video tip detection, has no effect if video_intensity = 2
-video_intensity = 2; % Intensity video: 0 = off, 1 = on + analysis, 2 = video only
+video_intensity = 1; % Intensity video: 0 = off, 1 = on + analysis, 2 = video only
 frame_rate = 0.3; % Number of seconds per frame of input video
 distributions = 0;  % Show histogram of results in the end
 workspace = 0; % Save workspace
@@ -88,14 +88,16 @@ end
 % Zero background for non-ratio modes using per-frame Otsu thresholding
 % (for ratio mode this was already done in main_ratio_movies / FRET-IBRA)
 if ~strcmp(mode, 'ratio')
-    for fc = 1:size(BT1,3)
+    BT1_class = class(BT1);
+    parfor fc = 1:size(BT1,3)
         frm = BT1(:,:,fc);
-        BT1(:,:,fc) = frm .* cast(imbinarize(mat2gray(frm)), class(BT1));
+        BT1(:,:,fc) = frm .* cast(imbinarize(mat2gray(frm)), BT1_class);
     end
     if ~isempty(BT2)
-        for fc = 1:size(BT2,3)
+        BT2_class = class(BT2);
+        parfor fc = 1:size(BT2,3)
             frm = BT2(:,:,fc);
-            BT2(:,:,fc) = frm .* cast(imbinarize(mat2gray(frm)), class(BT2));
+            BT2(:,:,fc) = frm .* cast(imbinarize(mat2gray(frm)), BT2_class);
         end
     end
     M = BT1;
@@ -121,8 +123,10 @@ if (nkymo > 0 || video_intensity > 0)
         L(L<0) = 0;
         L = uint8(L.*255);
     else
-        nz = sort(double(M(M > 0)));
-        Mmax = nz(round(0.99 * numel(nz)));
+        nz = double(M(M > 0));
+        [hc, he] = histcounts(nz, 1024);
+        cdf = cumsum(hc) / numel(nz);
+        Mmax = he(find(cdf >= 0.99, 1));
         L = uint8(double(M)./Mmax.*255);
         Cmin_tmp = 0; Cmin = 0; Cmax = Mmax;
     end
