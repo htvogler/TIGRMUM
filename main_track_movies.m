@@ -2,10 +2,10 @@ clear all
 close all
 
 % Path to Mat file
-path = '/Users/htv/Downloads/Claude_test/FRET-IBRA_results/HV202_1_7'; % Input folder path (ADD PATH TO FILE HERE)
-fname = 'HV202_1_7'; % Filename 
-stp = 1; % Start frame number
-smp = 2402; % End frame number
+path = '/Users/htv/Downloads/Claude_test/FRET-IBRA_results/HV203_1_11'; % Input folder path (ADD PATH TO FILE HERE)
+fname = 'HV203_1_11'; % Filename 
+stp = 600; % Start frame number
+smp = 613; % End frame number
 
 % Options for analysis
 tip_plot = 1; % Video tip detection
@@ -174,6 +174,29 @@ for count = smp:-1:stp
     Umax = max(find(U(:,end)==1)); Umin = min(find(U(:,end)==1));
     U = imfill(drawline(U,Umin,size(U,2),Umax,size(U,2),1),'holes');
 
+    % ---- DIAGNOSTIC BLOCK 1: binarisation pipeline (frame smp only) ----
+    if count == smp
+        dp = fullfile(outpath, sprintf('diag_%d', count));
+        imwrite(mat2gray(double(O)),            [dp '_01_O_raw.png']);
+        imwrite(mat2gray(double(L(:,:,count))), [dp '_02_L_display.png']);
+        imwrite(P,                              [dp '_03_P_otsu.png']);
+        Ud1 = imopen(P, se);
+        imwrite(Ud1,                            [dp '_04_U_imopen.png']);
+        Ud2 = bwareaopen(Ud1, 100);
+        imwrite(Ud2,                            [dp '_05_U_bwareaopen.png']);
+        Ud3 = bwareafilt(P, 1);
+        imwrite(Ud3,                            [dp '_06_U_bwareafilt_P.png']);
+        Ud4 = bwmorph(Ud3, 'clean');
+        imwrite(Ud4,                            [dp '_07_U_clean.png']);
+        Ud5 = medfilt2(Ud4);
+        imwrite(Ud5,                            [dp '_08_U_medfilt.png']);
+        Ud6 = imclose(Ud5, se);
+        imwrite(Ud6,                            [dp '_09_U_imclose.png']);
+        imwrite(U,                              [dp '_10_U_final.png']);
+        disp(['DIAG block 1 saved to ' dp]);
+    end
+    % ---- END DIAGNOSTIC BLOCK 1 ----
+
     % Removing branches from thinned image
     Q = bwmorph(U,'thin',Inf);    
     
@@ -324,23 +347,78 @@ for count = smp:-1:stp
     total2(:,:) = boundb(postotal2,:);
     
     % Ensure that both curves reach maxy
-    if (max(total1(:,2)) < (maxy-1))
-        while(max(total1(:,2)) < (maxy-1))
-            total1 = vertcat(total1,total2(end,:));
-            total2(end,:) = [];
-        end
-    elseif (max(total2(:,2)) < (maxy-1))
-        while(max(total2(:,2)) < (maxy-1))
-            total2 = vertcat(total2, total1(end,:));
-            total1(end,:) = [];
+    if isempty(total1) || isempty(total2)
+        dist_all = pdist2(boundb, tip_final(count,:));
+        postotal_all = find(dist_all > diamo*0.75);
+        half = ceil(length(postotal_all)*0.5);
+        total1 = boundb(postotal_all(1:half),:);
+        total2 = boundb(postotal_all(half+1:end),:);
+    end
+    if ~isempty(total1) && ~isempty(total2)
+        if (max(total1(:,2)) < (maxy-1))
+            while(max(total1(:,2)) < (maxy-1) && ~isempty(total2))
+                total1 = vertcat(total1,total2(end,:));
+                total2(end,:) = [];
+            end
+        elseif (max(total2(:,2)) < (maxy-1))
+            while(max(total2(:,2)) < (maxy-1) && ~isempty(total1))
+                total2 = vertcat(total2, total1(end,:));
+                total1(end,:) = [];
+            end
         end
     end
-    
-    if(abs(total1(end,1) - total2(end,1)) < 0.75*diam)
+    if isempty(total1) || isempty(total2)
+        dist_all = pdist2(boundb, tip_final(count,:));
+        postotal_all = find(dist_all > diamo*0.75);
+        if ~isempty(postotal_all)
+            half = ceil(length(postotal_all)*0.5);
+            total1 = boundb(postotal_all(1:half),:);
+            total2 = boundb(postotal_all(half+1:end),:);
+        end
+    end
+
+    if ~isempty(total1) && ~isempty(total2) && (abs(total1(end,1) - total2(end,1)) < 0.75*diam)
         total1(find(total1(:,2) >= max(total1(:,2))),:) = [];
         total2(find(total2(:,2) >= max(total2(:,2))),:) = [];
-    end 
-    
+    end
+
+    % ---- DIAGNOSTIC BLOCK 2: skeleton + geometry (frame smp only) ----
+    if count == smp
+        dp  = fullfile(outpath, sprintf('diag_%d', count));
+        sz1 = size(U,1); sz2 = size(U,2);
+
+        imwrite(imdilate(Q,  strel('disk',1)), [dp '_11_Q_thin.png']);
+        imwrite(imdilate(Q2, strel('disk',1)), [dp '_12_Q2_debranched.png']);
+
+        Rch = uint8(U)*80; Gch = uint8(U)*80; Bch = uint8(U)*80;
+        Qd  = imdilate(Q,  strel('disk',1)); Rch = Rch + uint8(Qd)*170;
+        Q2d = imdilate(Q2, strel('disk',1)); Gch = Gch + uint8(Q2d)*170;
+        if ~isempty(Qef)
+            re = max(1,Qef(1,1)-4):min(sz1,Qef(1,1)+4);
+            ce = max(1,Qef(1,2)-4):min(sz2,Qef(1,2)+4);
+            Bch(re,ce) = 255;
+        end
+        imwrite(cat(3,Rch,Gch,Bch), [dp '_13_skeleton_overlay.png']);
+
+        Rch = uint8(U)*60; Gch = uint8(U)*60; Bch = uint8(U)*60;
+        brows = max(1,min(sz1,boundb(:,1))); bcols = max(1,min(sz2,boundb(:,2)));
+        for pi=1:size(boundb,1), Rch(brows(pi),bcols(pi))=255; Gch(brows(pi),bcols(pi))=255; end
+        if ~isempty(total1)
+            tr=max(1,min(sz1,total1(:,1))); tc=max(1,min(sz2,total1(:,2)));
+            for pi=1:size(total1,1), Gch(tr(pi),tc(pi))=255; end
+        end
+        if ~isempty(total2)
+            tr=max(1,min(sz1,total2(:,1))); tc=max(1,min(sz2,total2(:,2)));
+            for pi=1:size(total2,1), Bch(tr(pi),tc(pi))=255; end
+        end
+        re=max(1,tip_final(count,1)-3):min(sz1,tip_final(count,1)+3);
+        ce=max(1,tip_final(count,2)-3):min(sz2,tip_final(count,2)+3);
+        Rch(re,ce)=255; Gch(re,ce)=0; Bch(re,ce)=0;
+        imwrite(cat(3,Rch,Gch,Bch), [dp '_14_geometry_overlay.png']);
+        disp(['DIAG block 2 saved to ' dp]);
+    end
+    % ---- END DIAGNOSTIC BLOCK 2 ----
+
     % Centerline: minimum-cost path through tube, weighted by distance from
     % wall — paths near the tube centre are cheap, so the optimal path
     % naturally follows the medial axis regardless of bends or branches.
@@ -659,7 +737,9 @@ for count = smp:-1:stp
 
     % Tip plot
     Splot = zeros(size(Q2));
-    Splot(tip_final(count,1)-3:tip_final(count,1)+3,tip_final(count,2)-3:tip_final(count,2)+3) = 1;
+    r1 = max(1,tip_final(count,1)-3); r2 = min(size(Splot,1),tip_final(count,1)+3);
+    c1 = max(1,tip_final(count,2)-3); c2 = min(size(Splot,2),tip_final(count,2)+3);
+    Splot(r1:r2,c1:c2) = 1;
  %   Splot(tip_ellipsef(1)-1:tip_ellipsef(1)+1,tip_ellipsef(2)-1:tip_ellipsef(2)+1) = 2;
  %   if (size(Sef,1) > 1) Splot(tip_mid(1)-3:tip_mid(1)+3,tip_mid(2)-3:tip_mid(2)+3) = 3; end
  %   Splot(tip_skel(1)-1:tip_skel(1)+1,(2)-1:tip_skel(2)+1) = 4;

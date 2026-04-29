@@ -33,20 +33,29 @@ ybound = find(bound(:,2) == maxy-1);
 boundc = circshift(bound,-ybound(1));
 
 toln = tol*1.25; tip_final = [0 0];
+toln_max = norm(size(H));
 while (nnz(tip_final) == 0)
-    tip_new = []; 
+    tip_new = [];
     for i = 1:length(bound)
         dist_val = pdist2(boundc(i,:),major(1,:));
         if (dist_val < toln) tip_new = [tip_new; boundc(i,:)]; end
     end
     [tip_final,center,phin,axes,tip_check] = ellipse_data(tip_new);
+    if toln > toln_max
+        tip_final = major(1,:);
+        break;
+    end
     toln = toln + 5;
 end
 
 % Shift the entire boundary vector center at final tip
-posxf = []; posxy = []; boundb = [];
+posxf = []; posyf = []; boundb = [];
 posxf = find(boundc(:,1) == tip_final(1));
 posyf = find(boundc(:,2) == tip_final(2));
 interf = intersect(posxf,posyf);
+if isempty(interf)
+    [~, interf] = min(pdist2(boundc, tip_final));
+    tip_final = boundc(interf,:);
+end
 
 boundb = circshift(boundc,(-ceil(length(boundc)*0.5)-interf(1)));
