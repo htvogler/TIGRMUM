@@ -2,16 +2,16 @@ clear all
 close all
 
 % Path to Mat file
-path = '/Users/htv/Downloads/Claude_test/FRET-IBRA_results/HV203_1_11'; % Input folder path (ADD PATH TO FILE HERE)
-fname = 'HV203_1_11'; % Filename 
-stp = 600; % Start frame number
-smp = 613; % End frame number
+path = '/Users/htv/Downloads/Claude_test/FRET-IBRA_results/HV202_1_7'; % Input folder path (ADD PATH TO FILE HERE)
+fname = 'HV202_1_7'; % Filename 
+stp = 1; % Start frame number
+smp = 2402; % End frame number
 
 % Options for analysis
 tip_plot = 1; % Video tip detection
 video_intensity = 1; % Video intensity
 frame_rate = 0.3; % Number of seconds per frame of input video
-distributions = 1;  % Show histogram of results in the end
+distributions = 0;  % Show histogram of results in the end
 workspace = 0; % Save workspace
 
 % Tip detection parameters
