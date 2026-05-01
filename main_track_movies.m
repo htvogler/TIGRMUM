@@ -2,16 +2,16 @@ clear all
 close all
 
 % Path to Mat file
-path = '/Users/htv/Downloads/20260327/tiff/FRET-IBRA_results/20260327_3'; % Input folder path (ADD PATH TO FILE HERE)
-fname = '20260327_3'; % Filename 
+path = '/Users/htv/Downloads/20260407/movies/tiff/FRET-IBRA_results/HV202_2_11'; % Input folder path (ADD PATH TO FILE HERE)
+fname = 'HV202_2_11'; % Filename 
 stp = 1; % Start frame number
-smp = 999; % End frame number
+smp = 623; % End frame number
 
 % Options for analysis
 tip_plot = 1; % Video tip detection, has no effect if video_intensity = 2
 video_intensity = 1; % Intensity video: 0 = off, 1 = on + analysis, 2 = video only
-frame_rate = 1; % Number of seconds per frame of input video
-distributions = 0;  % Show histogram of results in the end
+frame_rate = 0.36; % Number of seconds per frame of input video
+distributions = 1;  % Show histogram of results in the end
 workspace = 0; % Save workspace
 
 % Tip detection parameters
@@ -23,7 +23,7 @@ split = 1; % Split ROI along center line
 circle = 0; % Circle ROI as fraction of diameter
 starti = 0; % Rectangle ROI Start length / no pixelsize means percentage as a fraction of length of tube
 stopi = 10; % Rectangle/Circle ROI Stop length / no pixelsize means percentage as a fraction of length of tube
-pixelsize = 0.16125; % Pixel to um conversion
+pixelsize = 0.3225; % Pixel to um conversion
 
 % Kymo, movie and measurements options
 Cmin = 1.5; % Min pixel value in Ratio stack
@@ -31,7 +31,7 @@ Cmax = 3; % Max pixel value in Ratio stack
 nkymo = 3; % Number of pixels line width average for kymograph (odd number) (0 means no kymo)
 diamcutoff = 0; % In pixels if pixelsize is not given
 bit_depth = 12; % Camera bit depth (12 or 16) — must match FRET-IBRA config
-bg_thresh_frac = 0.016;  % Background zeroing threshold as fraction of full 16-bit range (always
+bg_thresh_frac = 0.018;  % Background zeroing threshold as fraction of full 16-bit range (always
                         % applied after rescaling, so camera-independent: 0.02 = ~1311 cts;
                         % lower for weak-signal stacks, e.g. 0.008 = ~524 cts)
 
@@ -235,19 +235,20 @@ for count = smp:-1:stp
             xr = min(max(round(xctk_smp), 1), size(U,2));
             cl_mask(sub2ind(size(U), yr, xr)) = true;
             cl_mask_grown = imdilate(cl_mask, strel('disk', 15));
-            % Collective inclusion: any non-background pixel within 15 px of
-            % the smp centerline is unambiguously tube — add all at once.
-            % cl_mask is clipped to the bounding box of (U | on_cl) so it
-            % cannot extend beyond the current frame's real tube extent
-            % (e.g. into background past the tip in early frames).
-            on_cl = P & cl_mask_grown;
-            if any(on_cl(:))
-                combined_bb = U | on_cl;
-                rc = find(any(combined_bb, 2)); cc = find(any(combined_bb, 1));
-                cl_clipped = cl_mask;
-                cl_clipped([1:rc(1)-1, rc(end)+1:end], :) = false;
-                cl_clipped(:, [1:cc(1)-1, cc(end)+1:end]) = false;
-                U = U | on_cl | cl_clipped;
+            % Gap gate: only run centerline-guided repair if the smp
+            % centerline actually passes through unmasked area.  For
+            % complete tubes (strong signal, no gap) the centerline lies
+            % entirely within U and this block is skipped entirely.
+            if any(cl_mask(:) & ~U(:))
+                on_cl = P & cl_mask_grown;
+                if any(on_cl(:))
+                    combined_bb = U | on_cl;
+                    rc = find(any(combined_bb, 2)); cc = find(any(combined_bb, 1));
+                    cl_clipped = cl_mask;
+                    cl_clipped([1:rc(1)-1, rc(end)+1:end], :) = false;
+                    cl_clipped(:, [1:cc(1)-1, cc(end)+1:end]) = false;
+                    U = U | on_cl | cl_clipped;
+                end
             end
         end
         for k = 1:max(Pother(:))
@@ -273,7 +274,7 @@ for count = smp:-1:stp
     % Re-apply centerline bridge: medfilt2 removes 1-pixel-wide lines, so
     % restore cl_mask + signal pixels before imclose thickens them into a
     % proper connection across the gap.
-    if ~isempty(cl_mask)
+    if ~isempty(cl_mask) && any(cl_mask(:) & ~U(:))
         on_cl = P & cl_mask_grown;
         if any(on_cl(:))
             combined_bb = U | on_cl;
