@@ -2,15 +2,15 @@ clear all
 close all
 
 % Path to Mat file
-path = '/Users/htv/Downloads/20260407/movies/tiff/FRET-IBRA_results/HV203_4_21'; % Input folder path (ADD PATH TO FILE HERE)
-fname = 'HV203_4_21'; % Filename 
+path = '/Users/htv/Downloads/20260327/tiff/FRET-IBRA_results/20260327_3'; % Input folder path (ADD PATH TO FILE HERE)
+fname = '20260327_3'; % Filename 
 stp = 1; % Start frame number
-smp = 9001; % End frame number
+smp = 999; % End frame number
 
 % Options for analysis
 tip_plot = 1; % Video tip detection, has no effect if video_intensity = 2
 video_intensity = 1; % Intensity video: 0 = off, 1 = on + analysis, 2 = video only
-frame_rate = 0.3; % Number of seconds per frame of input video
+frame_rate = 1; % Number of seconds per frame of input video
 distributions = 0;  % Show histogram of results in the end
 workspace = 0; % Save workspace
 
@@ -23,7 +23,7 @@ split = 1; % Split ROI along center line
 circle = 0; % Circle ROI as fraction of diameter
 starti = 0; % Rectangle ROI Start length / no pixelsize means percentage as a fraction of length of tube
 stopi = 10; % Rectangle/Circle ROI Stop length / no pixelsize means percentage as a fraction of length of tube
-pixelsize = 0.3225; % Pixel to um conversion
+pixelsize = 0.16125; % Pixel to um conversion
 
 % Kymo, movie and measurements options
 Cmin = 1.5; % Min pixel value in Ratio stack
