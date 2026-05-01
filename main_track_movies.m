@@ -702,9 +702,33 @@ for count = smp:-1:stp
             distc_t = distc_t*pixelsize;
         end
         
-        % Project ROI length onto the side curves
-        [startc1,stopc1] = closest_bound(total1,xctf,yctf,max(startpos,1),max(stoppos,1));
-        [startc2,stopc2] = closest_bound(total2,xctf,yctf,max(startpos,1),max(stoppos,1));
+        % Project ROI length onto the side curves.
+        % Map the target physical distances (starti, stopi in µm) directly
+        % onto the DENSE 100-pt centerline (distc in px / xc,yc) by
+        % converting to pixels and finding the nearest-neighbour index.
+        % This avoids distctf(startpos/stoppos) which can be wrong for
+        % S-curved tubes where line_continuity leaves large gaps in distctf.
+        if pixelsize > 0
+            arc_start_px = starti / pixelsize;
+            arc_stop_px  = min(stopi / pixelsize, distc(end));
+        else
+            arc_start_px = starti / 100 * distc(end);
+            arc_stop_px  = stopi  / 100 * distc(end);
+        end
+        [~, k_start] = min(abs(distc - arc_start_px));
+        [~, k_stop]  = min(abs(distc - arc_stop_px));
+        k_start = max(1, min(k_start, length(xc)));
+        k_stop  = max(1, min(k_stop,  length(xc)));
+
+        [startc1,stopc1] = closest_bound(total1,xc,yc,k_start,k_stop,diamo*2);
+        [startc2,stopc2] = closest_bound(total2,xc,yc,k_start,k_stop,diamo*2);
+
+        % Guarantee ordering (tip-end first, needed for polygon construction)
+        if stopc1 < startc1, [startc1,stopc1] = deal(stopc1,startc1); end
+        if stopc2 < startc2, [startc2,stopc2] = deal(stopc2,startc2); end
+
+        fprintf('F%d: arcs %.1f->%.1f  k:%d->%d  c1:%d->%d  c2:%d->%d\n', ...
+            count,arc_start_px,arc_stop_px,k_start,k_stop,startc1,stopc1,startc2,stopc2);
         
         % Create masks for rectangles and circles, and include whether they are
         % normal, split or stationary
@@ -725,8 +749,8 @@ for count = smp:-1:stp
                 if (circle > 0)
                     stoppos = length(linectf); stopc1 = length(total1); stopc2 = length(total2);
                 end
-                roi1 = vertcat(total1(startc1:stopc1,:), linectf(stoppos:-1:startpos,:));
-                roi2 = vertcat(total2(startc2:stopc2,:), linectf(stoppos:-1:startpos,:));
+                roi1 = vertcat(total1(startc1:stopc1,:), [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
+                roi2 = vertcat(total2(startc2:stopc2,:), [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
                 if (starti < distc_t)
                     roi1 = vertcat(boundb(range2(1):postotal1(2),:),roi1,boundb(range2(1),:));
                     roi2 = vertcat(boundb(range2(1):-1:postotal2(1),:),roi2,boundb(range2(1),:));
