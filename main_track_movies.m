@@ -30,6 +30,10 @@ Cmin = 1.5; % Min pixel value in Ratio stack
 Cmax = 3; % Max pixel value in Ratio stack
 nkymo = 3; % Number of pixels line width average for kymograph (odd number) (0 means no kymo)
 diamcutoff = 0; % In pixels if pixelsize is not given
+bit_depth = 12; % Camera bit depth (12 or 16) — must match FRET-IBRA config
+bg_thresh_frac = 0.016;  % Background zeroing threshold as fraction of full 16-bit range (always
+                        % applied after rescaling, so camera-independent: 0.02 = ~1311 cts;
+                        % lower for weak-signal stacks, e.g. 0.008 = ~524 cts)
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Detect input file and select analysis mode
@@ -85,17 +89,38 @@ else
     error('No suitable HDF5 input file found for %s', fname);
 end
 
-% Zero background for non-ratio modes using per-frame Otsu thresholding
-% (for ratio mode this was already done in main_ratio_movies / FRET-IBRA)
+% Rescale data to full 16-bit range if the camera bit depth is less than 16.
+% FRET-IBRA stores 12-bit (or other) camera data in uint16 containers without
+% expanding the range, so raw values only occupy [0, 2^bit_depth-1].
+% Rescaling here makes all downstream code — thresholds, display scaling,
+% intensity CSV values — consistent and bit-depth-independent.
+% NOTE: intensity values in the CSV will differ from pre-rescaling runs
+%       (e.g. x16 higher for 12-bit data); ratios and relative values are unaffected.
+bit_max = double(2^16 - 1); % always 65535 after rescaling
+if bit_depth < 16 && ~strcmp(mode, 'ratio')
+    scale = bit_max / double(2^bit_depth - 1);  % e.g. 65535/4095 ≈ 16 for 12-bit
+    BT1 = uint16(double(BT1) .* scale);
+    if ~isempty(BT2)
+        BT2 = uint16(double(BT2) .* scale);
+    end
+end
+
+% Zero background for non-ratio modes using a fixed threshold as a fraction
+% of the full 16-bit range. After rescaling above, bit_max is always 65535
+% so bg_thresh_frac is camera-independent: 0.02 = ~1311 counts regardless
+% of bit depth. FRET-IBRA background subtraction leaves a noise floor of
+% ~1-50 raw counts; after 12-bit rescaling that is ~16-800 counts, well
+% below typical tube signal. Otsu is not used here because it adapts to
+% something that doesn't need adapting and risks cutting into weak tube signal.
 if ~strcmp(mode, 'ratio')
     for fc = 1:size(BT1,3)
         frm = BT1(:,:,fc);
-        BT1(:,:,fc) = frm .* cast(imbinarize(mat2gray(frm)), class(BT1));
+        BT1(:,:,fc) = frm .* cast(double(frm) > bit_max * bg_thresh_frac, class(BT1));
     end
     if ~isempty(BT2)
         for fc = 1:size(BT2,3)
             frm = BT2(:,:,fc);
-            BT2(:,:,fc) = frm .* cast(imbinarize(mat2gray(frm)), class(BT2));
+            BT2(:,:,fc) = frm .* cast(double(frm) > bit_max * bg_thresh_frac, class(BT2));
         end
     end
     M = BT1;
@@ -166,6 +191,7 @@ intensityB1_F1 = NaN(1, smp);
 intensityB2_F1 = NaN(1, smp);
 intensityB1_F2 = NaN(1, smp);
 intensityB2_F2 = NaN(1, smp);
+warning('off', 'MATLAB:nearlySingularMatrix');
 for count = smp:-1:stp
     disp(['Image Analysis:' num2str(count)]);
     try
@@ -179,7 +205,7 @@ for count = smp:-1:stp
     if strcmp(mode, 'ratio')
         P = imbinarize(O, 0.2);
     else
-        P = imbinarize(O);
+        P = O > 0;  % background already zeroed in pre-loop; no second threshold needed
     end
     se = strel('disk',10);
     se2 = strel('disk',1);
@@ -196,8 +222,37 @@ for count = smp:-1:stp
         if ~isempty(U_prev)
             U_prev_grown = imdilate(U_prev, strel('disk', prox_dist));
         end
+        % Build centerline mask from smp reference frame if available.
+        % All P pixels collectively overlapping the dilated centerline are
+        % included in one shot (no per-piece iteration) — works even when
+        % the signal is fragmented into many tiny components.  The centerline
+        % pixels themselves are also added as a bridge so imclose can fill
+        % large gaps before bwareafilt.
+        cl_mask = []; cl_mask_grown = [];
+        if exist('yctk_smp','var')
+            cl_mask = false(size(U));
+            yr = min(max(round(yctk_smp), 1), size(U,1));
+            xr = min(max(round(xctk_smp), 1), size(U,2));
+            cl_mask(sub2ind(size(U), yr, xr)) = true;
+            cl_mask_grown = imdilate(cl_mask, strel('disk', 15));
+            % Collective inclusion: any non-background pixel within 15 px of
+            % the smp centerline is unambiguously tube — add all at once.
+            % cl_mask is clipped to the bounding box of (U | on_cl) so it
+            % cannot extend beyond the current frame's real tube extent
+            % (e.g. into background past the tip in early frames).
+            on_cl = P & cl_mask_grown;
+            if any(on_cl(:))
+                combined_bb = U | on_cl;
+                rc = find(any(combined_bb, 2)); cc = find(any(combined_bb, 1));
+                cl_clipped = cl_mask;
+                cl_clipped([1:rc(1)-1, rc(end)+1:end], :) = false;
+                cl_clipped(:, [1:cc(1)-1, cc(end)+1:end]) = false;
+                U = U | on_cl | cl_clipped;
+            end
+        end
         for k = 1:max(Pother(:))
             piece = Pother == k;
+            % Proximity gate
             if ~any(U_grown(:) & piece(:)), continue; end
             % Temporal test: piece overlaps previous frame's mask → include unconditionally
             if ~isempty(U_prev_grown) && any(U_prev_grown(:) & piece(:))
@@ -215,6 +270,20 @@ for count = smp:-1:stp
     end
     U = bwmorph(U,'clean');
     U = medfilt2(U);
+    % Re-apply centerline bridge: medfilt2 removes 1-pixel-wide lines, so
+    % restore cl_mask + signal pixels before imclose thickens them into a
+    % proper connection across the gap.
+    if ~isempty(cl_mask)
+        on_cl = P & cl_mask_grown;
+        if any(on_cl(:))
+            combined_bb = U | on_cl;
+            rc = find(any(combined_bb, 2)); cc = find(any(combined_bb, 1));
+            cl_clipped = cl_mask;
+            cl_clipped([1:rc(1)-1, rc(end)+1:end], :) = false;
+            cl_clipped(:, [1:cc(1)-1, cc(end)+1:end]) = false;
+            U = U | on_cl | cl_clipped;
+        end
+    end
     U = imclose(U,se);
     U = bwareafilt(U, 1);
     U_prev = U;
@@ -493,7 +562,7 @@ for count = smp:-1:stp
     % naturally follows the medial axis regardless of bends or branches.
     right_col = size(U,2) - 1;
     right_pix = find(U(:, right_col));
-    if isempty(right_pix)
+    while isempty(right_pix) && right_col > 1
         right_col = right_col - 1;
         right_pix = find(U(:, right_col));
     end
@@ -840,7 +909,7 @@ for count = smp:-1:stp
         close(h);
     end
     catch ME
-        warning('TIGRMUM: frame %d failed — %s', count, ME.message);
+        warning('TIGRMUM: frame %d failed — %s (line %d)', count, ME.message, ME.stack(1).line);
         frame_failed(count) = true;
         if tip_plot && ~isempty(V_frame_size)
             writeVideo(V, zeros(V_frame_size, 'uint8'));
@@ -873,6 +942,7 @@ for count = smp:-1:stp
         end
     end
 end
+warning('on', 'MATLAB:nearlySingularMatrix');
 
 if (tip_plot == 1) close(V); end
 
