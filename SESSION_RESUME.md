@@ -2,9 +2,9 @@
 
 ## Current state
 
-Branch: `robust_tracking` (branched from `master`, carries all prior fixes).
-Test parameters: stp=1, smp=1702 — user about to run to find any remaining
-problem frames between 1 and 1702.
+Branch: `master` (`robust_tracking` merged and pushed to `origin/master`, commit `50b355b`).
+Test parameters: stp=1, smp=9001 — full HV203_4_21 stack run in progress to
+find any remaining problem frames.
 
 ---
 
@@ -81,13 +81,13 @@ try/catch and handled as a skipped frame.
 
 ## Known open items
 
-- Running stp=1, smp=1702 to find any remaining problem frames
+- Full stack run (stp=1, smp=9001) in progress — watch for any remaining
+  skipped frames in the warning output
 - Diagnostic blocks (images 01–14 per run) still in `main_track_movies.m`
+  — decide when to remove
 - FRET-IBRA HDF5 attribute overflow on 9000-frame stack — fix in
   `fret-ibra/ibra/functions.py` line 274: store `res_range` as dataset
   not attribute
-- `robust_tracking` branch not yet merged to `master` or pushed to remote
-  (currently ~20+ commits ahead)
 
 ---
 
