@@ -2,16 +2,16 @@ clear all
 close all
 
 % Path to Mat file
-path = '/Users/htv/Downloads/20260407/movies/tiff/FRET-IBRA_results/HV202_2_11'; % Input folder path (ADD PATH TO FILE HERE)
-fname = 'HV202_2_11'; % Filename 
+path = '/Users/htv/Downloads/20260407/movies/tiff/FRET-IBRA_results/HV203_4_21'; % Input folder path (ADD PATH TO FILE HERE)
+fname = 'HV203_4_21'; % Filename 
 stp = 1; % Start frame number
-smp = 623; % End frame number
+smp = 9001; % End frame number
 
 % Options for analysis
 tip_plot = 1; % Video tip detection, has no effect if video_intensity = 2
 video_intensity = 1; % Intensity video: 0 = off, 1 = on + analysis, 2 = video only
-frame_rate = 0.36; % Number of seconds per frame of input video
-distributions = 1;  % Show histogram of results in the end
+frame_rate = 0.3697; % Number of seconds per frame of input video
+distributions = 0;  % Show histogram of results in the end
 workspace = 0; % Save workspace
 
 % Tip detection parameters
@@ -70,21 +70,16 @@ elseif exist(back_file, 'file')
         disp('      For ratio analysis, run FRET-IBRA module 2 first, then re-run main_track_movies.m.');
     else
         mode = 'single';
-        BT1 = h5read(back_file, '/acceptor');
+        if any(strcmp(dnames, 'acceptor_bleach'))
+            BT1 = h5read(back_file, '/acceptor_bleach');
+            disp('NOTE: Using bleach-corrected/cropped stack (/acceptor_bleach) from _back.h5.');
+        else
+            BT1 = h5read(back_file, '/acceptor');
+            warning('TIGRMUM: /acceptor_bleach not found in %s. Run FRET-IBRA Module 4 first.', back_file);
+        end
         BT2 = [];
     end
     M = BT1;
-    try
-        bc = h5readatt(back_file, '/', 'bleach_corrected');
-        if iscell(bc), bc = bc{1}; end
-        if ischar(bc), bc = strcmpi(bc, 'true'); end
-        bc = logical(bc);
-    catch
-        bc = false;
-    end
-    if ~bc
-        warning('TIGRMUM: bleach_corrected attribute missing or false in %s. Run FRET-IBRA Module 4 first.', back_file);
-    end
 else
     error('No suitable HDF5 input file found for %s', fname);
 end
@@ -154,7 +149,7 @@ if (nkymo > 0 || video_intensity > 0)
         nz = double(M(M > 0));
         [hc, he] = histcounts(nz, 1024);
         cdf = cumsum(hc) / numel(nz);
-        Mmax = he(find(cdf >= 0.99, 1));
+        Mmax = he(find(cdf >= 0.999, 1));
         L = uint8(double(M)./Mmax.*255);
         Cmin_tmp = 0; Cmin = 0; Cmax = Mmax;
     end
