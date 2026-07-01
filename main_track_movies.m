@@ -875,9 +875,7 @@ for count = smp:-1:stp
     Cplot(:,size(U,2)+1:end) = [];
     
     % Plot two images
-    if (tip_plot) h = figure('visible', 'off');
-    else h = figure;
-    end
+    h = figure('visible', 'off');
 
     %subplot(1,2,2)
     image2 = U*20+Splot*40+Cplot*30;
@@ -894,8 +892,8 @@ for count = smp:-1:stp
         frame = getframe(gcf);
         writeVideo(V,frame);
         if isempty(V_frame_size), V_frame_size = size(frame.cdata); end
-        close(h);
     end
+    close(h);
     catch ME
         warning('TIGRMUM: frame %d failed — %s (line %d)', count, ME.message, ME.stack(1).line);
         frame_failed(count) = true;
