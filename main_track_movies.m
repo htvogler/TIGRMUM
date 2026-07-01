@@ -354,7 +354,34 @@ for count = smp:-1:stp
     [Sbr,Sbc] = find(Sb > 0);
     Sbl = [Sbr Sbc];
     
-    if (count == smp) diamo = diam; end
+    if (count == smp)
+        % Single-column diam (measured at maxy-1 by locate_tip/edge_quant)
+        % underestimates the true diameter on weak-signal stacks: that
+        % column sits right where the tube crosses into the frame, which
+        % is where segmentation is most marginal. Average the cross-
+        % sectional span over several columns moving inward from the edge
+        % instead of trusting one column. Verified on HV202_2_11 frame
+        % 623: single-column=17px vs multi-column mean=20.3px.
+        ref_col = size(U,2) - 1; % same column locate_tip/edge_quant uses
+        diamo_samples = [];
+        for doff = 0:5:50
+            dcol = ref_col - doff;
+            if dcol < 1, break; end
+            drows = find(U(:,dcol));
+            if ~isempty(drows)
+                diamo_samples(end+1) = max(drows) - min(drows);
+            end
+        end
+        if ~isempty(diamo_samples)
+            diamo = mean(diamo_samples);
+        else
+            diamo = diam; % fallback if no columns had any mask pixels
+        end
+        if debug_mode
+            fprintf('  diamo F%d: single-col=%.1fpx multi-col-avg=%.1fpx (n=%d cols)\n', ...
+                count, diam, diamo, numel(diamo_samples));
+        end
+    end
 
     if isempty(Sbl)
         % Skeleton is a simple unbranched path — select tip endpoint directly
