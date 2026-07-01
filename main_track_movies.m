@@ -1156,20 +1156,24 @@ if (distributions == 1)
 
     figd1 = figure;
     subplot(1,2,1)
-    histogram(Mhist(Mhist(:,1)>0.1,1)); hold on; histogram(Mhist(Mhist(:,2)>0.1,2))
+    histogram(Mhist(Mhist(:,1)>0.1,1)); hold on;
+    if size(Mhist,2) >= 2, histogram(Mhist(Mhist(:,2)>0.1,2)); end
     title('Histogram C')
     subplot(1,2,2)
-    histogram(MhistF(MhistF(:,1)>0.1,1)); hold on; histogram(MhistF(MhistF(:,2)>0.1,2))
+    histogram(MhistF(MhistF(:,1)>0.1,1)); hold on;
+    if size(MhistF,2) >= 2, histogram(MhistF(MhistF(:,2)>0.1,2)); end
     title('Histogram CF')
     savefig(figd1, fullfile(figpath, [fname '_hist_C.fig']));
     exportgraphics(figd1, fullfile(figpath, [fname '_hist_C.png']));
 
     figd2 = figure;
     subplot(1,2,1)
-    histogram(B1hist(B1hist(:,1)>0.1,1)); hold on; histogram(B1hist(B1hist(:,2)>0.1,2))
+    histogram(B1hist(B1hist(:,1)>0.1,1)); hold on;
+    if size(B1hist,2) >= 2, histogram(B1hist(B1hist(:,2)>0.1,2)); end
     title('Histogram B1')
     subplot(1,2,2)
-    histogram(B1histF(B1histF(:,1)>0.1,1)); hold on; histogram(B1histF(B1histF(:,2)>0.1,2))
+    histogram(B1histF(B1histF(:,1)>0.1,1)); hold on;
+    if size(B1histF,2) >= 2, histogram(B1histF(B1histF(:,2)>0.1,2)); end
     title('Histogram B1F')
     savefig(figd2, fullfile(figpath, [fname '_hist_B1.fig']));
     exportgraphics(figd2, fullfile(figpath, [fname '_hist_B1.png']));
@@ -1178,10 +1182,12 @@ if (distributions == 1)
         B2hist = double(B2hist); B2histF = double(B2histF);
         figd3 = figure;
         subplot(1,2,1)
-        histogram(B2hist(B2hist(:,1)>0.1,1)); hold on; histogram(B2hist(B2hist(:,2)>0.1,2))
+        histogram(B2hist(B2hist(:,1)>0.1,1)); hold on;
+        if size(B2hist,2) >= 2, histogram(B2hist(B2hist(:,2)>0.1,2)); end
         title('Histogram B2')
         subplot(1,2,2)
-        histogram(B2histF(B2histF(:,1)>0.1,1)); hold on; histogram(B2histF(B2histF(:,2)>0.1,2))
+        histogram(B2histF(B2histF(:,1)>0.1,1)); hold on;
+        if size(B2histF,2) >= 2, histogram(B2histF(B2histF(:,2)>0.1,2)); end
         title('Histogram B2F')
         savefig(figd3, fullfile(figpath, [fname '_hist_B2.fig']));
         exportgraphics(figd3, fullfile(figpath, [fname '_hist_B2.png']));
