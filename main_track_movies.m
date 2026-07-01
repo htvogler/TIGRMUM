@@ -410,27 +410,50 @@ for count = smp:-1:stp
         tip_mid = boundb(tip_midpos,:);
         
         test = [];
-        if (tip_ellipsepos>min(tip_choice) && tip_ellipsepos<max(tip_choice))
+        % Tolerance absorbs per-frame boundary-tracing noise: boundb is
+        % rebuilt from scratch each frame via bwboundaries, so the same
+        % index can land a few units off between frames even when the
+        % ellipse-fit tip itself hasn't moved (observed: a 1-unit miss on
+        % an otherwise-identical ellipsepos flipped this to the fallback
+        % vote and shifted the tracked tip by ~5px on a single frame).
+        tip_range_tol = 2;
+        if (tip_ellipsepos>min(tip_choice)-tip_range_tol && tip_ellipsepos<max(tip_choice)+tip_range_tol)
             tip_final(count,:) = tip_ellipsef;
+            if debug_mode
+                fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d in [%d,%d] margin=%d -> ellipsef\n', ...
+                    count, ~isempty(Sbl), choice, tip_ellipsepos, min(tip_choice), max(tip_choice), ...
+                    min(tip_ellipsepos-min(tip_choice), max(tip_choice)-tip_ellipsepos));
+            end
         else
             tip_ellipsedist = [pdist2(tip_ellipsef,tip_mid) pdist2(tip_ellipsef,tip_skel)];
-            if (last_flag)            
-                tip_finaldist = [pdist2(tip_final_last,tip_mid) pdist2(tip_final_last,tip_skel)];             
+            if (last_flag)
+                tip_finaldist = [pdist2(tip_final_last,tip_mid) pdist2(tip_final_last,tip_skel)];
                 [tmp, tip_finalpos] = min([(1-0.33)*tip_finaldist(1)+0.33*tip_ellipsedist(1) (1-0.33)*tip_finaldist(2)+0.33*tip_ellipsedist(2)]);
             else
                 [tmp, tip_finalpos] = min(tip_ellipsedist);
             end
             if (tip_finalpos == 1) tip_final(count,:) = tip_mid; else tip_final(count,:) = tip_skel; end
             test = [test count];
+            if debug_mode
+                srclabel = 'skel'; if (tip_finalpos==1), srclabel = 'mid'; end
+                overshoot = min(tip_ellipsepos-min(tip_choice), max(tip_choice)-tip_ellipsepos);
+                fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d NOT in [%d,%d] overshoot=%d last_flag=%d -> %s (ellipsedist=[%.1f %.1f])\n', ...
+                    count, ~isempty(Sbl), choice, tip_ellipsepos, min(tip_choice), max(tip_choice), overshoot, last_flag, srclabel, tip_ellipsedist(1), tip_ellipsedist(2));
+            end
         end
     else
         tip_skel = boundb(dsearchn(boundb,Sef(1,:)),:);
-        if (last_flag) [tmp, tip_finaldistpos] = min([pdist2(tip_final_last,tip_ellipsef) pdist2(tip_final_last,tip_skel)]);   
+        if (last_flag) [tmp, tip_finaldistpos] = min([pdist2(tip_final_last,tip_ellipsef) pdist2(tip_final_last,tip_skel)]);
         else tip_finaldistpos = 2;
         end
         if (tip_finaldistpos == 1) tip_final(count,:) = tip_ellipsef; else tip_final(count,:) = tip_skel; end
+        if debug_mode
+            srclabel = 'skel'; if (tip_finaldistpos==1), srclabel = 'ellipsef'; end
+            fprintf('  tip F%d: branchpt=%d unbranched last_flag=%d -> %s\n', ...
+                count, ~isempty(Sbl), last_flag, srclabel);
+        end
     end
-        
+
     % Update tip_final for the next frame
     tip_final_last(:,:) = tip_final(count,:);
     
