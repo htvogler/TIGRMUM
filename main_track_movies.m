@@ -967,7 +967,7 @@ for count = smp:-1:stp
     imagesc(image2);
 
     if (tip_plot)
-        txtstr = strcat('Time(s): ',num2str((count*frame_rate)));
+        txtstr = strcat('Time(s): ',num2str((count*frame_rate)),'  Frame: ',num2str(count));
         text(10,10,txtstr,'color','white')
         set(gca,'xtick',[]);
         set(gca,'xticklabel',[]);
