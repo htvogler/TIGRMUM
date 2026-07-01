@@ -15,6 +15,7 @@ video_intensity = 1; % Intensity video: 0 = off, 1 = on + analysis, 2 = video on
 frame_rate = 0.150; % Number of seconds per frame of input video
 distributions = 0;  % Show histogram of results in the end
 workspace = 0; % Save workspace
+debug_mode = 0; % Save per-run diagnostic images + print ROI arc debug info to console
 
 % Tip detection parameters
 weight = 0.5; % Distance to eliminate branches (Higher means more reliance on the tip ellipse), 0 follows only the thinned edge.

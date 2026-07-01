@@ -266,7 +266,7 @@ for count = smp:-1:stp
     U = imfill(drawline(U,Umin,size(U,2),Umax,size(U,2),1),'holes');
 
     % ---- DIAGNOSTIC BLOCK 1: binarisation pipeline (frame smp only) ----
-    if count == smp
+    if debug_mode && count == smp
         dp = fullfile(outpath, sprintf('diag_%d', count));
         imwrite(mat2gray(double(O)),            [dp '_01_O_raw.png']);
         imwrite(mat2gray(double(L(:,:,count))), [dp '_02_L_display.png']);
@@ -485,7 +485,7 @@ for count = smp:-1:stp
     end
 
     % ---- DIAGNOSTIC BLOCK 2: skeleton + geometry (frame smp only) ----
-    if count == smp
+    if debug_mode && count == smp
         dp  = fullfile(outpath, sprintf('diag_%d', count));
         sz1 = size(U,1); sz2 = size(U,2);
 
@@ -586,7 +586,7 @@ for count = smp:-1:stp
     path_dist = [0; cumsum(sqrt(sum(diff(path).^2, 2)))];
 
     % DEBUG: save overlay for the last frame only
-    if (count == smp)
+    if debug_mode && (count == smp)
         dbg = zeros(size(U,1), size(U,2), 3);
         dbg(:,:,3) = double(U) * 0.4;   % tube mask: dark blue
         dbg(:,:,2) = double(Q) * 0.8;   % Q skeleton: green
@@ -690,8 +690,10 @@ for count = smp:-1:stp
         if stopc1 < startc1, [startc1,stopc1] = deal(stopc1,startc1); end
         if stopc2 < startc2, [startc2,stopc2] = deal(stopc2,startc2); end
 
-        fprintf('F%d: arcs %.1f->%.1f  k:%d->%d  c1:%d->%d  c2:%d->%d\n', ...
-            count,arc_start_px,arc_stop_px,k_start,k_stop,startc1,stopc1,startc2,stopc2);
+        if debug_mode
+            fprintf('F%d: arcs %.1f->%.1f  k:%d->%d  c1:%d->%d  c2:%d->%d\n', ...
+                count,arc_start_px,arc_stop_px,k_start,k_stop,startc1,stopc1,startc2,stopc2);
+        end
         
         % Create masks for rectangles and circles, and include whether they are
         % normal, split or stationary
