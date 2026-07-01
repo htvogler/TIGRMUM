@@ -20,6 +20,7 @@ cb_strip = repmat(cb_rgb, 1, cb_w, 1);            % nrows x cb_w x 3
 for count = 1:size(L,3)
     % Apply gaussian blur then map to RGB via colourmap
     blurred = imgaussfilt(L(:,:,count), 1.5);
+    blurred(L(:,:,count) == 0) = 0;              % restore zeroed background (prevent halo)
     idx     = blurred + 1;                        % shift: 0->idx1(black)
     rgb     = reshape(map(idx(:),:), nrows, size(L,2), 3);
 
