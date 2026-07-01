@@ -265,8 +265,12 @@ for count = smp:-1:stp
     Umax = max(find(U(:,end)==1)); Umin = min(find(U(:,end)==1));
     U = imfill(drawline(U,Umin,size(U,2),Umax,size(U,2),1),'holes');
 
-    % ---- DIAGNOSTIC BLOCK 1: binarisation pipeline (frame smp only) ----
-    if debug_mode && count == smp
+    % ---- DIAGNOSTIC BLOCK 1: binarisation pipeline (frame smp-1) ----
+    % smp-1 is the SECOND frame processed (loop runs smp:-1:stp), so it
+    % inherits U_prev/diamo/tip_final_last correctly primed by frame smp —
+    % unlike frame smp itself, which always starts cold. To debug frame N,
+    % set smp = N+1.
+    if debug_mode && count == smp - 1
         dp = fullfile(outpath, sprintf('diag_%d', count));
         imwrite(mat2gray(double(O)),            [dp '_01_O_raw.png']);
         imwrite(mat2gray(double(L(:,:,count))), [dp '_02_L_display.png']);
@@ -484,8 +488,8 @@ for count = smp:-1:stp
         total2(find(total2(:,2) >= max(total2(:,2))),:) = [];
     end
 
-    % ---- DIAGNOSTIC BLOCK 2: skeleton + geometry (frame smp only) ----
-    if debug_mode && count == smp
+    % ---- DIAGNOSTIC BLOCK 2: skeleton + geometry (frame smp-1, see BLOCK 1) ----
+    if debug_mode && count == smp - 1
         dp  = fullfile(outpath, sprintf('diag_%d', count));
         sz1 = size(U,1); sz2 = size(U,2);
 
@@ -585,8 +589,8 @@ for count = smp:-1:stp
     % Cumulative arc length along path (0 at tip, max at base)
     path_dist = [0; cumsum(sqrt(sum(diff(path).^2, 2)))];
 
-    % DEBUG: save overlay for the last frame only
-    if debug_mode && (count == smp)
+    % DEBUG: save overlay for frame smp-1 (see DIAGNOSTIC BLOCK 1 above)
+    if debug_mode && (count == smp - 1)
         dbg = zeros(size(U,1), size(U,2), 3);
         dbg(:,:,3) = double(U) * 0.4;   % tube mask: dark blue
         dbg(:,:,2) = double(Q) * 0.8;   % Q skeleton: green
