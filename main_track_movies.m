@@ -1,39 +1,7 @@
 clear all
 close all
 
-% Path to Mat file
-path = '/Users/htv/Downloads/20260407/movies/tiff/FRET-IBRA_results/HV203_4_21'; % Input folder path (ADD PATH TO FILE HERE)
-fname = 'HV203_4_21'; % Filename 
-stp = 1; % Start frame number
-smp = 9001; % End frame number
-
-% Options for analysis
-tip_plot = 1; % Video tip detection, has no effect if video_intensity = 2
-video_intensity = 1; % Intensity video: 0 = off, 1 = on + analysis, 2 = video only
-frame_rate = 0.3697; % Number of seconds per frame of input video
-distributions = 0;  % Show histogram of results in the end
-workspace = 0; % Save workspace
-
-% Tip detection parameters
-weight = 0.5; % Distance to eliminate branches (Higher means more reliance on the tip ellipse), 0 follows only the thinned edge.
-
-% ROI options
-ROItype = 1; % No ROI = 0; Moving ROI = 1; Stationary ROI = 2
-split = 1; % Split ROI along center line
-circle = 0; % Circle ROI as fraction of diameter
-starti = 0; % Rectangle ROI Start length / no pixelsize means percentage as a fraction of length of tube
-stopi = 10; % Rectangle/Circle ROI Stop length / no pixelsize means percentage as a fraction of length of tube
-pixelsize = 0.3225; % Pixel to um conversion
-
-% Kymo, movie and measurements options
-Cmin = 1.5; % Min pixel value in Ratio stack
-Cmax = 3; % Max pixel value in Ratio stack
-nkymo = 3; % Number of pixels line width average for kymograph (odd number) (0 means no kymo)
-diamcutoff = 0; % In pixels if pixelsize is not given
-bit_depth = 12; % Camera bit depth (12 or 16) — must match FRET-IBRA config
-bg_thresh_frac = 0.018;  % Background zeroing threshold as fraction of full 16-bit range (always
-                        % applied after rescaling, so camera-independent: 0.02 = ~1311 cts;
-                        % lower for weak-signal stacks, e.g. 0.008 = ~524 cts)
+run('run_config.m'); % Per-run parameters (gitignored) — copy from run_config.example.m
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Detect input file and select analysis mode
@@ -910,12 +878,12 @@ for count = smp:-1:stp
     if (tip_plot) h = figure('visible', 'off');
     else h = figure;
     end
-    
+
     %subplot(1,2,2)
     image2 = U*20+Splot*40+Cplot*30;
     if (ROItype > 0) image2 = image2 + double(F1*60 + F2*80); end
     imagesc(image2);
-    
+
     if (tip_plot)
         txtstr = strcat('Time(s): ',num2str((count*frame_rate)));
         text(10,10,txtstr,'color','white')
