@@ -1,9 +1,9 @@
 function L = video_processing(pathf,fname,stp,smp,timestep,L,Cmin,Cmin_tmp,Cmax,suffix)
 
 if nargin < 10 || isempty(suffix), suffix = '_ratio'; end
-movie = [pathf '/' fname suffix '.avi'];
+movie = [pathf '/' fname suffix '.mp4'];
 
-V = VideoWriter(movie, 'Uncompressed AVI');
+V = VideoWriter(movie, 'MPEG-4');
 V.FrameRate = 50;
 open(V);
 

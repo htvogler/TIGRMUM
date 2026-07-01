@@ -94,7 +94,7 @@ type = find_orient(M(:,:,1));
         
 % Scaled plot of the growing tube with tip and ROI
 if (tip_plot == 1) && (video_intensity ~= 2)
-    V = VideoWriter([outpath '/' fname '_growth.avi'], 'Uncompressed AVI');
+    V = VideoWriter([outpath '/' fname '_growth.mp4'], 'MPEG-4');
     V.FrameRate = 100;
     open(V);
     hdum = figure('visible','off');
