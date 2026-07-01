@@ -383,6 +383,19 @@ for count = smp:-1:stp
         end
     end
 
+    % Sanity-check this frame's own diameter against the frozen reference.
+    % If this frame's diam deviates too far from diamo, either this frame's
+    % segmentation is anomalous, or diamo itself (frozen from a single
+    % frame) was a bad reference to begin with -- either way, downstream
+    % thresholds built on diamo are unreliable for this frame.
+    diam_tol = 2; % flag if diam is more than 2x larger or smaller than diamo
+    if (diam < diamo/diam_tol) || (diam > diamo*diam_tol)
+        frame_failed(count) = true;
+        if debug_mode
+            fprintf('  diam F%d: diam=%.1fpx vs diamo=%.1fpx -- flagged, results NaN''d\n', count, diam, diamo);
+        end
+    end
+
     if isempty(Sbl)
         % Skeleton is a simple unbranched path — select tip endpoint directly
         S2 = S; S2area = 1;
