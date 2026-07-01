@@ -681,15 +681,24 @@ for count = smp:-1:stp
     if (ROItype > 0)
         Esize = size(U);
         % Find ROI from centerline distance using percentages or distance
+        % tip_excl_dist: total1/total2 always exclude boundary points within
+        % diamo*0.75 px of tip_final (see postotal1/postotal2 above), so the
+        % ROI side-curves always fall short of the tip by that radius. The
+        % stitch (boundb(...postotal...)) is the only thing that closes that
+        % gap, so it must fire whenever starti requests a start point inside
+        % that always-excluded region — not merely when distc_t (an
+        % unrelated tip-to-Qef distance) happens to exceed starti.
         if (pixelsize == 0)
             percent = (100*distctf)./(distctf(end));
             start_length = abs(percent - starti); [tmp startpos] = min(start_length);
             stop_length = abs(percent - stopi); [tmp stoppos] = min(stop_length);
             distc_t = (100*distc_t)/max(distctf);
+            tip_excl_dist = (100*diamo*0.75)/max(distctf);
         else
             start_length = abs(distctf*pixelsize - starti); [tmp startpos] = min(start_length);
             stop_length = abs(distctf*pixelsize - stopi); [tmp stoppos] = min(stop_length);
             distc_t = distc_t*pixelsize;
+            tip_excl_dist = diamo*0.75*pixelsize;
         end
         
         % Project ROI length onto the side curves.
@@ -727,7 +736,7 @@ for count = smp:-1:stp
         if (ROItype ~= 2 | count == smp)
             if (circle == 0)
                 roi = vertcat(total1(startc1:stopc1,:), total2(stopc2:-1:startc2,:));
-                if (starti < distc_t) roi = vertcat(boundb(postotal2(1):postotal1(2),:),roi); end
+                if (starti < tip_excl_dist) roi = vertcat(boundb(postotal2(1):postotal1(2),:),roi); end
                 F = poly2mask(roi(:,2),roi(:,1),Esize(1),Esize(2));
             else
                 mask = zeros(Esize(1),Esize(2));
@@ -743,12 +752,18 @@ for count = smp:-1:stp
                 end
                 roi1 = vertcat(total1(startc1:stopc1,:), [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
                 roi2 = vertcat(total2(startc2:stopc2,:), [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
-                if (starti < distc_t)
+                if (starti < tip_excl_dist)
                     roi1 = vertcat(boundb(range2(1):postotal1(2),:),roi1,boundb(range2(1),:));
                     roi2 = vertcat(boundb(range2(1):-1:postotal2(1),:),roi2,boundb(range2(1),:));
                 end
                 F1 = F.*poly2mask(roi1(:,2),roi1(:,1),Esize(1),Esize(2));
                 F2 = F.*poly2mask(roi2(:,2),roi2(:,1),Esize(1),Esize(2));
+                if debug_mode
+                    roi_gap_px = min(pdist2(tip_final(count,:), vertcat(roi1,roi2)));
+                    distc_t_unit = 'pct'; if (pixelsize > 0), distc_t_unit = 'um'; end
+                    fprintf('  roi F%d: tip_final-to-ROI gap=%.1fpx (stitch_fired=%d, distc_t=%.2f%s, tip_excl_dist=%.2f%s)\n', ...
+                        count, roi_gap_px, starti < tip_excl_dist, distc_t, distc_t_unit, tip_excl_dist, distc_t_unit);
+                end
             end
         end
     
