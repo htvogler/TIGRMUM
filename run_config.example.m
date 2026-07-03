@@ -34,6 +34,24 @@ Cmax = 3; % Max pixel value in Ratio stack
 nkymo = 3; % Number of pixels line width average for kymograph (odd number) (0 means no kymo)
 diamcutoff = 0; % In pixels if pixelsize is not given
 bit_depth = 12; % Camera bit depth (12 or 16) — must match FRET-IBRA config
+threshold_method = 'triangle'; % Per-frame background/foreground separation for single-channel
+                 % and two-channel-without-ratio modes (ratio mode is unaffected -- its
+                 % background is already handled upstream by FRET-IBRA). Pick based on the
+                 % sensor's intensity distribution along the tube, not the imaging mode:
+                 %   'triangle' - for sensors where a small, very bright region sits next to
+                 %                much dimmer but still-real signal, e.g. a saturated GCaMP
+                 %                tip next to a dim shank. Otsu's variance criterion gets
+                 %                pulled toward isolating the rare bright outlier and throws
+                 %                the dim-but-real shank away as "background"; Triangle finds
+                 %                where the histogram departs from the background peak
+                 %                instead, regardless of how far the bright tail extends.
+                 %                Default, since most current work is GCaMP.
+                 %   'otsu'     - for sensors with fairly uniform intensity along the tube's
+                 %                length, e.g. yellow cameleon CFP/YFP (tip and shank
+                 %                comparably bright). Triangle over-includes background noise
+                 %                here (tested on YC11: kept ~4x more pixels than Otsu, mostly
+                 %                noise speckle, not tube) because there's no sharp peak-to-
+                 %                tail departure for it to key off.
 weak_signal = 0; % 0 = no centerline gap-repair (default). 1 = also run centerline-guided
                  % gap repair, which collectively re-includes any foreground pixel near the
                  % smp reference centerline -- useful for stacks with fragmented/dropout

@@ -74,18 +74,17 @@ if bit_depth < 16 && ~strcmp(mode, 'ratio')
     end
 end
 
-% Zero background for non-ratio modes using per-frame Otsu thresholding
-% (mat2gray-normalised so it works consistently regardless of absolute
-% signal level).
+% Zero background for non-ratio modes. Method controlled by threshold_method
+% (see run_config.m for which to use for which signal distribution).
 if ~strcmp(mode, 'ratio')
     for fc = 1:size(BT1,3)
         frm = BT1(:,:,fc);
-        BT1(:,:,fc) = frm .* cast(imbinarize(mat2gray(frm)), class(BT1));
+        BT1(:,:,fc) = frm .* cast(signal_threshold(frm, threshold_method), class(BT1));
     end
     if ~isempty(BT2)
         for fc = 1:size(BT2,3)
             frm = BT2(:,:,fc);
-            BT2(:,:,fc) = frm .* cast(imbinarize(mat2gray(frm)), class(BT2));
+            BT2(:,:,fc) = frm .* cast(signal_threshold(frm, threshold_method), class(BT2));
         end
     end
     M = BT1;
@@ -170,7 +169,7 @@ for count = smp:-1:stp
     if strcmp(mode, 'ratio')
         P = imbinarize(O, 0.2);
     else
-        P = imbinarize(O);
+        P = O > 0;  % background already zeroed in pre-loop via signal_threshold; no second threshold needed
     end
     se = strel('disk',10);
     se2 = strel('disk',1);
