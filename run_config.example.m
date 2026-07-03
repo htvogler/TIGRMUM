@@ -34,6 +34,9 @@ Cmax = 3; % Max pixel value in Ratio stack
 nkymo = 3; % Number of pixels line width average for kymograph (odd number) (0 means no kymo)
 diamcutoff = 0; % In pixels if pixelsize is not given
 bit_depth = 12; % Camera bit depth (12 or 16) — must match FRET-IBRA config
-bg_thresh_frac = 0.018;  % Background zeroing threshold as fraction of full 16-bit range (always
-                        % applied after rescaling, so camera-independent: 0.02 = ~1311 cts;
-                        % lower for weak-signal stacks, e.g. 0.008 = ~524 cts)
+weak_signal = 0; % 0 = no centerline gap-repair (default). 1 = also run centerline-guided
+                 % gap repair, which collectively re-includes any foreground pixel near the
+                 % smp reference centerline -- useful for stacks with fragmented/dropout
+                 % signal, but can pull in disconnected debris on stacks that don't need it
+                 % (see session notes). Applies to single-channel and two-channel-without-
+                 % ratio modes only; ratio mode is unaffected either way.

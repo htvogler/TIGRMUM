@@ -18,6 +18,12 @@ if ~exist(outpath, 'dir'), mkdir(outpath); end
 figpath = fullfile(outpath, 'Figures');
 if ~exist(figpath, 'dir'), mkdir(figpath); end
 
+% Capture the full console output (incl. per-frame debug prints and
+% warnings) to a file so failures/gate stats can be grep'd after the run
+% instead of relying on the scrollback.
+diary off;
+diary(fullfile(outpath, [fname '_console.log']));
+
 if exist(ratio_file, 'file')
     mode = 'ratio';
     M   = h5read(ratio_file, '/ratio_raw');
@@ -68,22 +74,18 @@ if bit_depth < 16 && ~strcmp(mode, 'ratio')
     end
 end
 
-% Zero background for non-ratio modes using a fixed threshold as a fraction
-% of the full 16-bit range. After rescaling above, bit_max is always 65535
-% so bg_thresh_frac is camera-independent: 0.02 = ~1311 counts regardless
-% of bit depth. FRET-IBRA background subtraction leaves a noise floor of
-% ~1-50 raw counts; after 12-bit rescaling that is ~16-800 counts, well
-% below typical tube signal. Otsu is not used here because it adapts to
-% something that doesn't need adapting and risks cutting into weak tube signal.
+% Zero background for non-ratio modes using per-frame Otsu thresholding
+% (mat2gray-normalised so it works consistently regardless of absolute
+% signal level).
 if ~strcmp(mode, 'ratio')
     for fc = 1:size(BT1,3)
         frm = BT1(:,:,fc);
-        BT1(:,:,fc) = frm .* cast(double(frm) > bit_max * bg_thresh_frac, class(BT1));
+        BT1(:,:,fc) = frm .* cast(imbinarize(mat2gray(frm)), class(BT1));
     end
     if ~isempty(BT2)
         for fc = 1:size(BT2,3)
             frm = BT2(:,:,fc);
-            BT2(:,:,fc) = frm .* cast(double(frm) > bit_max * bg_thresh_frac, class(BT2));
+            BT2(:,:,fc) = frm .* cast(imbinarize(mat2gray(frm)), class(BT2));
         end
     end
     M = BT1;
@@ -168,7 +170,7 @@ for count = smp:-1:stp
     if strcmp(mode, 'ratio')
         P = imbinarize(O, 0.2);
     else
-        P = O > 0;  % background already zeroed in pre-loop; no second threshold needed
+        P = imbinarize(O);
     end
     se = strel('disk',10);
     se2 = strel('disk',1);
@@ -190,9 +192,11 @@ for count = smp:-1:stp
         % included in one shot (no per-piece iteration) — works even when
         % the signal is fragmented into many tiny components.  The centerline
         % pixels themselves are also added as a bridge so imclose can fill
-        % large gaps before bwareafilt.
+        % large gaps before bwareafilt. Opt-in via weak_signal: this can
+        % pull in disconnected debris near the reference centerline on
+        % stacks that don't actually need gap repair (see session notes).
         cl_mask = []; cl_mask_grown = [];
-        if exist('yctk_smp','var')
+        if weak_signal && exist('yctk_smp','var')
             cl_mask = false(size(U));
             yr = min(max(round(yctk_smp), 1), size(U,1));
             xr = min(max(round(xctk_smp), 1), size(U,2));
@@ -979,7 +983,7 @@ for count = smp:-1:stp
     end
     close(h);
     catch ME
-        warning('TIGRMUM: frame %d failed — %s (line %d)', count, ME.message, ME.stack(1).line);
+        warning('TIGRMUM: frame %d failed — %s (%s:%d)', count, ME.message, ME.stack(1).name, ME.stack(1).line);
         frame_failed(count) = true;
         if tip_plot && ~isempty(V_frame_size)
             writeVideo(V, zeros(V_frame_size, 'uint8'));
@@ -1275,5 +1279,7 @@ if (distributions == 1)
         exportgraphics(figd3, fullfile(figpath, [fname '_hist_B2.png']));
     end
 end
+
+diary off;
 
 if (workspace) save([outpath '/' fname '_result.mat']); end
