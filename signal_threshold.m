@@ -9,20 +9,27 @@ function mask = signal_threshold(frm, method)
 %                comparably bright. Otsu maximises between-class variance,
 %                which assumes roughly two comparable populations
 %                (background vs. signal) -- true here.
-%   'triangle' - per-frame Triangle/Zack thresholding. Best when a small,
-%                very bright region sits next to much dimmer but still-
-%                real signal, e.g. a saturated GCaMP tip next to a dim
-%                shank. Otsu's variance criterion gets pulled toward
+%   'triangle' - per-frame Triangle/Zack thresholding, eroded by 1px. Best
+%                when a small, very bright region sits next to much dimmer
+%                but still-real signal, e.g. a saturated GCaMP tip next to
+%                a dim shank. Otsu's variance criterion gets pulled toward
 %                isolating the rare bright outlier and throws the dim-but-
 %                real shank signal away as "background"; Triangle finds
 %                where the histogram departs from the background peak
 %                instead, regardless of how far the bright tail extends.
+%                That low cutoff also reaches into the PSF blur skirt
+%                around the whole tube, not just along the dim shank, so
+%                the raw mask is eroded by 1px to trim it back toward the
+%                visible edge (tested on HV197_4_19: kept the dim shank
+%                connected while removing stray background speckle and
+%                tightening the outline -- see session notes).
 
 switch method
     case 'otsu'
         mask = imbinarize(mat2gray(frm));
     case 'triangle'
         mask = double(frm) > triangle_threshold(frm);
+        mask = imerode(mask, strel('disk', 1));
     otherwise
         error('signal_threshold: unknown threshold_method "%s" (use ''otsu'' or ''triangle'')', method);
 end

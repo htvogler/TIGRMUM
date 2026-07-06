@@ -796,8 +796,17 @@ for count = smp:-1:stp
                 roi1 = vertcat(total1(startc1:stopc1,:), [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
                 roi2 = vertcat(total2(startc2:stopc2,:), [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
                 if (starti < tip_excl_dist)
-                    roi1 = vertcat(boundb(range2(1):postotal1(2),:),roi1,boundb(range2(1),:));
-                    roi2 = vertcat(boundb(range2(1):-1:postotal2(1),:),roi2,boundb(range2(1),:));
+                    % Stitch from the boundary point actually nearest the tip, not
+                    % range2(1) (just the arbitrary bisection index used to split
+                    % boundb into range1/range2 for the postotal1/postotal2 scan --
+                    % unrelated to where the tip is). The two usually sit close
+                    % together (boundb's start point already lands near the tip by
+                    % convention), but range2(1) is a coincidence, not a guarantee.
+                    % Verified on HV197_4_19 frames 2000-2043: valid frames went
+                    % from 42/44 to 44/44 after this change.
+                    tip_boundpos = dsearchn(boundb, tip_final(count,:));
+                    roi1 = vertcat(boundb(tip_boundpos:postotal1(2),:),roi1,boundb(tip_boundpos,:));
+                    roi2 = vertcat(boundb(tip_boundpos:-1:postotal2(1),:),roi2,boundb(tip_boundpos,:));
                 end
                 F1 = F.*poly2mask(roi1(:,2),roi1(:,1),Esize(1),Esize(2));
                 F2 = F.*poly2mask(roi2(:,2),roi2(:,1),Esize(1),Esize(2));
