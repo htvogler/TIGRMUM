@@ -33,4 +33,17 @@ switch method
     otherwise
         error('signal_threshold: unknown threshold_method "%s" (use ''otsu'' or ''triangle'')', method);
 end
+
+% Strip small disconnected noise specks here, at the source, not just in the
+% tracking mask U (which already does this via bwareaopen+bwareafilt further
+% downstream in main_track_movies.m). This mask also feeds BT1/BT2/M/L
+% directly -- without this, M (and the intensity video built from it) shows
+% every stray speck that survives per-pixel thresholding, even though the
+% tracking pipeline discards them. Verified on HV197_4_19 frame 2042: 38
+% separate connected components in the raw per-pixel mask (one real tube at
+% 2930px, 37 noise blobs, 32 of them under 10px) -- bwareaopen+bwareafilt
+% here reduces that to the single real component, matching what U already
+% gets downstream.
+mask = bwareaopen(mask, 100);
+mask = bwareafilt(mask, 1);
 end
