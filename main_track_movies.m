@@ -315,20 +315,18 @@ for count = smp:-1:stp
         dp = fullfile(outpath, sprintf('diag_%d', count));
         imwrite(mat2gray(double(O)),            [dp '_01_O_raw.png']);
         imwrite(mat2gray(double(L(:,:,count))), [dp '_02_L_display.png']);
-        imwrite(P,                              [dp '_03_P_otsu.png']);
-        Ud1 = imopen(P, se);
-        imwrite(Ud1,                            [dp '_04_U_imopen.png']);
-        Ud2 = bwareaopen(Ud1, 100);
-        imwrite(Ud2,                            [dp '_05_U_bwareaopen.png']);
-        Ud3 = bwareafilt(P, 1);
-        imwrite(Ud3,                            [dp '_06_U_bwareafilt_P.png']);
-        Ud4 = bwmorph(Ud3, 'clean');
-        imwrite(Ud4,                            [dp '_07_U_clean.png']);
-        Ud5 = medfilt2(Ud4);
-        imwrite(Ud5,                            [dp '_08_U_medfilt.png']);
-        Ud6 = imclose(Ud5, strel('disk', close_r));
-        imwrite(Ud6,                            [dp '_09_U_imclose.png']);
-        imwrite(U,                              [dp '_10_U_final.png']);
+        imwrite(P,                              [dp '_03_P_thres.png']);
+        Ud1 = bwareaopen(P, 100);
+        imwrite(Ud1,                            [dp '_04_U_bwareaopen.png']);
+        Ud2 = bwareafilt(Ud1, 1);
+        imwrite(Ud2,                            [dp '_05_U_bwareafilt.png']);
+        Ud3 = bwmorph(Ud2, 'clean');
+        imwrite(Ud3,                            [dp '_06_U_clean.png']);
+        Ud4 = medfilt2(Ud3);
+        imwrite(Ud4,                            [dp '_07_U_medfilt.png']);
+        Ud5 = imclose(Ud4, strel('disk', close_r));
+        imwrite(Ud5,                            [dp '_08_U_imclose.png']);
+        imwrite(U,                              [dp '_09_U_final.png']);
         disp(['DIAG block 1 saved to ' dp]);
     end
     % ---- END DIAGNOSTIC BLOCK 1 ----
@@ -604,8 +602,8 @@ for count = smp:-1:stp
         dp  = fullfile(outpath, sprintf('diag_%d', count));
         sz1 = size(U,1); sz2 = size(U,2);
 
-        imwrite(imdilate(Q,  strel('disk',1)), [dp '_11_Q_thin.png']);
-        imwrite(imdilate(Q2, strel('disk',1)), [dp '_12_Q2_debranched.png']);
+        imwrite(imdilate(Q,  strel('disk',1)), [dp '_10_Q_thin.png']);
+        imwrite(imdilate(Q2, strel('disk',1)), [dp '_11_Q2_debranched.png']);
 
         Rch = uint8(U)*80; Gch = uint8(U)*80; Bch = uint8(U)*80;
         Qd  = imdilate(Q,  strel('disk',1)); Rch = Rch + uint8(Qd)*170;
@@ -615,7 +613,7 @@ for count = smp:-1:stp
             ce = max(1,Qef(1,2)-4):min(sz2,Qef(1,2)+4);
             Bch(re,ce) = 255;
         end
-        imwrite(cat(3,Rch,Gch,Bch), [dp '_13_skeleton_overlay.png']);
+        imwrite(cat(3,Rch,Gch,Bch), [dp '_12_skeleton_overlay.png']);
 
         Rch = uint8(U)*60; Gch = uint8(U)*60; Bch = uint8(U)*60;
         brows = max(1,min(sz1,boundb(:,1))); bcols = max(1,min(sz2,boundb(:,2)));
@@ -631,7 +629,7 @@ for count = smp:-1:stp
         re=max(1,tip_final(count,1)-3):min(sz1,tip_final(count,1)+3);
         ce=max(1,tip_final(count,2)-3):min(sz2,tip_final(count,2)+3);
         Rch(re,ce)=255; Gch(re,ce)=0; Bch(re,ce)=0;
-        imwrite(cat(3,Rch,Gch,Bch), [dp '_14_geometry_overlay.png']);
+        imwrite(cat(3,Rch,Gch,Bch), [dp '_13_geometry_overlay.png']);
         disp(['DIAG block 2 saved to ' dp]);
     end
     % ---- END DIAGNOSTIC BLOCK 2 ----
