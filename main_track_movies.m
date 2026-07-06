@@ -173,9 +173,19 @@ for count = smp:-1:stp
     end
     se = strel('disk',10);
     se2 = strel('disk',1);
-    U = imopen(P,se);
-    U = bwareaopen(U,100);
-    U = bwareafilt(P,1);
+    % Strip small disconnected noise specks before anything downstream can
+    % bridge them into the tube. This used to be dead code -- U was
+    % immediately overwritten from raw P, discarding both the imopen and
+    % bwareaopen results -- so isolated stray pixels near the tube (e.g. a
+    % single noise pixel a few rows from the true edge) survived into the
+    % gap-repair/imclose stage, where imclose's dilate step could fuse them
+    % into the tube's connected component before bwareafilt ever got a
+    % chance to tell them apart (verified on HV197_4_19 frame 2015: a lone
+    % stray pixel 4 rows from the tube edge at column 117 got bridged in by
+    % imclose, thickening the tube's border by ~2px over the last 4 columns
+    % approaching the crop edge).
+    U = bwareaopen(P,100);
+    U = bwareafilt(U,1);
     % Gap repair: recover disconnected P pieces close to U and aligned with its axis
     Ustats = regionprops(U, 'Centroid', 'Orientation', 'MajorAxisLength');
     if ~isempty(Ustats)
@@ -217,21 +227,34 @@ for count = smp:-1:stp
                 end
             end
         end
-        for k = 1:max(Pother(:))
-            piece = Pother == k;
-            % Proximity gate
-            if ~any(U_grown(:) & piece(:)), continue; end
-            % Temporal test: piece overlaps previous frame's mask → include unconditionally
-            if ~isempty(U_prev_grown) && any(U_prev_grown(:) & piece(:))
-                U = U | piece;
-                continue;
-            end
-            % Fallback: orientation check (first frame or no U_prev overlap)
-            ps = regionprops(piece, 'Centroid');
-            v = ps.Centroid - Ustats.Centroid;
-            ang = abs(mod(atan2d(-v(2), v(1)) - Ustats.Orientation + 90, 180) - 90);
-            if ang <= 35
-                U = U | piece;
+        % Opt-in via weak_signal, like the cl_mask block above: prox_dist has
+        % a 30px floor, which in a small crop is close to half the frame, so
+        % the proximity gate barely filters anything. The temporal test then
+        % unconditionally re-admits any disconnected P piece that overlaps
+        % the previous frame's (dilated) mask -- a persistent, fixed-position
+        % artifact (dust speck, hot pixel) recurring near the tube satisfies
+        % that every frame and gets rescued back into U indefinitely, even
+        % though bwareaopen/bwareafilt just discarded it as a small
+        % disconnected component (verified on HV197_4_19 frame 2015: a lone
+        % stray pixel 4 rows from the tube's true edge, thickening the
+        % border by ~1-2px over the last few columns before the crop edge).
+        if weak_signal
+            for k = 1:max(Pother(:))
+                piece = Pother == k;
+                % Proximity gate
+                if ~any(U_grown(:) & piece(:)), continue; end
+                % Temporal test: piece overlaps previous frame's mask → include unconditionally
+                if ~isempty(U_prev_grown) && any(U_prev_grown(:) & piece(:))
+                    U = U | piece;
+                    continue;
+                end
+                % Fallback: orientation check (first frame or no U_prev overlap)
+                ps = regionprops(piece, 'Centroid');
+                v = ps.Centroid - Ustats.Centroid;
+                ang = abs(mod(atan2d(-v(2), v(1)) - Ustats.Orientation + 90, 180) - 90);
+                if ang <= 35
+                    U = U | piece;
+                end
             end
         end
     end
@@ -391,13 +414,20 @@ for count = smp:-1:stp
             end
         end
         if ~isempty(diamo_samples)
-            diamo = mean(diamo_samples);
+            % Median, not mean: doff=0 (the column closest to the crop edge)
+            % is the sample most exposed to border artifacts (e.g. a
+            % genuine but localised thickening right where the tube meets
+            % the crop boundary -- see session notes on HV197_4_19 frame
+            % 2015). A single inflated sample pulls the mean proportionally;
+            % median ignores it as long as fewer than half the samples are
+            % affected, at no cost when the samples are well-behaved.
+            diamo = median(diamo_samples);
         else
             diamo = diam; % fallback if no columns had any mask pixels
         end
         if debug_mode
-            fprintf('  diamo F%d: single-col=%.1fpx multi-col-avg=%.1fpx (n=%d cols)\n', ...
-                count, diam, diamo, numel(diamo_samples));
+            fprintf('  diamo F%d: single-col=%.1fpx multi-col-median=%.1fpx (n=%d cols) samples=%s\n', ...
+                count, diam, diamo, numel(diamo_samples), mat2str(diamo_samples));
         end
     end
 
