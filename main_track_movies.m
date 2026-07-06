@@ -105,6 +105,17 @@ if (tip_plot == 1) && (video_intensity ~= 2)
     close(hdum);
 end
 
+% Debug video: real intensity (jet colormap, same orientation as U/F1/F2)
+% with the traced centerline and ROI halves overlaid, so the ROI-split
+% geometry can be checked directly against the real signal instead of
+% inferred from the binary-mask growth video or the un-annotated intensity
+% video. Separate from both -- does not touch growth.mp4 or _intensity.mp4.
+if roi_debug_video && (video_intensity ~= 2)
+    Vroi = VideoWriter([outpath '/' fname '_roi_debug.mp4'], 'MPEG-4');
+    Vroi.FrameRate = 20;
+    open(Vroi);
+end
+
 if (nkymo > 0 || video_intensity > 0)
     if strcmp(mode, 'ratio')
         K = M(:,:,:)./Cmax;
@@ -139,6 +150,7 @@ if (distributions), d = 1; end
 U_prev = [];
 frame_failed = false(smp, 1);
 if ~exist('V_frame_size','var'), V_frame_size = []; end
+Vroi_frame_size = [];
 tip_final    = NaN(smp, 2);
 diamf_avg    = NaN(1, smp);
 Ucount       = NaN(1, smp);
@@ -1033,11 +1045,48 @@ for count = smp:-1:stp
         if isempty(V_frame_size), V_frame_size = size(frame.cdata); end
     end
     close(h);
+
+    if roi_debug_video
+        % O, not L: L is built once for the whole stack and is never
+        % per-frame rotated, while O/U/F1/F2/Cplot all are (see the
+        % imrotate block earlier in this loop) -- using L here would
+        % misalign the overlay against the ROI geometry.
+        Od = min(255, double(O)./Cmax.*255);
+        jetmap = uint8(jet(256).*255);
+        idx = uint8(Od) + 1;
+        rgb = reshape(jetmap(idx(:),:), size(O,1), size(O,2), 3);
+        rch = rgb(:,:,1); gch = rgb(:,:,2); bch = rgb(:,:,3);
+        % Tint each ROI half so it's clear which pixels count toward
+        % Half1 (red) vs Half2 (blue), while still showing the real
+        % intensity underneath (blend, not a flat fill).
+        if (ROItype > 0)
+            f1m = logical(F1); f2m = logical(F2);
+            rch(f1m) = uint8(min(255, double(rch(f1m))*0.5 + 255*0.5));
+            gch(f1m) = uint8(double(gch(f1m))*0.5);
+            bch(f1m) = uint8(double(bch(f1m))*0.5);
+            rch(f2m) = uint8(double(rch(f2m))*0.5);
+            gch(f2m) = uint8(double(gch(f2m))*0.5);
+            bch(f2m) = uint8(min(255, double(bch(f2m))*0.5 + 255*0.5));
+        end
+        % Traced centerline as a bright white line on top of everything.
+        clm = logical(Cplot);
+        rch(clm) = 255; gch(clm) = 255; bch(clm) = 255;
+        rgb_roi = cat(3, rch, gch, bch);
+        if exist('insertText','file')
+            txtstr = ['Time(s): ' num2str(count*frame_rate) '  Frame: ' num2str(count)];
+            rgb_roi = insertText(rgb_roi,[5 5],txtstr,'FontSize',8,'TextColor','white','BoxOpacity',0);
+        end
+        writeVideo(Vroi, rgb_roi);
+        if isempty(Vroi_frame_size), Vroi_frame_size = size(rgb_roi); end
+    end
     catch ME
         warning('TIGRMUM: frame %d failed — %s (%s:%d)', count, ME.message, ME.stack(1).name, ME.stack(1).line);
         frame_failed(count) = true;
         if tip_plot && ~isempty(V_frame_size)
             writeVideo(V, zeros(V_frame_size, 'uint8'));
+        end
+        if roi_debug_video && ~isempty(Vroi_frame_size)
+            writeVideo(Vroi, zeros(Vroi_frame_size, 'uint8'));
         end
         % Fixed-line kymograph: computable from L alone, fill even on failure
         if nkymo > 0 && exist('yctk_smp','var')
@@ -1070,6 +1119,7 @@ end
 warning('on', 'MATLAB:nearlySingularMatrix');
 
 if (tip_plot == 1) close(V); end
+if roi_debug_video, close(Vroi); end
 
 % Final tip movement/diameter/pixel number on a per frame basis
 fig1 = figure;
