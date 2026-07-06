@@ -251,7 +251,22 @@ for count = smp:-1:stp
             U = U | on_cl | cl_clipped;
         end
     end
-    U = imclose(U,se);
+    % Closing radius scaled to the tube's own measured width (diamo) rather
+    % than a fixed pixel count: a fixed radius (originally disk(10), unchanged
+    % since the very first commit) is only appropriate for whatever
+    % magnification/binning produced that many pixels per tube-diameter --
+    % on a narrower image (e.g. 40x + 1.6x vs 20x) the same radius is
+    % disproportionately large relative to the tube and permanently fills in
+    % concave bends during the dilate step (verified on HV197_4_19 frame
+    % 2042: disk(10) added 81px at the tube's elbows vs 2px for disk(1)).
+    % diamo isn't calibrated yet on the very first (smp) frame -- fall back
+    % to a small constant for that one frame only.
+    if exist('diamo','var')
+        close_r = max(1, round(diamo * 0.15));
+    else
+        close_r = 2;
+    end
+    U = imclose(U, strel('disk', close_r));
     U = bwareafilt(U, 1);
     U_prev = U;
 
@@ -288,7 +303,7 @@ for count = smp:-1:stp
         imwrite(Ud4,                            [dp '_07_U_clean.png']);
         Ud5 = medfilt2(Ud4);
         imwrite(Ud5,                            [dp '_08_U_medfilt.png']);
-        Ud6 = imclose(Ud5, se);
+        Ud6 = imclose(Ud5, strel('disk', close_r));
         imwrite(Ud6,                            [dp '_09_U_imclose.png']);
         imwrite(U,                              [dp '_10_U_final.png']);
         disp(['DIAG block 1 saved to ' dp]);
