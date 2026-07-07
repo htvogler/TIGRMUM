@@ -54,7 +54,26 @@ end
 % 2930px, 37 noise blobs, 32 of them under 10px) -- bwareaopen+bwareafilt
 % here reduces that to the single real component, matching what U already
 % gets downstream.
-mask = bwareaopen(mask, round(100 * up_factor^2));
+% weak_signal only: don't let bwareaopen discard a small-but-real component
+% just because it's small, if it touches the crop's edge -- a fragment
+% reaching the field boundary is far more likely to be the tube's own
+% base/attachment point (which main_track_movies.m later assumes reaches
+% one particular border, to close off the tracked shape there) than
+% scattered noise, which has no reason to specifically hug an edge. Found
+% on HV198_1_16 3185-3301: 18 of 48 frames where the tracking mask failed
+% to reach that border had a real, connected fragment sitting right at the
+% edge that bwareaopen discarded purely for being smaller than the area
+% floor -- not because it wasn't real signal.
+if weak_signal
+    lbl0 = bwlabel(mask);
+    edge_mask = false(size(mask));
+    edge_mask([1 end], :) = true; edge_mask(:, [1 end]) = true;
+    edge_labels = setdiff(unique(lbl0(edge_mask & mask)), 0);
+    edge_frags = ismember(lbl0, edge_labels);
+else
+    edge_frags = false(size(mask));
+end
+mask = bwareaopen(mask, round(100 * up_factor^2)) | edge_frags;
 
 % Component selection: normally keep only the single largest piece (a real
 % tube is one connected object; anything else surviving bwareaopen this far
@@ -110,5 +129,30 @@ if weak_signal
 end
 if ~bridged
     mask = bwareafilt(mask, 1);
+end
+
+% weak_signal only: reconnect any edge fragment kept above (specifically so
+% it wouldn't be silently discarded here) that the component-selection step
+% just above didn't already include -- bwareafilt(1) keeps only the single
+% largest piece, and the two-component bridge only looks at the top 2 by
+% area, so a small edge fragment is usually neither. Same thin-corridor
+% technique as that bridge: connect each stranded fragment to whichever
+% piece ended up as the final mask, rather than leaving it disconnected and
+% then implicitly losing it anyway.
+if weak_signal && any(edge_frags(:))
+    lbl_e = bwlabel(edge_frags);
+    for ei = 1:max(lbl_e(:))
+        frag = lbl_e == ei;
+        if any(frag(:) & mask(:)), continue; end
+        [D2, IDX2] = bwdist(mask);
+        frag_idx = find(frag);
+        [~, rel2] = min(D2(frag_idx));
+        [rf, cf] = ind2sub(size(mask), frag_idx(rel2));
+        [rm, cm] = ind2sub(size(mask), IDX2(rf, cf));
+        corridor2 = false(size(mask));
+        corridor2 = drawline(corridor2, rm, cm, rf, cf, true);
+        corridor2 = imdilate(corridor2, strel('disk', up_factor));
+        mask = mask | frag | corridor2;
+    end
 end
 end

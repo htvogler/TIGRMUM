@@ -335,6 +335,21 @@ for count = smp:-1:stp
     else last_flag = 1;
     end
     
+    if weak_signal && ~any(U(:,end))
+        % No signal reaches the tracking border at all this frame --
+        % signal_threshold.m's edge-fragment preservation can't help here,
+        % since there's genuinely nothing there to preserve (verified on
+        % HV198_1_16 3185-3301: 30 of 48 border-touching failures had zero
+        % raw signal near the border, not just a discarded small fragment).
+        % Extend from U's own nearest point straight out to the border on
+        % that row, so the border-closing step just below (which assumes
+        % U(:,end) has at least one true pixel, and otherwise silently does
+        % nothing -- Umax/Umin come back empty and drawline is a no-op) has
+        % something to work with.
+        [Ur, Uc] = find(U);
+        [~, mi] = max(Uc);
+        U(Ur(mi), Uc(mi):size(U,2)) = true;
+    end
     Umax = max(find(U(:,end)==1)); Umin = min(find(U(:,end)==1));
     U = imfill(drawline(U,Umin,size(U,2),Umax,size(U,2),1),'holes');
 
