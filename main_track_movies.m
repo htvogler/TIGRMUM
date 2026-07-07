@@ -219,6 +219,29 @@ for count = smp:-1:stp
     % approaching the crop edge).
     U = bwareaopen(P, round(100 * up_factor^2));
     U = bwareafilt(U,1);
+
+    % weak_signal only: use the reference (first analysed, i.e. count==smp)
+    % frame's own full mask -- not a thin centerline -- as a spatial prior
+    % for which nearby real signal (P) pixels should count as tube. A full
+    % 2D mask, dilated by a small margin, naturally covers the tube's actual
+    % width and shape, not just an idealised 1px path, so it both rescues
+    % disconnected fragments *and* fills in thin/ragged edges within an
+    % otherwise-connected mask in one mechanism -- verified on HV198_1_16
+    % 3185-3301: dilating the reference frame's mask by just 5px (native;
+    % scaled by up_factor here) already covers 98-100% of every other
+    % frame's own mask in this range, including badly split/truncated ones.
+    % Replaces the old centerline-based (yctk_smp/xctk_smp) version of this
+    % same idea, which needed a bounding-box-clip workaround specifically
+    % because a 1D line has no width of its own to be a shape prior with.
+    U_ref_grown = [];
+    if weak_signal && exist('U_smp', 'var')
+        U_ref_grown = imdilate(U_smp, strel('disk', round(5 * up_factor)));
+        on_ref = P & U_ref_grown & ~U;
+        if any(on_ref(:))
+            U = U | on_ref;
+        end
+    end
+
     % Gap repair: recover disconnected P pieces close to U and aligned with its axis
     Ustats = regionprops(U, 'Centroid', 'Orientation', 'MajorAxisLength');
     if ~isempty(Ustats)
@@ -229,38 +252,7 @@ for count = smp:-1:stp
         if ~isempty(U_prev)
             U_prev_grown = imdilate(U_prev, strel('disk', prox_dist));
         end
-        % Build centerline mask from smp reference frame if available.
-        % All P pixels collectively overlapping the dilated centerline are
-        % included in one shot (no per-piece iteration) — works even when
-        % the signal is fragmented into many tiny components.  The centerline
-        % pixels themselves are also added as a bridge so imclose can fill
-        % large gaps before bwareafilt. Opt-in via weak_signal: this can
-        % pull in disconnected debris near the reference centerline on
-        % stacks that don't actually need gap repair (see session notes).
-        cl_mask = []; cl_mask_grown = [];
-        if weak_signal && exist('yctk_smp','var')
-            cl_mask = false(size(U));
-            yr = min(max(round(yctk_smp), 1), size(U,1));
-            xr = min(max(round(xctk_smp), 1), size(U,2));
-            cl_mask(sub2ind(size(U), yr, xr)) = true;
-            cl_mask_grown = imdilate(cl_mask, strel('disk', round(15 * up_factor)));
-            % Gap gate: only run centerline-guided repair if the smp
-            % centerline actually passes through unmasked area.  For
-            % complete tubes (strong signal, no gap) the centerline lies
-            % entirely within U and this block is skipped entirely.
-            if any(cl_mask(:) & ~U(:))
-                on_cl = P & cl_mask_grown;
-                if any(on_cl(:))
-                    combined_bb = U | on_cl;
-                    rc = find(any(combined_bb, 2)); cc = find(any(combined_bb, 1));
-                    cl_clipped = cl_mask;
-                    cl_clipped([1:rc(1)-1, rc(end)+1:end], :) = false;
-                    cl_clipped(:, [1:cc(1)-1, cc(end)+1:end]) = false;
-                    U = U | on_cl | cl_clipped;
-                end
-            end
-        end
-        % Opt-in via weak_signal, like the cl_mask block above: prox_dist has
+        % Opt-in via weak_signal, like the reference-mask block above: prox_dist has
         % a 30px floor, which in a small crop is close to half the frame, so
         % the proximity gate barely filters anything. The temporal test then
         % unconditionally re-admits any disconnected P piece that overlaps
@@ -293,18 +285,12 @@ for count = smp:-1:stp
     end
     U = bwmorph(U,'clean');
     U = medfilt2(U);
-    % Re-apply centerline bridge: medfilt2 removes 1-pixel-wide lines, so
-    % restore cl_mask + signal pixels before imclose thickens them into a
-    % proper connection across the gap.
-    if ~isempty(cl_mask) && any(cl_mask(:) & ~U(:))
-        on_cl = P & cl_mask_grown;
-        if any(on_cl(:))
-            combined_bb = U | on_cl;
-            rc = find(any(combined_bb, 2)); cc = find(any(combined_bb, 1));
-            cl_clipped = cl_mask;
-            cl_clipped([1:rc(1)-1, rc(end)+1:end], :) = false;
-            cl_clipped(:, [1:cc(1)-1, cc(end)+1:end]) = false;
-            U = U | on_cl | cl_clipped;
+    % Re-apply the reference-mask rescue: medfilt2 can erode away thin,
+    % single-pixel-wide connections just added above.
+    if ~isempty(U_ref_grown)
+        on_ref = P & U_ref_grown & ~U;
+        if any(on_ref(:))
+            U = U | on_ref;
         end
     end
     % Closing radius scaled to the tube's own measured width (diamo) rather
@@ -323,8 +309,22 @@ for count = smp:-1:stp
         close_r = round(2 * up_factor);
     end
     U = imclose(U, strel('disk', close_r));
-    U = bwareafilt(U, 1);
+    % Final component selection: normally single-largest, same as always.
+    % weak_signal only: also keep any component overlapping the reference
+    % footprint, regardless of size -- a rescued fragment from the U_ref
+    % block above isn't guaranteed to have actually merged into the main
+    % blob by this point (imclose only bridges gaps up to ~close_r), so
+    % plain bwareafilt(1) could still silently drop it right back out here.
+    if weak_signal && ~isempty(U_ref_grown)
+        lblU = bwlabel(U);
+        ref_labels = setdiff(unique(lblU(U_ref_grown & U)), 0);
+        keep_ref = ismember(lblU, ref_labels);
+        U = bwareafilt(U, 1) | keep_ref;
+    else
+        U = bwareafilt(U, 1);
+    end
     U_prev = U;
+    if weak_signal && count == smp, U_smp = U; end
 
     if (count == smp) Ub = logical(ones(size(P)));
     else Ub = U;
