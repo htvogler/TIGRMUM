@@ -81,26 +81,30 @@ if weak_signal
         [areas_sorted, order] = sort(areas, 'descend');
         comp1 = lbl == order(1);
         comp2 = lbl == order(2);
-        D = bwdist(comp1);
-        gap = double(min(D(comp2))); % strel requires a double radius downstream --
-                                      % frm's class (e.g. single, if it ever enters
-                                      % the pipeline that way) can otherwise leak
-                                      % through bwdist/min into bridge_r
+        [D, IDX] = bwdist(comp1);
+        gap = double(min(D(comp2)));
         if areas_sorted(2) >= 0.25 * areas_sorted(1) && gap <= 3 * sqrt(areas_sorted(2))
-            % imdilate, not imclose: closing's erode-back step strips away
-            % the thin bridge this just formed (a minimal dilation joins
-            % the two pieces with only a narrow neck, well below 2x the
-            % erosion radius), silently re-splitting them right back into 2
-            % components -- verified empirically on HV198_1_16 frame 3068
-            % (the exact case this fix targets): dilating by bridge_r joins
-            % them into 1 component, but the matching imclose erode-back
-            % restored 2. A slightly fatter waist for one anomalous frame is
-            % harmless; losing half the tube again is not.
-            bridge_r = double(ceil(gap / 2) + 1);
-            mask = imdilate(comp1 | comp2, strel('disk', bridge_r));
+            % Connect the two NEAREST points with a thin corridor instead of
+            % dilating the whole union by bridge_r -- dilating both full
+            % components inflates the entire mask, not just the seam (found
+            % on HV198_1_16 3185-3301: 31% of frames bridged, some with
+            % gaps up to ~29px, so bridge_r up to 16 -- fattening the WHOLE
+            % tube 3x+ over its normal pixel count, not just patching the
+            % gap). comp1/comp2 keep their exact original shape; only a
+            % corridor of fixed width (~up_factor, matching the erosion
+            % radius elsewhere) gets added between them, regardless of how
+            % large the gap itself is.
+            comp2_idx = find(comp2);
+            [~, rel] = min(D(comp2_idx));
+            [r2, c2] = ind2sub(size(mask), comp2_idx(rel));
+            [r1, c1] = ind2sub(size(mask), IDX(r2, c2));
+            corridor = false(size(mask));
+            corridor = drawline(corridor, r1, c1, r2, c2, true);
+            corridor = imdilate(corridor, strel('disk', up_factor));
+            mask = comp1 | comp2 | corridor;
             bridged = true;
-            fprintf('  signal_threshold: bridged 2 components (%d px + %d px, gap %.1f px)\n', ...
-                areas_sorted(1), areas_sorted(2), gap);
+            fprintf('  signal_threshold: bridged 2 components (%d px + %d px, gap %.1f px, corridor width %d)\n', ...
+                areas_sorted(1), areas_sorted(2), gap, up_factor);
         end
     end
 end
