@@ -1,9 +1,18 @@
 function L = video_processing(pathf,fname,stp,smp,timestep,L,Cmin,Cmin_tmp,Cmax,suffix)
 
 if nargin < 10 || isempty(suffix), suffix = '_ratio'; end
-movie = [pathf '/' fname suffix '.mp4'];
+movie = [pathf '/' fname suffix '.avi'];
 
-V = VideoWriter(movie, 'MPEG-4');
+% Uncompressed AVI, not MPEG-4: even at Quality=100, H.264's fixed 4:2:0
+% chroma subsampling mangles a thin, saturated, high-contrast feature (the
+% tube) against a mostly-black background at this small frame size --
+% confirmed by decoding real MPEG-4 output frames: the tube broke up into
+% scattered near-grayscale "ghost" pixels between real jet-colour pixels
+% (chroma-subsampling/block artifacts), not leftover segmentation noise.
+% Quality only controls DCT quantization, not chroma subsampling, so it
+% reduced but never eliminated the effect. These clips are short/small
+% enough that uncompressed size isn't a concern.
+V = VideoWriter(movie, 'Uncompressed AVI');
 V.FrameRate = 50;
 open(V);
 
@@ -30,7 +39,7 @@ for count = 1:size(L,3)
     % Burn timestamp text (simple pixel-level not needed — use insertText if
     % available, otherwise skip to avoid figure overhead)
     if exist('insertText','file')
-        txtstr = ['Time(s): ' num2str((count+stp-1)*timestep)];
+        txtstr = ['Time(s): ' num2str((count+stp-1)*timestep) '  Frame: ' num2str(count+stp-1)];
         frame_rgb = insertText(frame_rgb,[5 5],txtstr,'FontSize',12, ...
             'TextColor','white','BoxOpacity',0);
     end

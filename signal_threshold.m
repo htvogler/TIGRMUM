@@ -1,4 +1,4 @@
-function mask = signal_threshold(frm, method)
+function mask = signal_threshold(frm, method, up_factor)
 % Per-frame binary foreground mask, method selectable via threshold_method
 % (see run_config.m). Which one to use depends on the signal's intensity
 % distribution along the tube, not the imaging mode:
@@ -23,13 +23,22 @@ function mask = signal_threshold(frm, method)
 %                visible edge (tested on HV197_4_19: kept the dim shank
 %                connected while removing stray background speckle and
 %                tightening the outline -- see session notes).
+%
+% up_factor: spatial upsampling factor applied upstream (see run_config.m's
+% `upsample` and main_track_movies.m). Default 1 (no upsampling). The
+% erosion radius and area-opening threshold below are calibrated in native-
+% resolution pixels -- a linear distance (erosion) scales by up_factor, an
+% area (bwareaopen) scales by up_factor^2, so both still correspond to the
+% same physical size regardless of how finely the frame has been resampled.
+
+if nargin < 3 || isempty(up_factor), up_factor = 1; end
 
 switch method
     case 'otsu'
         mask = imbinarize(mat2gray(frm));
     case 'triangle'
         mask = double(frm) > triangle_threshold(frm);
-        mask = imerode(mask, strel('disk', 1));
+        mask = imerode(mask, strel('disk', up_factor));
     otherwise
         error('signal_threshold: unknown threshold_method "%s" (use ''otsu'' or ''triangle'')', method);
 end
@@ -44,6 +53,6 @@ end
 % 2930px, 37 noise blobs, 32 of them under 10px) -- bwareaopen+bwareafilt
 % here reduces that to the single real component, matching what U already
 % gets downstream.
-mask = bwareaopen(mask, 100);
+mask = bwareaopen(mask, round(100 * up_factor^2));
 mask = bwareafilt(mask, 1);
 end

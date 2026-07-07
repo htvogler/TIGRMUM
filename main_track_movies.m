@@ -58,6 +58,20 @@ else
     error('No suitable HDF5 input file found for %s', fname);
 end
 
+% Optional spatial upsampling (see run_config.m: `upsample`). Fixed 2x
+% bicubic factor -- meant as a quick test of whether more pixels per tube
+% (currently only ~10px wide) reduces segmentation/centerline bias, not a
+% tunable resolution knob. Halves pixelsize automatically so
+% starti/stopi/diamcutoff stay correct in real-world units -- the config
+% should still hold the camera's true, native pixelsize either way.
+if upsample, up_factor = 2; else, up_factor = 1; end
+if up_factor > 1
+    BT1 = upsample_stack(BT1, up_factor);
+    if ~isempty(BT2), BT2 = upsample_stack(BT2, up_factor); end
+    if strcmp(mode, 'ratio'), M = upsample_stack(M, up_factor); end
+    if pixelsize > 0, pixelsize = pixelsize / up_factor; end
+end
+
 % Rescale data to full 16-bit range if the camera bit depth is less than 16.
 % FRET-IBRA stores 12-bit (or other) camera data in uint16 containers without
 % expanding the range, so raw values only occupy [0, 2^bit_depth-1].
@@ -79,12 +93,12 @@ end
 if ~strcmp(mode, 'ratio')
     for fc = 1:size(BT1,3)
         frm = BT1(:,:,fc);
-        BT1(:,:,fc) = frm .* cast(signal_threshold(frm, threshold_method), class(BT1));
+        BT1(:,:,fc) = frm .* cast(signal_threshold(frm, threshold_method, up_factor), class(BT1));
     end
     if ~isempty(BT2)
         for fc = 1:size(BT2,3)
             frm = BT2(:,:,fc);
-            BT2(:,:,fc) = frm .* cast(signal_threshold(frm, threshold_method), class(BT2));
+            BT2(:,:,fc) = frm .* cast(signal_threshold(frm, threshold_method, up_factor), class(BT2));
         end
     end
     M = BT1;
@@ -97,6 +111,8 @@ type = find_orient(M(:,:,1));
 if (tip_plot == 1) && (video_intensity ~= 2)
     V = VideoWriter([outpath '/' fname '_growth.mp4'], 'MPEG-4');
     V.FrameRate = 100;
+    V.Quality = 100; % default (75) visibly ringed/ghosted thin bright features
+                      % on the mostly-black background of these small frames
     open(V);
     hdum = figure('visible','off');
     imagesc(zeros(size(M,1), size(M,2)));
@@ -109,9 +125,13 @@ end
 % with the traced centerline and ROI halves overlaid, so the ROI-split
 % geometry can be checked directly against the real signal instead of
 % inferred from the binary-mask growth video or the un-annotated intensity
-% video. Separate from both -- does not touch growth.mp4 or _intensity.mp4.
+% video. Separate from both -- does not touch growth.mp4 or _intensity.avi.
 if roi_debug_video && (video_intensity ~= 2)
-    Vroi = VideoWriter([outpath '/' fname '_roi_debug.mp4'], 'MPEG-4');
+    % Uncompressed AVI, not MPEG-4: same reasoning as video_processing.m's
+    % intensity video -- H.264's chroma subsampling breaks up the thin
+    % centerline/ROI-tint overlay into scattered artifacts regardless of
+    % Quality setting. This is a debug tool, so fidelity over file size.
+    Vroi = VideoWriter([outpath '/' fname '_roi_debug.avi'], 'Uncompressed AVI');
     Vroi.FrameRate = 20;
     open(Vroi);
 end
@@ -196,12 +216,12 @@ for count = smp:-1:stp
     % stray pixel 4 rows from the tube edge at column 117 got bridged in by
     % imclose, thickening the tube's border by ~2px over the last 4 columns
     % approaching the crop edge).
-    U = bwareaopen(P,100);
+    U = bwareaopen(P, round(100 * up_factor^2));
     U = bwareafilt(U,1);
     % Gap repair: recover disconnected P pieces close to U and aligned with its axis
     Ustats = regionprops(U, 'Centroid', 'Orientation', 'MajorAxisLength');
     if ~isempty(Ustats)
-        prox_dist = max(30, round(Ustats.MajorAxisLength * 0.15));
+        prox_dist = max(round(30 * up_factor), round(Ustats.MajorAxisLength * 0.15));
         U_grown = imdilate(U, strel('disk', prox_dist));
         Pother = bwlabel(P & ~U);
         U_prev_grown = [];
@@ -222,7 +242,7 @@ for count = smp:-1:stp
             yr = min(max(round(yctk_smp), 1), size(U,1));
             xr = min(max(round(xctk_smp), 1), size(U,2));
             cl_mask(sub2ind(size(U), yr, xr)) = true;
-            cl_mask_grown = imdilate(cl_mask, strel('disk', 15));
+            cl_mask_grown = imdilate(cl_mask, strel('disk', round(15 * up_factor)));
             % Gap gate: only run centerline-guided repair if the smp
             % centerline actually passes through unmasked area.  For
             % complete tubes (strong signal, no gap) the centerline lies
@@ -299,7 +319,7 @@ for count = smp:-1:stp
     if exist('diamo','var')
         close_r = max(1, round(diamo * 0.15));
     else
-        close_r = 2;
+        close_r = round(2 * up_factor);
     end
     U = imclose(U, strel('disk', close_r));
     U = bwareafilt(U, 1);
@@ -328,7 +348,7 @@ for count = smp:-1:stp
         imwrite(mat2gray(double(O)),            [dp '_01_O_raw.png']);
         imwrite(mat2gray(double(L(:,:,count))), [dp '_02_L_display.png']);
         imwrite(P,                              [dp '_03_P_thres.png']);
-        Ud1 = bwareaopen(P, 100);
+        Ud1 = bwareaopen(P, round(100 * up_factor^2));
         imwrite(Ud1,                            [dp '_04_U_bwareaopen.png']);
         Ud2 = bwareafilt(Ud1, 1);
         imwrite(Ud2,                            [dp '_05_U_bwareafilt.png']);
@@ -1052,24 +1072,42 @@ for count = smp:-1:stp
         % imrotate block earlier in this loop) -- using L here would
         % misalign the overlay against the ROI geometry.
         Od = min(255, double(O)./Cmax.*255);
-        jetmap = uint8(jet(256).*255);
+        % Reserve index 1 for pure black, same as video_processing.m's map --
+        % without it, jet(256)'s own index-1 colour (dark blue, not black)
+        % renders the zeroed background as a solid dark-blue field instead
+        % of black, since O==0 always maps to index 1.
+        jetmap = uint8(vertcat([0 0 0], jet(255)) .* 255);
         idx = uint8(Od) + 1;
         rgb = reshape(jetmap(idx(:),:), size(O,1), size(O,2), 3);
         rch = rgb(:,:,1); gch = rgb(:,:,2); bch = rgb(:,:,3);
-        % Tint each ROI half so it's clear which pixels count toward
-        % Half1 (red) vs Half2 (blue), while still showing the real
-        % intensity underneath (blend, not a flat fill).
+        % Outline each ROI half (solid colour, not a blend) so the split is
+        % visible regardless of the underlying jet colour -- a 50% blend was
+        % nearly invisible against jet's own warm tip colours (verified:
+        % the F2/blue blend against a near-zero-blue jet red pixel produced
+        % [.,.,128], barely distinguishable from the unblended tip colour).
+        % bwperim, not imerode-based edge detection, since it still returns
+        % a usable boundary even when the ROI is only a few px wide.
+        % bwperim/the traced skeleton are always exactly 1px wide regardless
+        % of resolution -- at up_factor=2 that's half as visually prominent
+        % relative to the (now 2x wider) tube as it was natively. Thicken
+        % both by the same up_factor so the overlay stays equally visible
+        % whether or not upsampling is on (verified: without this, the ROI
+        % outline/centerline were still being drawn correctly at up_factor=2,
+        % just too thin to notice against the tube at a normal viewing size).
+        line_r = max(0, up_factor - 1);
         if (ROItype > 0)
-            f1m = logical(F1); f2m = logical(F2);
-            rch(f1m) = uint8(min(255, double(rch(f1m))*0.5 + 255*0.5));
-            gch(f1m) = uint8(double(gch(f1m))*0.5);
-            bch(f1m) = uint8(double(bch(f1m))*0.5);
-            rch(f2m) = uint8(double(rch(f2m))*0.5);
-            gch(f2m) = uint8(double(gch(f2m))*0.5);
-            bch(f2m) = uint8(min(255, double(bch(f2m))*0.5 + 255*0.5));
+            f1_edge = bwperim(logical(F1));
+            f2_edge = bwperim(logical(F2));
+            if line_r > 0
+                f1_edge = imdilate(f1_edge, strel('disk', line_r));
+                f2_edge = imdilate(f2_edge, strel('disk', line_r));
+            end
+            rch(f1_edge) = 255; gch(f1_edge) = 0;   bch(f1_edge) = 0;
+            rch(f2_edge) = 0;   gch(f2_edge) = 0;   bch(f2_edge) = 255;
         end
         % Traced centerline as a bright white line on top of everything.
         clm = logical(Cplot);
+        if line_r > 0, clm = imdilate(clm, strel('disk', line_r)); end
         rch(clm) = 255; gch(clm) = 255; bch(clm) = 255;
         rgb_roi = cat(3, rch, gch, bch);
         if exist('insertText','file')

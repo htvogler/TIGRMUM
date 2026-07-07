@@ -16,11 +16,26 @@ frame_rate = 0.150; % Number of seconds per frame of input video
 distributions = 0;  % Show histogram of results in the end
 workspace = 0; % Save workspace
 debug_mode = 0; % Save per-run diagnostic images + print ROI arc debug info to console
-roi_debug_video = 0; % Save {fname}_roi_debug.mp4: real intensity (jet colormap) with the traced
-                     % centerline and ROI halves (Half1=red tint, Half2=blue tint) overlaid, in the
+roi_debug_video = 0; % Save {fname}_roi_debug.avi (uncompressed -- MPEG-4 chroma
+                     % subsampling mangled the thin overlay at this frame size):
+                     % real intensity (jet colormap) with the traced centerline and
+                     % ROI halves outlined (Half1=red, Half2=blue) overlaid, in the
                      % same orientation as the tracking geometry. Separate from growth.mp4 and
-                     % _intensity.mp4 -- doesn't touch either. Meant for checking the ROI-split
+                     % _intensity.avi -- doesn't touch either. Meant for checking the ROI-split
                      % geometry directly against the real signal, e.g. if Half2/Half1 looks biased.
+upsample = 0; % 0 = off (default). 1 = bicubic-upsample the raw stack 2x before
+                     % segmentation/tracking. Experimental: tests whether more pixels per
+                     % tube (currently only ~10px wide, so a 1px error is a much bigger
+                     % fraction of the object than on a wider tube) reduces
+                     % segmentation/centerline bias. All the pipeline's hardcoded
+                     % pixel-based constants (erosion/closing radii, bwareaopen area
+                     % thresholds) are scaled internally to match -- still enter the
+                     % camera's true, native pixelsize below; it's halved internally
+                     % when this is on. Roughly 4x the pixels/frame, so slower; try on
+                     % a short stp/smp range first. Keep in mind: this interpolates
+                     % existing pixels, it doesn't add real optical resolution -- for
+                     % new acquisitions, a higher-mag objective/tube lens or no pixel
+                     % binning addresses the root cause directly.
 
 % Tip detection parameters
 weight = 0.5; % Distance to eliminate branches (Higher means more reliance on the tip ellipse), 0 follows only the thinned edge.
