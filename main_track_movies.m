@@ -247,14 +247,33 @@ for count = smp:-1:stp
     % bridged with a proper corridor (bridge_to_mask.m), not a plain union,
     % so it's guaranteed to end up in the same connected component as U
     % rather than leaving the skeleton looking at two separate blobs.
+    % The loop walks backward from the reference (longest/most-grown) frame
+    % toward earlier, shorter ones -- the tube's tip keeps receding as count
+    % decreases, so U_smp's OWN tip region is never valid for any other
+    % frame. Cap U_ref_grown so it can never extend past this frame's own
+    % plain (pre-rescue) reach, plus a small margin to still allow filling a
+    % gap right at the current tip -- the reference must only ever help
+    % with the stationary base/shank, never redefine where the tip is.
     U_ref_grown = [];
     if weak_signal && exist('U_smp', 'var')
         U_ref_grown = imdilate(U_smp, strel('disk', round(5 * up_factor)));
+        [~, Uc_plain] = find(U);
+        if ~isempty(Uc_plain)
+            tip_margin = round(5 * up_factor);
+            min_allowed_col = max(1, min(Uc_plain) - tip_margin);
+            U_ref_grown(:, 1:(min_allowed_col - 1)) = false;
+        end
         candidates = bwlabel(P & U_ref_grown & ~U);
         for ci = 1:max(candidates(:))
             frag = candidates == ci;
             if nnz(frag) < round(100 * up_factor^2), continue; end
-            U = bridge_to_mask(U, frag, up_factor);
+            if exist('diamo', 'var')
+                corridor_r = max(1, round(diamo / 2));
+            else
+                rp = regionprops(frag, 'MinorAxisLength');
+                corridor_r = max(up_factor, round(rp.MinorAxisLength / 2));
+            end
+            U = bridge_to_mask(U, frag, corridor_r);
         end
     end
 
@@ -309,7 +328,13 @@ for count = smp:-1:stp
         for ci = 1:max(candidates(:))
             frag = candidates == ci;
             if nnz(frag) < round(100 * up_factor^2), continue; end
-            U = bridge_to_mask(U, frag, up_factor);
+            if exist('diamo', 'var')
+                corridor_r = max(1, round(diamo / 2));
+            else
+                rp = regionprops(frag, 'MinorAxisLength');
+                corridor_r = max(up_factor, round(rp.MinorAxisLength / 2));
+            end
+            U = bridge_to_mask(U, frag, corridor_r);
         end
     end
     % Closing radius scaled to the tube's own measured width (diamo) rather
@@ -328,6 +353,14 @@ for count = smp:-1:stp
         close_r = round(2 * up_factor);
     end
     U = imclose(U, strel('disk', close_r));
+    % weak_signal only: erode small spikes/whiskers off the boundary the
+    % same way imclose (just above) fills small bays/notches -- same
+    % diamo-scaled radius, opposite morphological operation. Not applied
+    % outside weak_signal since it changes the mask shape for datasets that
+    % never asked for this smoothing.
+    if weak_signal
+        U = imopen(U, strel('disk', close_r));
+    end
     % Final component selection: normally single-largest, same as always.
     % weak_signal only: also keep any component overlapping the reference
     % footprint, regardless of size -- a rescued fragment from the U_ref

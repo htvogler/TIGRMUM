@@ -103,27 +103,25 @@ if weak_signal
         [D, IDX] = bwdist(comp1);
         gap = double(min(D(comp2)));
         if areas_sorted(2) >= 0.25 * areas_sorted(1) && gap <= 3 * sqrt(areas_sorted(2))
-            % Connect the two NEAREST points with a thin corridor instead of
-            % dilating the whole union by bridge_r -- dilating both full
-            % components inflates the entire mask, not just the seam (found
-            % on HV198_1_16 3185-3301: 31% of frames bridged, some with
-            % gaps up to ~29px, so bridge_r up to 16 -- fattening the WHOLE
-            % tube 3x+ over its normal pixel count, not just patching the
-            % gap). comp1/comp2 keep their exact original shape; only a
-            % corridor of fixed width (~up_factor, matching the erosion
-            % radius elsewhere) gets added between them, regardless of how
-            % large the gap itself is.
-            comp2_idx = find(comp2);
-            [~, rel] = min(D(comp2_idx));
-            [r2, c2] = ind2sub(size(mask), comp2_idx(rel));
-            [r1, c1] = ind2sub(size(mask), IDX(r2, c2));
-            corridor = false(size(mask));
-            corridor = drawline(corridor, r1, c1, r2, c2, true);
-            corridor = imdilate(corridor, strel('disk', up_factor));
-            mask = comp1 | comp2 | corridor;
+            % Connect the two components with a corridor instead of dilating
+            % the whole union by bridge_r -- dilating both full components
+            % inflates the entire mask, not just the seam (found on
+            % HV198_1_16 3185-3301: 31% of frames bridged, some with gaps up
+            % to ~29px, so bridge_r up to 16 -- fattening the WHOLE tube 3x+
+            % over its normal pixel count). comp1/comp2 keep their exact
+            % original shape; only a corridor gets added between them.
+            % Corridor width matches the smaller piece's own local width
+            % (regionprops MinorAxisLength), not a thin fixed value -- a
+            % corridor much thinner than the real tube creates a visible
+            % "dumbbell" pinch that confuses the tip-detection/branch-
+            % removal logic downstream even once the pieces are technically
+            % one connected component (verified on HV198_1_16 frame 3224).
+            rp = regionprops(comp2, 'MinorAxisLength');
+            corridor_r = max(up_factor, round(rp.MinorAxisLength / 2));
+            mask = bridge_to_mask(comp1, comp2, corridor_r);
             bridged = true;
             fprintf('  signal_threshold: bridged 2 components (%d px + %d px, gap %.1f px, corridor width %d)\n', ...
-                areas_sorted(1), areas_sorted(2), gap, up_factor);
+                areas_sorted(1), areas_sorted(2), gap, corridor_r);
         end
     end
 end
@@ -144,15 +142,9 @@ if weak_signal && any(edge_frags(:))
     for ei = 1:max(lbl_e(:))
         frag = lbl_e == ei;
         if any(frag(:) & mask(:)), continue; end
-        [D2, IDX2] = bwdist(mask);
-        frag_idx = find(frag);
-        [~, rel2] = min(D2(frag_idx));
-        [rf, cf] = ind2sub(size(mask), frag_idx(rel2));
-        [rm, cm] = ind2sub(size(mask), IDX2(rf, cf));
-        corridor2 = false(size(mask));
-        corridor2 = drawline(corridor2, rm, cm, rf, cf, true);
-        corridor2 = imdilate(corridor2, strel('disk', up_factor));
-        mask = mask | frag | corridor2;
+        rp = regionprops(frag, 'MinorAxisLength');
+        corridor_r = max(up_factor, round(rp.MinorAxisLength / 2));
+        mask = bridge_to_mask(mask, frag, corridor_r);
     end
 end
 end
