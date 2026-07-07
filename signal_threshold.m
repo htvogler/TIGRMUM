@@ -82,7 +82,10 @@ if weak_signal
         comp1 = lbl == order(1);
         comp2 = lbl == order(2);
         D = bwdist(comp1);
-        gap = min(D(comp2));
+        gap = double(min(D(comp2))); % strel requires a double radius downstream --
+                                      % frm's class (e.g. single, if it ever enters
+                                      % the pipeline that way) can otherwise leak
+                                      % through bwdist/min into bridge_r
         if areas_sorted(2) >= 0.25 * areas_sorted(1) && gap <= 3 * sqrt(areas_sorted(2))
             % imdilate, not imclose: closing's erode-back step strips away
             % the thin bridge this just formed (a minimal dilation joins
@@ -93,7 +96,7 @@ if weak_signal
             % them into 1 component, but the matching imclose erode-back
             % restored 2. A slightly fatter waist for one anomalous frame is
             % harmless; losing half the tube again is not.
-            bridge_r = ceil(gap / 2) + 1;
+            bridge_r = double(ceil(gap / 2) + 1);
             mask = imdilate(comp1 | comp2, strel('disk', bridge_r));
             bridged = true;
             fprintf('  signal_threshold: bridged 2 components (%d px + %d px, gap %.1f px)\n', ...
