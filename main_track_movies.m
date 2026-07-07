@@ -168,6 +168,7 @@ if (video_intensity == 2), return; end
 % Loop backwards over stack
 if (distributions), d = 1; end
 U_prev = [];
+right_anchor_row_last = []; % weak_signal border-extension continuity, see below
 frame_failed = false(smp, 1);
 if ~exist('V_frame_size','var'), V_frame_size = []; end
 Vroi_frame_size = [];
@@ -341,14 +342,26 @@ for count = smp:-1:stp
         % since there's genuinely nothing there to preserve (verified on
         % HV198_1_16 3185-3301: 30 of 48 border-touching failures had zero
         % raw signal near the border, not just a discarded small fragment).
-        % Extend from U's own nearest point straight out to the border on
-        % that row, so the border-closing step just below (which assumes
+        % Extend U so the border-closing step just below (which assumes
         % U(:,end) has at least one true pixel, and otherwise silently does
         % nothing -- Umax/Umin come back empty and drawline is a no-op) has
         % something to work with.
+        %
+        % Anchor to the LAST frame's actual border row (right_anchor_row_last),
+        % not whichever row this frame's own already-degraded mask happens to
+        % end nearest to. The latter is essentially arbitrary and has no
+        % memory of the previous frame, which made right_anchor (and the
+        % whole per-frame traced centerline anchored on it) visibly jump
+        % around frame to frame on these frames specifically, instead of
+        % staying as stable as it does whenever the border signal is real.
         [Ur, Uc] = find(U);
         [~, mi] = max(Uc);
-        U(Ur(mi), Uc(mi):size(U,2)) = true;
+        if ~isempty(right_anchor_row_last)
+            target_row = min(max(right_anchor_row_last, 1), size(U,1));
+            U = drawline(U, Ur(mi), Uc(mi), target_row, size(U,2), true);
+        else
+            U(Ur(mi), Uc(mi):size(U,2)) = true;
+        end
     end
     Umax = max(find(U(:,end)==1)); Umin = min(find(U(:,end)==1));
     U = imfill(drawline(U,Umin,size(U,2),Umax,size(U,2),1),'holes');
@@ -719,6 +732,7 @@ for count = smp:-1:stp
         ra_row = right_pix(snap);
     end
     right_anchor = [ra_row, right_col];
+    if weak_signal, right_anchor_row_last = ra_row; end
 
     % Weight: inversely proportional to distance from tube boundary
     D_tube = bwdist(~U);
