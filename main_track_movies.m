@@ -224,21 +224,37 @@ for count = smp:-1:stp
     % frame's own full mask -- not a thin centerline -- as a spatial prior
     % for which nearby real signal (P) pixels should count as tube. A full
     % 2D mask, dilated by a small margin, naturally covers the tube's actual
-    % width and shape, not just an idealised 1px path, so it both rescues
-    % disconnected fragments *and* fills in thin/ragged edges within an
-    % otherwise-connected mask in one mechanism -- verified on HV198_1_16
-    % 3185-3301: dilating the reference frame's mask by just 5px (native;
-    % scaled by up_factor here) already covers 98-100% of every other
-    % frame's own mask in this range, including badly split/truncated ones.
-    % Replaces the old centerline-based (yctk_smp/xctk_smp) version of this
-    % same idea, which needed a bounding-box-clip workaround specifically
-    % because a 1D line has no width of its own to be a shape prior with.
+    % width and shape, not just an idealised 1px path -- verified on
+    % HV198_1_16 3185-3301: dilating the reference frame's mask by just 5px
+    % (native; scaled by up_factor here) already covers 98-100% of every
+    % other frame's own mask in this range, including badly split/truncated
+    % ones. Replaces the old centerline-based (yctk_smp/xctk_smp) version of
+    % this same idea, which needed a bounding-box-clip workaround
+    % specifically because a 1D line has no width of its own to be a shape
+    % prior with.
+    %
+    % Only bridge COHERENT fragments here, same area floor as bwareaopen
+    % above -- not every scattered raw-threshold pixel that happens to fall
+    % within the (fairly generous) dilated region. An earlier version just
+    % unioned in P & U_ref_grown wholesale: on frames with only a few
+    % noise-level hits in that region, this created several tiny 1-12px
+    % "whisker" appendages, each becoming a spurious skeleton endpoint
+    % (verified: pushed one frame's endpoint count from 20 to 23, another's
+    % 18 to 24) -- branch_removal and the tip-selection logic downstream
+    % assume a simple tip+base skeleton and broke on the extra branches,
+    % producing the "Colon operands must be real scalars" warnings and
+    % occasional hard crashes the user hit. Each qualifying fragment is
+    % bridged with a proper corridor (bridge_to_mask.m), not a plain union,
+    % so it's guaranteed to end up in the same connected component as U
+    % rather than leaving the skeleton looking at two separate blobs.
     U_ref_grown = [];
     if weak_signal && exist('U_smp', 'var')
         U_ref_grown = imdilate(U_smp, strel('disk', round(5 * up_factor)));
-        on_ref = P & U_ref_grown & ~U;
-        if any(on_ref(:))
-            U = U | on_ref;
+        candidates = bwlabel(P & U_ref_grown & ~U);
+        for ci = 1:max(candidates(:))
+            frag = candidates == ci;
+            if nnz(frag) < round(100 * up_factor^2), continue; end
+            U = bridge_to_mask(U, frag, up_factor);
         end
     end
 
@@ -286,11 +302,14 @@ for count = smp:-1:stp
     U = bwmorph(U,'clean');
     U = medfilt2(U);
     % Re-apply the reference-mask rescue: medfilt2 can erode away thin,
-    % single-pixel-wide connections just added above.
+    % single-pixel-wide connections just added above. Same coherent-
+    % fragment-only, corridor-bridged approach as above, not a raw union.
     if ~isempty(U_ref_grown)
-        on_ref = P & U_ref_grown & ~U;
-        if any(on_ref(:))
-            U = U | on_ref;
+        candidates = bwlabel(P & U_ref_grown & ~U);
+        for ci = 1:max(candidates(:))
+            frag = candidates == ci;
+            if nnz(frag) < round(100 * up_factor^2), continue; end
+            U = bridge_to_mask(U, frag, up_factor);
         end
     end
     % Closing radius scaled to the tube's own measured width (diamo) rather
