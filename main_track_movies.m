@@ -93,12 +93,12 @@ end
 if ~strcmp(mode, 'ratio')
     for fc = 1:size(BT1,3)
         frm = BT1(:,:,fc);
-        BT1(:,:,fc) = frm .* cast(signal_threshold(frm, threshold_method, up_factor), class(BT1));
+        BT1(:,:,fc) = frm .* cast(signal_threshold(frm, threshold_method, up_factor, weak_signal), class(BT1));
     end
     if ~isempty(BT2)
         for fc = 1:size(BT2,3)
             frm = BT2(:,:,fc);
-            BT2(:,:,fc) = frm .* cast(signal_threshold(frm, threshold_method, up_factor), class(BT2));
+            BT2(:,:,fc) = frm .* cast(signal_threshold(frm, threshold_method, up_factor, weak_signal), class(BT2));
         end
     end
     M = BT1;
@@ -569,6 +569,28 @@ for count = smp:-1:stp
             srclabel = 'skel'; if (tip_finaldistpos==1), srclabel = 'ellipsef'; end
             fprintf('  tip F%d: branchpt=%d unbranched last_flag=%d -> %s\n', ...
                 count, ~isempty(Sbl), last_flag, srclabel);
+        end
+    end
+
+    % Tip-position sanity check (weak_signal only): a real tube tip cannot
+    % jump implausibly far between adjacent frames. Empirically calibrated,
+    % not growth-rate-derived: frame-to-frame tip displacement was measured
+    % on 3 real datasets (~6500 transitions total) -- genuine growth+jitter
+    % never exceeded ~9.7um on two clean datasets, while a third (known
+    % segmentation failures, e.g. the mask splitting the tube in two) showed
+    % a sharp gap in the distribution: nothing between ~5um and ~41um, with
+    % ~2% of frames landing at 65-69um. 15um sits in the middle of that gap
+    % -- same flagging result (0 false positives on the clean datasets, ~68
+    % frames flagged on the bad one) at any threshold from 10 to 30um, so
+    % the exact value isn't sensitive. See session notes for the analysis.
+    if weak_signal && last_flag && pixelsize > 0
+        tip_jump_um = pdist2(tip_final(count,:), tip_final_last) * pixelsize;
+        if tip_jump_um > max_tip_jump_um
+            frame_failed(count) = true;
+            if debug_mode
+                fprintf('  tip F%d: jump=%.2fum > max_tip_jump_um=%.1fum -- flagged, results NaN''d\n', ...
+                    count, tip_jump_um, max_tip_jump_um);
+            end
         end
     end
 

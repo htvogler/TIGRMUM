@@ -77,4 +77,21 @@ weak_signal = 0; % 0 = no centerline gap-repair (default). 1 = also run centerli
                  % smp reference centerline -- useful for stacks with fragmented/dropout
                  % signal, but can pull in disconnected debris on stacks that don't need it
                  % (see session notes). Applies to single-channel and two-channel-without-
-                 % ratio modes only; ratio mode is unaffected either way.
+                 % ratio modes only; ratio mode is unaffected either way. Also gates two
+                 % more checks, both weak_signal-only:
+                 %  - signal_threshold.m: if per-pixel thresholding splits the tube into two
+                 %    substantial, nearby connected components (e.g. a transient real dip in
+                 %    signal severs the mask) instead of discarding the smaller one (today's
+                 %    default behaviour), bridge them into one piece.
+                 %  - main_track_movies.m: flag (NaN) a frame if its tracked tip jumps more
+                 %    than max_tip_jump_um from the previous frame's tip -- see that constant
+                 %    below for the empirical basis.
+max_tip_jump_um = 15; % Only used when weak_signal=1. Max plausible frame-to-frame tip
+                 % displacement in um before a frame is flagged as a tracking failure rather
+                 % than real growth+jitter. Empirically calibrated (not growth-rate-derived):
+                 % measured on 3 real datasets (~6500 transitions) -- genuine growth+jitter
+                 % never exceeded ~9.7um on two clean datasets, while a third (known
+                 % segmentation failures) showed a sharp gap in the distribution with nothing
+                 % between ~5um and ~41um. 15um sits in that gap; any value from 10-30um gives
+                 % the identical result on all 3 datasets, so it's not a sensitive parameter --
+                 % re-check if working with a very different growth rate/frame rate regime.
