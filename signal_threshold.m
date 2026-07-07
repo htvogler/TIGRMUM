@@ -110,14 +110,22 @@ if weak_signal
             % to ~29px, so bridge_r up to 16 -- fattening the WHOLE tube 3x+
             % over its normal pixel count). comp1/comp2 keep their exact
             % original shape; only a corridor gets added between them.
-            % Corridor width matches the smaller piece's own local width
-            % (regionprops MinorAxisLength), not a thin fixed value -- a
-            % corridor much thinner than the real tube creates a visible
-            % "dumbbell" pinch that confuses the tip-detection/branch-
-            % removal logic downstream even once the pieces are technically
-            % one connected component (verified on HV198_1_16 frame 3224).
-            rp = regionprops(comp2, 'MinorAxisLength');
-            corridor_r = max(up_factor, round(rp.MinorAxisLength / 2));
+            % Corridor width matches the smaller piece's own local width --
+            % estimated as Area/MajorAxisLength (average cross-section along
+            % its length), NOT regionprops MinorAxisLength. MinorAxisLength
+            % comes from an ellipse fit to the WHOLE region's second moments,
+            % which is only a sane width proxy for a straight blob -- for a
+            % bent/curved fragment (this dataset's tube has a visible zigzag)
+            % it reflects the bend's overall perpendicular spread instead,
+            % wildly overestimating local width. Verified on HV198_1_16
+            % frame 3267: comp1 (a genuine, otherwise-normal ~16px-wide tube
+            % segment) had MinorAxisLength=82.6px; comp2 had 66.1px -- using
+            % either as corridor_r produced a "balloon" several times the
+            % real tube width. Area/MajorAxisLength gave 17.7 and 16.7 for
+            % the same two components -- matching this frame's real diamo
+            % (~15-16px) closely.
+            rp = regionprops(comp2, 'MajorAxisLength');
+            corridor_r = max(up_factor, round((areas_sorted(2) / rp.MajorAxisLength) / 2));
             mask = bridge_to_mask(comp1, comp2, corridor_r);
             bridged = true;
             fprintf('  signal_threshold: bridged 2 components (%d px + %d px, gap %.1f px, corridor width %d)\n', ...
@@ -142,8 +150,8 @@ if weak_signal && any(edge_frags(:))
     for ei = 1:max(lbl_e(:))
         frag = lbl_e == ei;
         if any(frag(:) & mask(:)), continue; end
-        rp = regionprops(frag, 'MinorAxisLength');
-        corridor_r = max(up_factor, round(rp.MinorAxisLength / 2));
+        rp = regionprops(frag, 'MajorAxisLength', 'Area');
+        corridor_r = max(up_factor, round((rp.Area / rp.MajorAxisLength) / 2));
         mask = bridge_to_mask(mask, frag, corridor_r);
     end
 end
