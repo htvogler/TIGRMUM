@@ -220,61 +220,36 @@ for count = smp:-1:stp
     U = bwareaopen(P, round(100 * up_factor^2));
     U = bwareafilt(U,1);
 
-    % weak_signal only: use the reference (first analysed, i.e. count==smp)
-    % frame's own full mask -- not a thin centerline -- as a spatial prior
-    % for which nearby real signal (P) pixels should count as tube. A full
-    % 2D mask, dilated by a small margin, naturally covers the tube's actual
-    % width and shape, not just an idealised 1px path -- verified on
-    % HV198_1_16 3185-3301: dilating the reference frame's mask by just 5px
-    % (native; scaled by up_factor here) already covers 98-100% of every
-    % other frame's own mask in this range, including badly split/truncated
-    % ones. Replaces the old centerline-based (yctk_smp/xctk_smp) version of
-    % this same idea, which needed a bounding-box-clip workaround
-    % specifically because a 1D line has no width of its own to be a shape
-    % prior with.
+    % weak_signal only: instead of detecting/bridging fragments in this
+    % frame's own (possibly noisy/incomplete) data, directly reuse the
+    % reference (first analysed, i.e. count==smp) frame's own SMOOTHED mask
+    % as the known-good shape for the stationary base/shank, cropped to
+    % start at THIS frame's own tip. The loop walks backward from the
+    % reference (longest/most-grown) frame toward earlier, shorter ones --
+    % the tip recedes as count decreases, so the reference's own tip is
+    % never valid for any other frame, but the base/shank shape is (it
+    % doesn't move) -- "we kind of keep the reference mask and only shrink
+    % it back on the left to fit the new tip." The tip itself always comes
+    % from THIS frame's own mask (U, just built above from this frame's own
+    % P), never from the reference.
     %
-    % Only bridge COHERENT fragments here, same area floor as bwareaopen
-    % above -- not every scattered raw-threshold pixel that happens to fall
-    % within the (fairly generous) dilated region. An earlier version just
-    % unioned in P & U_ref_grown wholesale: on frames with only a few
-    % noise-level hits in that region, this created several tiny 1-12px
-    % "whisker" appendages, each becoming a spurious skeleton endpoint
-    % (verified: pushed one frame's endpoint count from 20 to 23, another's
-    % 18 to 24) -- branch_removal and the tip-selection logic downstream
-    % assume a simple tip+base skeleton and broke on the extra branches,
-    % producing the "Colon operands must be real scalars" warnings and
-    % occasional hard crashes the user hit. Each qualifying fragment is
-    % bridged with a proper corridor (bridge_to_mask.m), not a plain union,
-    % so it's guaranteed to end up in the same connected component as U
-    % rather than leaving the skeleton looking at two separate blobs.
-    % The loop walks backward from the reference (longest/most-grown) frame
-    % toward earlier, shorter ones -- the tube's tip keeps receding as count
-    % decreases, so U_smp's OWN tip region is never valid for any other
-    % frame. Cap U_ref_grown so it can never extend past this frame's own
-    % plain (pre-rescue) reach, plus a small margin to still allow filling a
-    % gap right at the current tip -- the reference must only ever help
-    % with the stationary base/shank, never redefine where the tip is.
-    U_ref_grown = [];
+    % Replaces an earlier fragment-detection approach (scan P for candidate
+    % blobs within a dilated reference footprint, bridge qualifying ones
+    % with a corridor) that had no upper size or shape limit and could pull
+    % in large non-tube-shaped patches of real signal -- verified: a
+    % "massive blob" several times the tube's own width on one frame, from
+    % nothing more than diffuse real signal happening to fall within the
+    % dilated footprint. Directly reusing the reference's own
+    % already-validated, already-smoothed shape (see where U_smp is built,
+    % after diamo is known) sidesteps that failure mode entirely: there's no
+    % scanning/detecting of ambiguous candidates left to get wrong.
     if weak_signal && exist('U_smp', 'var')
-        U_ref_grown = imdilate(U_smp, strel('disk', round(5 * up_factor)));
         [~, Uc_plain] = find(U);
-        if ~isempty(Uc_plain)
-            tip_margin = round(5 * up_factor);
-            min_allowed_col = max(1, min(Uc_plain) - tip_margin);
-            U_ref_grown(:, 1:(min_allowed_col - 1)) = false;
-        end
-        candidates = bwlabel(P & U_ref_grown & ~U);
-        for ci = 1:max(candidates(:))
-            frag = candidates == ci;
-            if nnz(frag) < round(100 * up_factor^2), continue; end
-            if exist('diamo', 'var')
-                corridor_r = max(1, round(diamo / 2));
-            else
-                rp = regionprops(frag, 'MinorAxisLength');
-                corridor_r = max(up_factor, round(rp.MinorAxisLength / 2));
-            end
-            U = bridge_to_mask(U, frag, corridor_r);
-        end
+        tip_col = size(U, 2);
+        if ~isempty(Uc_plain), tip_col = min(Uc_plain); end
+        U_ref_shrunk = U_smp;
+        U_ref_shrunk(:, 1:(tip_col - 1)) = false;
+        U = U | U_ref_shrunk;
     end
 
     % Gap repair: recover disconnected P pieces close to U and aligned with its axis
@@ -320,22 +295,10 @@ for count = smp:-1:stp
     end
     U = bwmorph(U,'clean');
     U = medfilt2(U);
-    % Re-apply the reference-mask rescue: medfilt2 can erode away thin,
-    % single-pixel-wide connections just added above. Same coherent-
-    % fragment-only, corridor-bridged approach as above, not a raw union.
-    if ~isempty(U_ref_grown)
-        candidates = bwlabel(P & U_ref_grown & ~U);
-        for ci = 1:max(candidates(:))
-            frag = candidates == ci;
-            if nnz(frag) < round(100 * up_factor^2), continue; end
-            if exist('diamo', 'var')
-                corridor_r = max(1, round(diamo / 2));
-            else
-                rp = regionprops(frag, 'MinorAxisLength');
-                corridor_r = max(up_factor, round(rp.MinorAxisLength / 2));
-            end
-            U = bridge_to_mask(U, frag, corridor_r);
-        end
+    % Re-apply the reference-mask shrink-and-union: medfilt2 can erode away
+    % thin single-pixel-wide connections just added above.
+    if weak_signal && exist('U_smp', 'var')
+        U = U | U_ref_shrunk;
     end
     % Closing radius scaled to the tube's own measured width (diamo) rather
     % than a fixed pixel count: a fixed radius (originally disk(10), unchanged
@@ -353,30 +316,38 @@ for count = smp:-1:stp
         close_r = round(2 * up_factor);
     end
     U = imclose(U, strel('disk', close_r));
-    % weak_signal only: erode small spikes/whiskers off the boundary the
-    % same way imclose (just above) fills small bays/notches -- same
-    % diamo-scaled radius, opposite morphological operation. Not applied
-    % outside weak_signal since it changes the mask shape for datasets that
-    % never asked for this smoothing.
-    if weak_signal
-        U = imopen(U, strel('disk', close_r));
-    end
-    % Final component selection: normally single-largest, same as always.
-    % weak_signal only: also keep any component overlapping the reference
-    % footprint, regardless of size -- a rescued fragment from the U_ref
-    % block above isn't guaranteed to have actually merged into the main
-    % blob by this point (imclose only bridges gaps up to ~close_r), so
-    % plain bwareafilt(1) could still silently drop it right back out here.
-    if weak_signal && ~isempty(U_ref_grown)
-        lblU = bwlabel(U);
-        ref_labels = setdiff(unique(lblU(U_ref_grown & U)), 0);
-        keep_ref = ismember(lblU, ref_labels);
-        U = bwareafilt(U, 1) | keep_ref;
-    else
+    % weak_signal only: despike/debay along the WHOLE tube, not just at
+    % specific rescue points -- close_r (diamo*0.15) is too small to fix
+    % anything but very minor notches (verified: left clearly visible
+    % "chewed" narrowings in U_final, some deep enough that the measured
+    % diameter collapsed to 0-2px against a 15px reference and crashed the
+    % boundary-curve code downstream). Uses ws_smooth_r (diamo*0.3, set once
+    % the reference frame's own diamo is known -- see below), the same
+    % radius the reference mask itself was smoothed with. Restore border
+    % contact if this erodes it away (opening can strip a thin border-
+    % touching strip) using the reference's own original border rows as a
+    % stable anchor -- same technique used to build U_smp below.
+    if weak_signal && exist('ws_smooth_r', 'var')
+        had_border = any(U(:,end));
+        U = imclose(U, strel('disk', ws_smooth_r));
+        U = imopen(U, strel('disk', ws_smooth_r));
         U = bwareafilt(U, 1);
+        if had_border && ~any(U(:,end)) && ~isempty(U_smp_border_rows)
+            anchor_row = round(median(U_smp_border_rows));
+            [Ur, Uc] = find(U);
+            [~, mi] = max(Uc);
+            corridor = false(size(U));
+            corridor = drawline(corridor, Ur(mi), Uc(mi), anchor_row, size(U,2), true);
+            corridor = imdilate(corridor, strel('disk', up_factor));
+            U = U | corridor;
+        end
     end
+    U = bwareafilt(U, 1);
     U_prev = U;
-    if weak_signal && count == smp, U_smp = U; end
+    if weak_signal && count == smp
+        U_smp_raw = U;
+        U_smp_border_rows = find(U(:,end));
+    end
 
     if (count == smp) Ub = logical(ones(size(P)));
     else Ub = U;
@@ -538,6 +509,43 @@ for count = smp:-1:stp
         if debug_mode
             fprintf('  diamo F%d: single-col=%.1fpx multi-col-median=%.1fpx (n=%d cols) samples=%s\n', ...
                 count, diam, diamo, numel(diamo_samples), mat2str(diamo_samples));
+        end
+        % weak_signal only: finalize the reference mask now that diamo is
+        % known -- heavily smoothed (despike+debay, same operation as every
+        % other frame gets, just using this frame's own newly-measured
+        % diamo since close_r/ws_smooth_r aren't set yet this early in the
+        % very first iteration) so it's a clean template for every other
+        % frame to crop against, not a noisy one. "The reference frame
+        % needs to be touching the right border" -- checked explicitly and
+        % restored via a corridor to its own pre-smoothing border row if
+        % smoothing ever strips it (verified this happens in practice: an
+        % opening large enough to despike can erode away a thin
+        % border-touching strip).
+        if weak_signal && exist('U_smp_raw', 'var')
+            ws_smooth_r = max(1, round(diamo * 0.3));
+            U_smp = imclose(U_smp_raw, strel('disk', ws_smooth_r));
+            U_smp = imopen(U_smp, strel('disk', ws_smooth_r));
+            U_smp = bwareafilt(U_smp, 1);
+            if ~any(U_smp(:,end)) && ~isempty(U_smp_border_rows)
+                anchor_row = round(median(U_smp_border_rows));
+                [Ur, Uc] = find(U_smp);
+                [~, mi] = max(Uc);
+                corridor = false(size(U_smp));
+                corridor = drawline(corridor, Ur(mi), Uc(mi), anchor_row, size(U_smp,2), true);
+                corridor = imdilate(corridor, strel('disk', up_factor));
+                U_smp = U_smp | corridor;
+            end
+            if debug_mode
+                fprintf('  U_smp: raw_px=%d smoothed_px=%d touches_border=%d ws_smooth_r=%d\n', ...
+                    nnz(U_smp_raw), nnz(U_smp), any(U_smp(:,end)), ws_smooth_r);
+                % Dedicated dump for the reference frame itself (count==smp)
+                % -- everything else derives from this, so it needs to be
+                % checkable directly rather than only via the smp-1
+                % diagnostic block below (which is frame smp-1, not smp).
+                dp_ref = fullfile(outpath, sprintf('diag_%d_refmask', count));
+                imwrite(U_smp_raw, [dp_ref '_00_U_smp_raw.png']);
+                imwrite(U_smp,     [dp_ref '_01_U_smp_smoothed.png']);
+            end
         end
     end
 
