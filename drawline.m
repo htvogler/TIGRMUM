@@ -56,7 +56,7 @@ if abs(X1 - X0) <= abs(Y1 - Y0)
    else
       dy = Y1 - Y0; dx = X1 - X0;
       p = -2*dx; n = 2*dy + 2*dx; tn = dy;
-      while (Y0 <= Y1)
+      while (Y0 < Y1)
          if tn >= 0
             tn = tn - p;
          else

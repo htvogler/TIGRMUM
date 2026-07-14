@@ -11,9 +11,17 @@ back_file  = [pathf '/' fname '_back.h5'];
 
 % Build output path: {root}/TIGRMUM_results/{fname}/
 % Assumes input is at {root}/FRET-IBRA_results/{fname}/
+% Override via run_config.m's `outpath_override`, if set, to write directly
+% to a specific directory instead -- e.g. for side-by-side method
+% comparisons, so results never pass through (and risk mixing with
+% whatever pre-existing content sits in) the default shared location.
 [fribra_dir, ~, ~] = fileparts(pathf);
 [root_dir,   ~, ~] = fileparts(fribra_dir);
-outpath = fullfile(root_dir, 'TIGRMUM_results', fname);
+if exist('outpath_override', 'var') && ~isempty(outpath_override)
+    outpath = outpath_override;
+else
+    outpath = fullfile(root_dir, 'TIGRMUM_results', fname);
+end
 if ~exist(outpath, 'dir'), mkdir(outpath); end
 figpath = fullfile(outpath, 'Figures');
 if ~exist(figpath, 'dir'), mkdir(figpath); end
@@ -308,12 +316,27 @@ for count = smp:-1:stp
     % disproportionately large relative to the tube and permanently fills in
     % concave bends during the dilate step (verified on HV197_4_19 frame
     % 2042: disk(10) added 81px at the tube's elbows vs 2px for disk(1)).
-    % diamo isn't calibrated yet on the very first (smp) frame -- fall back
-    % to a small constant for that one frame only.
+    % diamo isn't calibrated yet on the very first (smp) frame -- estimate a
+    % rough width directly from this frame's own current mask instead of a
+    % blind small constant. Area/MajorAxisLength (same width proxy already
+    % used for signal_threshold.m's corridor sizing and diamo's own
+    % cross-check fallback) is whole-shape-based, so it holds up reasonably
+    % well even on the not-yet-closed mask, unlike a local column scan.
+    % Without this, frame smp got a much smaller close_r than every other
+    % frame (which uses the real diamo once known), leaving its boundary
+    % under-smoothed relative to its neighbours -- confirmed on 20260327_2:
+    % this alone was enough to make bwmorph('thin') throw off many spurious
+    % branches on frame smp that branch_removal.m then pruned incorrectly,
+    % picking a mid-tube kink instead of the true tip.
     if exist('diamo','var')
         close_r = max(1, round(diamo * 0.15));
     else
-        close_r = round(2 * up_factor);
+        rp_close = regionprops(U, 'Area', 'MajorAxisLength');
+        if ~isempty(rp_close) && rp_close(1).MajorAxisLength > 0
+            close_r = max(1, round((rp_close(1).Area / rp_close(1).MajorAxisLength) * 0.15));
+        else
+            close_r = round(2 * up_factor);
+        end
     end
     U = imclose(U, strel('disk', close_r));
     % weak_signal only: despike/debay along the WHOLE tube, not just at
@@ -389,12 +412,15 @@ for count = smp:-1:stp
     Umax = max(find(U(:,end)==1)); Umin = min(find(U(:,end)==1));
     U = imfill(drawline(U,Umin,size(U,2),Umax,size(U,2),1),'holes');
 
-    % ---- DIAGNOSTIC BLOCK 1: binarisation pipeline (frame smp-1) ----
-    % smp-1 is the SECOND frame processed (loop runs smp:-1:stp), so it
-    % inherits U_prev/diamo/tip_final_last correctly primed by frame smp —
-    % unlike frame smp itself, which always starts cold. To debug frame N,
-    % set smp = N+1.
-    if debug_mode && count == smp - 1
+    % ---- DIAGNOSTIC BLOCK 1: binarisation pipeline (frames smp and smp-1) ----
+    % smp-1 is the SECOND frame processed (loop runs smp:-1:stp), and
+    % inherits U_prev/diamo/tip_final_last correctly primed by frame smp --
+    % useful for "normal" per-frame debugging. smp itself always starts
+    % cold (no U_prev/tip_final_last yet) -- dumped too since the cold-start
+    % case has its own failure modes (no continuity to disambiguate a branch
+    % choice) that smp-1 can't show. To debug some other frame N, set
+    % smp = N+1 (dumps N via the smp-1 branch).
+    if debug_mode && (count == smp || count == smp - 1)
         dp = fullfile(outpath, sprintf('diag_%d', count));
         imwrite(mat2gray(double(O)),            [dp '_01_O_raw.png']);
         imwrite(mat2gray(double(L(:,:,count))), [dp '_02_L_display.png']);
@@ -415,24 +441,24 @@ for count = smp:-1:stp
     % ---- END DIAGNOSTIC BLOCK 1 ----
 
     % Removing branches from thinned image
-    Q = bwmorph(U,'thin',Inf);    
-    
+    Q = bwmorph(U,'thin',Inf);
+
     Qe = bwmorph(Q,'endpoints');
     [Qer,Qec] = find(Qe > 0);
     Qel = [Qer Qec];
-        
-    Qb = bwmorph(Q,'branchpoints');       
+
+    Qb = bwmorph(Q,'branchpoints');
     [Qbr,Qbc] = find(Qb > 0);
     if (Qbr > 0)
         Qbf = [Qbr Qbc];
         [Q2, Qef, tmp] = branch_removal(Q,Qbf,Qel,0,1);
-    else 
+    else
         Q2 = Q;
         [tmp,Qepos] = max(Qec);
         Qef = Qel;
         Qef(Qepos,:) = [];
     end
-   
+
     % Finding the radius for ellipse fitting
     tols = 0; rad=1;
     while (tols == 0)
@@ -470,12 +496,12 @@ for count = smp:-1:stp
     Se = bwmorph(S,'endpoints');
     [Ser,Sec] = find(Se > 0);
     Sel = [Ser Sec];
-    
+
     % Skeltonizing and finding branchpoints
     Sb = bwmorph(S,'branchpoints');
     [Sbr,Sbc] = find(Sb > 0);
     Sbl = [Sbr Sbc];
-    
+
     if (count == smp)
         % Single-column diam (measured at maxy-1 by locate_tip/edge_quant)
         % underestimates the true diameter on weak-signal stacks: that
@@ -491,7 +517,18 @@ for count = smp:-1:stp
             if dcol < 1, break; end
             drows = find(U(:,dcol));
             if ~isempty(drows)
-                diamo_samples(end+1) = max(drows) - min(drows);
+                % Largest contiguous run, not the full row span: a small
+                % disconnected speck elsewhere in the same column (weak_signal's
+                % rescue logic can leave these) would otherwise inflate the
+                % span-based width several-fold. Confirmed on 20260327_2 frame
+                % 500: true tube run ~81px, full span 386px because of three
+                % stray 5px specks in the same column -- fed a bogus diamo=356
+                % into ws_smooth_r, which then collapsed the reference mask
+                % from 38244px to 9px and broke almost every later frame.
+                gaps = find(diff(drows) > 1);
+                run_starts = [drows(1); drows(gaps+1)];
+                run_ends = [drows(gaps); drows(end)];
+                diamo_samples(end+1) = max(run_ends - run_starts) + 1;
             end
         end
         if ~isempty(diamo_samples)
@@ -505,6 +542,26 @@ for count = smp:-1:stp
             diamo = median(diamo_samples);
         else
             diamo = diam; % fallback if no columns had any mask pixels
+        end
+        % The column-scan above assumes the tube crosses these columns close
+        % to perpendicular -- when it instead meets the border at a shallow/
+        % diagonal angle, a vertical slice measures a much longer span than
+        % the tube's true cross-section (confirmed on 20260327_2 frame 500:
+        % tube runs diagonally, column-scan gave ~356px against a true
+        % ~80-100px width). Cross-check against Area/MajorAxisLength -- the
+        % same width proxy already used in signal_threshold.m for bent/
+        % diagonal shapes -- and fall back to it if the column-scan estimate
+        % looks implausibly large.
+        rp_diamo = regionprops(U, 'Area', 'MajorAxisLength');
+        if ~isempty(rp_diamo) && rp_diamo(1).MajorAxisLength > 0
+            diamo_axis = rp_diamo(1).Area / rp_diamo(1).MajorAxisLength;
+            if diamo > 1.5 * diamo_axis
+                if debug_mode
+                    fprintf('  diamo F%d: column-scan=%.1fpx implausible vs Area/MajorAxisLength=%.1fpx -- using axis estimate\n', ...
+                        count, diamo, diamo_axis);
+                end
+                diamo = diamo_axis;
+            end
         end
         if debug_mode
             fprintf('  diamo F%d: single-col=%.1fpx multi-col-median=%.1fpx (n=%d cols) samples=%s\n', ...
@@ -582,23 +639,37 @@ for count = smp:-1:stp
         end
         [S2,Sef,S2area] = branch_removal(S,Sbf,Sel,kill_angle,close_dist);
     end
-        
+
     % If more than 2 branches, further evaluation is needed
     if (size(Sef,1) > 1)
+        % branch_removal.m's single Sbf-targeted prune can occasionally
+        % leave 3+ candidates instead of 2 -- the voting/tip_mid logic
+        % below is built around exactly 2 (tip_choice is always a
+        % 2-element vector from Sef(1,:)/Sef(2,:)). Narrow to the two
+        % closest to the ellipse fit first so choice always stays in
+        % bounds. Confirmed crash otherwise: HV203_1_11 frame 613,
+        % "Index exceeds the number of array elements. Index must not
+        % exceed 2." -- Sef had 3 rows, skel_ellipsepos (an index into
+        % all of Sef) came back as 3, and tip_choice(3) doesn't exist.
+        if size(Sef,1) > 2
+            d_to_ellipse = pdist2(Sef, tip_ellipsef);
+            [~, order] = sort(d_to_ellipse);
+            Sef = Sef(order(1:2),:);
+        end
         % Voting to decide which branch to be chosen as closer to the tip
         [tmp, skel_ellipsepos] = min(pdist2(Sef,tip_ellipsef));
         if (last_flag == 1)
             [tmp, skel_lastpos] = min(pdist2(Sef,tip_final_last));
             if ((skel_lastpos+skel_ellipsepos+1) > 4) choice = 2; else choice = 1; end
-        else 
-            choice = skel_ellipsepos;       
+        else
+            choice = skel_ellipsepos;
         end
-    
+
         tip_choice = [dsearchn(boundb,Sef(1,:));dsearchn(boundb,Sef(2,:))];
         if (min(tip_choice) == tip_choice(2)) S2area = 1/S2area; end
         tip_skelpos = tip_choice(choice);
         tip_skel = boundb(tip_skelpos,:);
-   
+
         % Finding the middle of both branches if they exist
         cn = 0; tip_angle = [];
         for i = min(tip_choice):max(tip_choice)
@@ -614,7 +685,7 @@ for count = smp:-1:stp
         [tmp, tip_anglepos] = min(tip_anglediff);
         tip_midpos = tip_anglepos+min(tip_choice)-1;
         tip_mid = boundb(tip_midpos,:);
-        
+
         test = [];
         % Tolerance absorbs per-frame boundary-tracing noise: boundb is
         % rebuilt from scratch each frame via bwboundaries, so the same
@@ -643,8 +714,16 @@ for count = smp:-1:stp
             if debug_mode
                 srclabel = 'skel'; if (tip_finalpos==1), srclabel = 'mid'; end
                 overshoot = min(tip_ellipsepos-min(tip_choice), max(tip_choice)-tip_ellipsepos);
-                fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d NOT in [%d,%d] overshoot=%d last_flag=%d -> %s (ellipsedist=[%.1f %.1f])\n', ...
-                    count, ~isempty(Sbl), choice, tip_ellipsepos, min(tip_choice), max(tip_choice), overshoot, last_flag, srclabel, tip_ellipsedist(1), tip_ellipsedist(2));
+                if (last_flag)
+                    fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d NOT in [%d,%d] overshoot=%d last_flag=%d -> %s (ellipsedist=[%.1f %.1f] finaldist=[%.1f %.1f] blend=[%.1f %.1f] tip_mid=[%d %d] tip_skel=[%d %d] tip_final_last=[%d %d])\n', ...
+                        count, ~isempty(Sbl), choice, tip_ellipsepos, min(tip_choice), max(tip_choice), overshoot, last_flag, srclabel, ...
+                        tip_ellipsedist(1), tip_ellipsedist(2), tip_finaldist(1), tip_finaldist(2), ...
+                        (1-0.33)*tip_finaldist(1)+0.33*tip_ellipsedist(1), (1-0.33)*tip_finaldist(2)+0.33*tip_ellipsedist(2), ...
+                        tip_mid(1), tip_mid(2), tip_skel(1), tip_skel(2), tip_final_last(1), tip_final_last(2));
+                else
+                    fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d NOT in [%d,%d] overshoot=%d last_flag=%d -> %s (ellipsedist=[%.1f %.1f])\n', ...
+                        count, ~isempty(Sbl), choice, tip_ellipsepos, min(tip_choice), max(tip_choice), overshoot, last_flag, srclabel, tip_ellipsedist(1), tip_ellipsedist(2));
+                end
             end
         end
     else
@@ -739,13 +818,21 @@ for count = smp:-1:stp
         total2(find(total2(:,2) >= max(total2(:,2))),:) = [];
     end
 
-    % ---- DIAGNOSTIC BLOCK 2: skeleton + geometry (frame smp-1, see BLOCK 1) ----
-    if debug_mode && count == smp - 1
+    % ---- DIAGNOSTIC BLOCK 2: skeleton + geometry (frames smp and smp-1, see BLOCK 1) ----
+    if debug_mode && (count == smp || count == smp - 1)
         dp  = fullfile(outpath, sprintf('diag_%d', count));
         sz1 = size(U,1); sz2 = size(U,2);
 
         imwrite(imdilate(Q,  strel('disk',1)), [dp '_10_Q_thin.png']);
         imwrite(imdilate(Q2, strel('disk',1)), [dp '_11_Q2_debranched.png']);
+        % S/S2: the OTHER skeleton (bwmorph 'skel', not 'thin') -- the
+        % structure that actually generates the tip candidate voted on
+        % (tip_skel/tip_mid), unlike Q/Q2 which only seed the ellipse
+        % fit. Never dumped before this -- was previously only ever
+        % inspected via a one-off standalone script, not the real
+        % pipeline.
+        imwrite(imdilate(S,  strel('disk',1)), [dp '_14_S_skel.png']);
+        imwrite(imdilate(S2, strel('disk',1)), [dp '_15_S2_debranched.png']);
 
         Rch = uint8(U)*80; Gch = uint8(U)*80; Bch = uint8(U)*80;
         Qd  = imdilate(Q,  strel('disk',1)); Rch = Rch + uint8(Qd)*170;
@@ -754,6 +841,20 @@ for count = smp:-1:stp
             re = max(1,Qef(1,1)-4):min(sz1,Qef(1,1)+4);
             ce = max(1,Qef(1,2)-4):min(sz2,Qef(1,2)+4);
             Bch(re,ce) = 255;
+        end
+        % locate_tip.m's ellipse fit (center/axes/phin), drawn in white
+        % so it stands out against the R=Q/G=Q2 coding above. Same
+        % (row,col) convention ellipse_data.m itself uses throughout --
+        % tip_new's columns come from bwboundaries ([row col]), so
+        % "x"=row, "y"=col in center/axes/phin, not the usual image x/y.
+        if isreal(axes) && all(axes > 0)
+            tvals = linspace(0, 2*pi, 200);
+            er = axes(1)*cos(tvals)*cos(phin) - axes(2)*sin(tvals)*sin(phin) + center(1);
+            ec = axes(1)*cos(tvals)*sin(phin) + axes(2)*sin(tvals)*cos(phin) + center(2);
+            er = round(er); ec = round(ec);
+            valid = er>=1 & er<=sz1 & ec>=1 & ec<=sz2;
+            idx = sub2ind([sz1 sz2], er(valid), ec(valid));
+            Rch(idx) = 255; Gch(idx) = 255; Bch(idx) = 255;
         end
         imwrite(cat(3,Rch,Gch,Bch), [dp '_12_skeleton_overlay.png']);
 
@@ -841,8 +942,8 @@ for count = smp:-1:stp
     % Cumulative arc length along path (0 at tip, max at base)
     path_dist = [0; cumsum(sqrt(sum(diff(path).^2, 2)))];
 
-    % DEBUG: save overlay for frame smp-1 (see DIAGNOSTIC BLOCK 1 above)
-    if debug_mode && (count == smp - 1)
+    % DEBUG: save overlay for frames smp and smp-1 (see DIAGNOSTIC BLOCK 1 above)
+    if debug_mode && (count == smp || count == smp - 1)
         dbg = zeros(size(U,1), size(U,2), 3);
         dbg(:,:,3) = double(U) * 0.4;   % tube mask: dark blue
         dbg(:,:,2) = double(Q) * 0.8;   % Q skeleton: green
@@ -854,8 +955,8 @@ for count = smp:-1:stp
         dbg(right_anchor(1), right_anchor(2), :) = [0 1 1];
         % tip_final in magenta
         dbg(tip_final(count,1), tip_final(count,2), :) = [1 0 1];
-        imwrite(dbg, fullfile(outpath, [fname '_debug_skel.png']));
-        disp(['DEBUG saved: ' fullfile(outpath, [fname '_debug_skel.png'])]);
+        imwrite(dbg, fullfile(outpath, [fname sprintf('_debug_skel_%d.png', count)]));
+        disp(['DEBUG saved: ' fullfile(outpath, [fname sprintf('_debug_skel_%d.png', count)])]);
     end
 
     % Subsample to 100 evenly-spaced points and smooth
@@ -1120,7 +1221,25 @@ for count = smp:-1:stp
             kymo(:,a) = improfile(imgaussfilt(Lframe,1.5), linecte(:,2,a), linecte(:,1,a), double(kymo_len));
         end
         kymo(isnan(kymo)) = 0;
-        kymo_avg(:,count-stp+1) = vertcat(zeros((5 + npoints - kymo_len),1), mean(kymo,2));
+        % kymo_avg's row count used to be fixed once from whichever frame was
+        % processed first (5+npoints, from count==smp). That frame's path length
+        % is not a reliable upper bound (e.g. bleach movies: mask/path length
+        % varies a lot with brightness across the stack), so a later frame with
+        % a longer path than that would overflow the column height and throw.
+        % Grow kymo_avg on demand instead, and keep a kymo-only failure from
+        % taking down tip/diameter data already computed earlier this frame.
+        try
+            kymo_col = mean(kymo,2);
+            needed_rows = numel(kymo_col) + 5;
+            if ~exist('kymo_avg','var') || isempty(kymo_avg)
+                kymo_avg = zeros(needed_rows, smp-stp+1);
+            elseif needed_rows > size(kymo_avg,1)
+                kymo_avg = vertcat(zeros(needed_rows - size(kymo_avg,1), size(kymo_avg,2)), kymo_avg);
+            end
+            kymo_avg(:,count-stp+1) = vertcat(zeros(size(kymo_avg,1) - numel(kymo_col),1), kymo_col);
+        catch kymoErr
+            warning('TIGRMUM: kymo_avg update failed on frame %d — %s', count, kymoErr.message);
+        end
 
         % Fixed-line kymograph using smp centerline for all frames
         linecte_f = []; linecte_f(:,:,1) = [yctk_smp, xctk_smp];

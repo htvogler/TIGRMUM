@@ -125,7 +125,11 @@ if weak_signal
             % the same two components -- matching this frame's real diamo
             % (~15-16px) closely.
             rp = regionprops(comp2, 'MajorAxisLength');
-            corridor_r = max(up_factor, round((areas_sorted(2) / rp.MajorAxisLength) / 2));
+            if rp.MajorAxisLength > 0
+                corridor_r = max(up_factor, round((areas_sorted(2) / rp.MajorAxisLength) / 2));
+            else
+                corridor_r = up_factor; % degenerate (near-point) component -- no width to estimate
+            end
             mask = bridge_to_mask(comp1, comp2, corridor_r);
             bridged = true;
             fprintf('  signal_threshold: bridged 2 components (%d px + %d px, gap %.1f px, corridor width %d)\n', ...
@@ -151,7 +155,25 @@ if weak_signal && any(edge_frags(:))
         frag = lbl_e == ei;
         if any(frag(:) & mask(:)), continue; end
         rp = regionprops(frag, 'MajorAxisLength', 'Area');
-        corridor_r = max(up_factor, round((rp.Area / rp.MajorAxisLength) / 2));
+        if rp.MajorAxisLength > 0
+            corridor_r = max(up_factor, round((rp.Area / rp.MajorAxisLength) / 2));
+        else
+            corridor_r = up_factor; % degenerate (near-point) fragment -- no width to estimate
+        end
+        % Same gap sanity check as the two-component bridge above -- an
+        % edge-touching fragment far from the main mask is far more likely
+        % unrelated debris than a real gap in the tube's own signal.
+        % Without this, a small far-away fragment gets bridged with a long,
+        % arbitrary corridor unrelated to the tube (confirmed on
+        % HV200_2_24_cropped: ~148px corridor to a 1-8px far-corner speck;
+        % recurred on 20260327_2: a corridor down to a fragment near the
+        % opposite crop edge, which then fed into diamo and cascaded into
+        % oversized close_r/ws_smooth_r on later frames).
+        D = bwdist(mask);
+        gap = double(min(D(frag)));
+        if gap > 3 * sqrt(rp.Area)
+            continue;
+        end
         mask = bridge_to_mask(mask, frag, corridor_r);
     end
 end
