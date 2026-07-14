@@ -440,23 +440,55 @@ for count = smp:-1:stp
     end
     % ---- END DIAGNOSTIC BLOCK 1 ----
 
-    % Removing branches from thinned image
-    Q = bwmorph(U,'thin',Inf);
-
-    Qe = bwmorph(Q,'endpoints');
-    [Qer,Qec] = find(Qe > 0);
-    Qel = [Qer Qec];
-
-    Qb = bwmorph(Q,'branchpoints');
-    [Qbr,Qbc] = find(Qb > 0);
-    if (Qbr > 0)
-        Qbf = [Qbr Qbc];
-        [Q2, Qef, tmp] = branch_removal(Q,Qbf,Qel,0,1);
+    % Finding the tip-ward reference point (Qef): either via the skeleton +
+    % branch-removal (default, unchanged), or via ring_walk_tip.m -- a
+    % skeleton-free alternative that never builds a branch-point graph, so
+    % it can't inherit branch_removal.m's specific failure mode (a single
+    % stray pixel flipping which endpoint survives pruning at a sharp bend
+    % -- see ring_walk_tip.m and session notes on HV200_2_24_cropped
+    % frames 1482/1500 for the confirmed evidence). Both branches feed the
+    % SAME `Qef`, so everything downstream (the ellipse-fit radius search,
+    % locate_tip) is unconditional and unaware of which method ran.
+    if strcmp(tip_method, 'ringwalk')
+        rw_col = size(U,2) - 1;
+        rw_pix = find(U(:, rw_col));
+        while isempty(rw_pix) && rw_col > 1
+            rw_col = rw_col - 1;
+            rw_pix = find(U(:, rw_col));
+        end
+        rw_row = round(mean(rw_pix));
+        if ~U(rw_row, rw_col)
+            [~, snap] = min(abs(rw_pix - rw_row));
+            rw_row = rw_pix(snap);
+        end
+        % Cross-frame continuity, mirroring the skeleton method's own use
+        % of tip_final_last/last_flag: gated behind last_flag so it's
+        % never referenced before it's actually assigned (count==smp, the
+        % cold-start reference frame, always has last_flag==0).
+        if last_flag
+            Qef = ring_walk_tip(U, [rw_row, rw_col], 'prev_tip', tip_final_last);
+        else
+            Qef = ring_walk_tip(U, [rw_row, rw_col]);
+        end
     else
-        Q2 = Q;
-        [tmp,Qepos] = max(Qec);
-        Qef = Qel;
-        Qef(Qepos,:) = [];
+        % Removing branches from thinned image
+        Q = bwmorph(U,'thin',Inf);
+
+        Qe = bwmorph(Q,'endpoints');
+        [Qer,Qec] = find(Qe > 0);
+        Qel = [Qer Qec];
+
+        Qb = bwmorph(Q,'branchpoints');
+        [Qbr,Qbc] = find(Qb > 0);
+        if (Qbr > 0)
+            Qbf = [Qbr Qbc];
+            [Q2, Qef, tmp] = branch_removal(Q,Qbf,Qel,0,1);
+        else
+            Q2 = Q;
+            [tmp,Qepos] = max(Qec);
+            Qef = Qel;
+            Qef(Qepos,:) = [];
+        end
     end
 
     % Finding the radius for ellipse fitting
@@ -491,16 +523,18 @@ for count = smp:-1:stp
     tip_ellipsepos = dsearchn(boundb,tip_ellipse);
     tip_ellipsef = boundb(tip_ellipsepos,:);
    
-    % Skeletonizing and finding endpoints
-    S = bwmorph(U,'skel',Inf);
-    Se = bwmorph(S,'endpoints');
-    [Ser,Sec] = find(Se > 0);
-    Sel = [Ser Sec];
+    if strcmp(tip_method, 'skeleton')
+        % Skeletonizing and finding endpoints
+        S = bwmorph(U,'skel',Inf);
+        Se = bwmorph(S,'endpoints');
+        [Ser,Sec] = find(Se > 0);
+        Sel = [Ser Sec];
 
-    % Skeltonizing and finding branchpoints
-    Sb = bwmorph(S,'branchpoints');
-    [Sbr,Sbc] = find(Sb > 0);
-    Sbl = [Sbr Sbc];
+        % Skeltonizing and finding branchpoints
+        Sb = bwmorph(S,'branchpoints');
+        [Sbr,Sbc] = find(Sb > 0);
+        Sbl = [Sbr Sbc];
+    end
 
     if (count == smp)
         % Single-column diam (measured at maxy-1 by locate_tip/edge_quant)
@@ -619,6 +653,15 @@ for count = smp:-1:stp
         end
     end
 
+    if strcmp(tip_method, 'ringwalk')
+        % ring_walk_tip.m already produced a single, safeguarded candidate
+        % (Qef) -- no branch ambiguity to vote between, so just take
+        % locate_tip's local ellipse-fit refinement of it directly.
+        tip_final(count,:) = tip_ellipsef;
+        if debug_mode
+            fprintf('  tip F%d: ringwalk -> ellipsef\n', count);
+        end
+    else
     if isempty(Sbl)
         % Skeleton is a simple unbranched path — select tip endpoint directly
         S2 = S; S2area = 1;
@@ -738,6 +781,7 @@ for count = smp:-1:stp
                 count, ~isempty(Sbl), last_flag, srclabel);
         end
     end
+    end
 
     % Tip-position sanity check (weak_signal only): a real tube tip cannot
     % jump implausibly far between adjacent frames. Empirically calibrated,
@@ -823,40 +867,42 @@ for count = smp:-1:stp
         dp  = fullfile(outpath, sprintf('diag_%d', count));
         sz1 = size(U,1); sz2 = size(U,2);
 
-        imwrite(imdilate(Q,  strel('disk',1)), [dp '_10_Q_thin.png']);
-        imwrite(imdilate(Q2, strel('disk',1)), [dp '_11_Q2_debranched.png']);
-        % S/S2: the OTHER skeleton (bwmorph 'skel', not 'thin') -- the
-        % structure that actually generates the tip candidate voted on
-        % (tip_skel/tip_mid), unlike Q/Q2 which only seed the ellipse
-        % fit. Never dumped before this -- was previously only ever
-        % inspected via a one-off standalone script, not the real
-        % pipeline.
-        imwrite(imdilate(S,  strel('disk',1)), [dp '_14_S_skel.png']);
-        imwrite(imdilate(S2, strel('disk',1)), [dp '_15_S2_debranched.png']);
+        if strcmp(tip_method, 'skeleton')
+            imwrite(imdilate(Q,  strel('disk',1)), [dp '_10_Q_thin.png']);
+            imwrite(imdilate(Q2, strel('disk',1)), [dp '_11_Q2_debranched.png']);
+            % S/S2: the OTHER skeleton (bwmorph 'skel', not 'thin') -- the
+            % structure that actually generates the tip candidate voted on
+            % (tip_skel/tip_mid), unlike Q/Q2 which only seed the ellipse
+            % fit. Never dumped before this -- was previously only ever
+            % inspected via a one-off standalone script, not the real
+            % pipeline.
+            imwrite(imdilate(S,  strel('disk',1)), [dp '_14_S_skel.png']);
+            imwrite(imdilate(S2, strel('disk',1)), [dp '_15_S2_debranched.png']);
 
-        Rch = uint8(U)*80; Gch = uint8(U)*80; Bch = uint8(U)*80;
-        Qd  = imdilate(Q,  strel('disk',1)); Rch = Rch + uint8(Qd)*170;
-        Q2d = imdilate(Q2, strel('disk',1)); Gch = Gch + uint8(Q2d)*170;
-        if ~isempty(Qef)
-            re = max(1,Qef(1,1)-4):min(sz1,Qef(1,1)+4);
-            ce = max(1,Qef(1,2)-4):min(sz2,Qef(1,2)+4);
-            Bch(re,ce) = 255;
+            Rch = uint8(U)*80; Gch = uint8(U)*80; Bch = uint8(U)*80;
+            Qd  = imdilate(Q,  strel('disk',1)); Rch = Rch + uint8(Qd)*170;
+            Q2d = imdilate(Q2, strel('disk',1)); Gch = Gch + uint8(Q2d)*170;
+            if ~isempty(Qef)
+                re = max(1,Qef(1,1)-4):min(sz1,Qef(1,1)+4);
+                ce = max(1,Qef(1,2)-4):min(sz2,Qef(1,2)+4);
+                Bch(re,ce) = 255;
+            end
+            % locate_tip.m's ellipse fit (center/axes/phin), drawn in white
+            % so it stands out against the R=Q/G=Q2 coding above. Same
+            % (row,col) convention ellipse_data.m itself uses throughout --
+            % tip_new's columns come from bwboundaries ([row col]), so
+            % "x"=row, "y"=col in center/axes/phin, not the usual image x/y.
+            if isreal(axes) && all(axes > 0)
+                tvals = linspace(0, 2*pi, 200);
+                er = axes(1)*cos(tvals)*cos(phin) - axes(2)*sin(tvals)*sin(phin) + center(1);
+                ec = axes(1)*cos(tvals)*sin(phin) + axes(2)*sin(tvals)*cos(phin) + center(2);
+                er = round(er); ec = round(ec);
+                valid = er>=1 & er<=sz1 & ec>=1 & ec<=sz2;
+                idx = sub2ind([sz1 sz2], er(valid), ec(valid));
+                Rch(idx) = 255; Gch(idx) = 255; Bch(idx) = 255;
+            end
+            imwrite(cat(3,Rch,Gch,Bch), [dp '_12_skeleton_overlay.png']);
         end
-        % locate_tip.m's ellipse fit (center/axes/phin), drawn in white
-        % so it stands out against the R=Q/G=Q2 coding above. Same
-        % (row,col) convention ellipse_data.m itself uses throughout --
-        % tip_new's columns come from bwboundaries ([row col]), so
-        % "x"=row, "y"=col in center/axes/phin, not the usual image x/y.
-        if isreal(axes) && all(axes > 0)
-            tvals = linspace(0, 2*pi, 200);
-            er = axes(1)*cos(tvals)*cos(phin) - axes(2)*sin(tvals)*sin(phin) + center(1);
-            ec = axes(1)*cos(tvals)*sin(phin) + axes(2)*sin(tvals)*cos(phin) + center(2);
-            er = round(er); ec = round(ec);
-            valid = er>=1 & er<=sz1 & ec>=1 & ec<=sz2;
-            idx = sub2ind([sz1 sz2], er(valid), ec(valid));
-            Rch(idx) = 255; Gch(idx) = 255; Bch(idx) = 255;
-        end
-        imwrite(cat(3,Rch,Gch,Bch), [dp '_12_skeleton_overlay.png']);
 
         Rch = uint8(U)*60; Gch = uint8(U)*60; Bch = uint8(U)*60;
         brows = max(1,min(sz1,boundb(:,1))); bcols = max(1,min(sz2,boundb(:,2)));
@@ -946,7 +992,9 @@ for count = smp:-1:stp
     if debug_mode && (count == smp || count == smp - 1)
         dbg = zeros(size(U,1), size(U,2), 3);
         dbg(:,:,3) = double(U) * 0.4;   % tube mask: dark blue
-        dbg(:,:,2) = double(Q) * 0.8;   % Q skeleton: green
+        if strcmp(tip_method, 'skeleton')
+            dbg(:,:,2) = double(Q) * 0.8;   % Q skeleton: green
+        end
         % traced path in white
         for di = 1:size(path,1)
             dbg(path(di,1), path(di,2), :) = [1 1 1];
@@ -1263,7 +1311,7 @@ for count = smp:-1:stp
     end
 
     % Tip plot
-    Splot = zeros(size(Q2));
+    Splot = zeros(size(U));
     r1 = max(1,tip_final(count,1)-3); r2 = min(size(Splot,1),tip_final(count,1)+3);
     c1 = max(1,tip_final(count,2)-3); c2 = min(size(Splot,2),tip_final(count,2)+3);
     Splot(r1:r2,c1:c2) = 1;
@@ -1271,7 +1319,7 @@ for count = smp:-1:stp
  %   if (size(Sef,1) > 1) Splot(tip_mid(1)-3:tip_mid(1)+3,tip_mid(2)-3:tip_mid(2)+3) = 3; end
  %   Splot(tip_skel(1)-1:tip_skel(1)+1,(2)-1:tip_skel(2)+1) = 4;
     
-    Cplot = zeros(size(Q2)); Cplot(sub2ind([size(Cplot,1) size(Cplot,2)],yctk,xctk)) = 2.*ones(size(xctk));
+    Cplot = zeros(size(U)); Cplot(sub2ind([size(Cplot,1) size(Cplot,2)],yctk,xctk)) = 2.*ones(size(xctk));
     %for j = 1:length(xy1) Cplot = drawline(Cplot,xy1(j,1),xy1(j,2),xy2(j,1),xy2(j,2),1); end
     Cplot(:,size(U,2)+1:end) = [];
     

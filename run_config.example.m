@@ -72,6 +72,20 @@ threshold_method = 'triangle'; % Per-frame background/foreground separation for 
                  %                here (tested on YC11: kept ~4x more pixels than Otsu, mostly
                  %                noise speckle, not tube) because there's no sharp peak-to-
                  %                tail departure for it to key off.
+tip_method = 'skeleton'; % How to find the tip each frame (fluorescence-only pipeline).
+                 %   'skeleton' - thin the mask, prune spurious branches (branch_removal.m),
+                 %                seed an ellipse fit from the surviving endpoint. Default,
+                 %                battle-tested, but branch-removal can occasionally fail to
+                 %                prune down to exactly 2 endpoints at a sharp bend, leaving the
+                 %                tip seeded from an arbitrary leftover candidate instead of the
+                 %                real tip (confirmed on HV200_2_24_cropped frames 1482/1500).
+                 %   'ringwalk' - skeleton-free alternative (ring_walk_tip.m, after Zhu et al.
+                 %                2025 doi:10.1002/advs.202507434): walk outward from the base
+                 %                via expanding ring-intersection centroids, no branch graph to
+                 %                get wrong. Experimental -- prototype-validated on synthetic
+                 %                data this session, not yet run on a full real stack. Run both
+                 %                side by side on the same data before trusting it over
+                 %                'skeleton' for real measurements.
 weak_signal = 0; % 0 = no centerline gap-repair (default). 1 = also run centerline-guided
                  % gap repair, which collectively re-includes any foreground pixel near the
                  % smp reference centerline -- useful for stacks with fragmented/dropout
