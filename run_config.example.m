@@ -86,26 +86,40 @@ tip_method = 'skeleton'; % How to find the tip each frame (fluorescence-only pip
                  %                data this session, not yet run on a full real stack. Run both
                  %                side by side on the same data before trusting it over
                  %                'skeleton' for real measurements.
-weak_signal = 0; % 0 = no centerline gap-repair (default). 1 = also run centerline-guided
-                 % gap repair, which collectively re-includes any foreground pixel near the
-                 % smp reference centerline -- useful for stacks with fragmented/dropout
-                 % signal, but can pull in disconnected debris on stacks that don't need it
-                 % (see session notes). Applies to single-channel and two-channel-without-
-                 % ratio modes only; ratio mode is unaffected either way. Also gates two
-                 % more checks, both weak_signal-only:
-                 %  - signal_threshold.m: if per-pixel thresholding splits the tube into two
-                 %    substantial, nearby connected components (e.g. a transient real dip in
-                 %    signal severs the mask) instead of discarding the smaller one (today's
-                 %    default behaviour), bridge them into one piece.
-                 %  - main_track_movies.m: flag (NaN) a frame if its tracked tip jumps more
-                 %    than max_tip_jump_um from the previous frame's tip -- see that constant
-                 %    below for the empirical basis.
-max_tip_jump_um = 15; % Only used when weak_signal=1. Max plausible frame-to-frame tip
-                 % displacement in um before a frame is flagged as a tracking failure rather
-                 % than real growth+jitter. Empirically calibrated (not growth-rate-derived):
-                 % measured on 3 real datasets (~6500 transitions) -- genuine growth+jitter
-                 % never exceeded ~9.7um on two clean datasets, while a third (known
-                 % segmentation failures) showed a sharp gap in the distribution with nothing
-                 % between ~5um and ~41um. 15um sits in that gap; any value from 10-30um gives
-                 % the identical result on all 3 datasets, so it's not a sensitive parameter --
-                 % re-check if working with a very different growth rate/frame rate regime.
+weak_signal = 0; % 0 = plain segmentation only (default). 1 = two-pass repair for stacks
+                 % with fragmented/dropout signal:
+                 %  1) The main (reverse, smp:-1:stp) pass runs fully plain -- no gap-repair
+                 %     machinery touches any frame's mask. It only flags frames as
+                 %     needs_repair (severed into 2+ comparable components, noisy 3+
+                 %     components, or fails to reach the tracking border when the previous
+                 %     frame did) or frame_failed (diam_tol / tip-jump, see max_tip_jump_um).
+                 %     This replaces the old always-on mechanism (reference-mask union +
+                 %     temporal rescue applied to every frame regardless of need), which
+                 %     could quietly distort already-good frames -- see session notes.
+                 %  2) A forward repair pass (stp->smp, chronological order) then attempts
+                 %     ONLY the flagged frames: unions in the reference (smp) frame's own
+                 %     mask shape for the shank, then -- since forward order means "previous
+                 %     frame" is the real previous-in-time frame -- extends the mask toward
+                 %     the tip when it falls short of (previous frame's tip - max_tip_jump_um),
+                 %     using max_tip_jump_um as a constructive lower bound instead of only a
+                 %     post-hoc reject test. Frames it can't repair stay flagged/NaN'd exactly
+                 %     as before. Recomputes tip/diameter/ROI-intensity together so a repaired
+                 %     frame's numbers are mutually consistent; does NOT redo kymograph,
+                 %     diagnostics, or the growth/roi_debug videos for repaired frames (those
+                 %     stay as the plain pass produced them -- visualization only, not
+                 %     measurements.csv). Also gates signal_threshold.m's two-component bridge
+                 %     (severed mask -> bridge into one piece) the same as before.
+                 % Applies to single-channel and two-channel-without-ratio modes only; ratio
+                 % mode is unaffected either way.
+max_tip_jump_um = 15; % Only used when weak_signal=1: (a) as the reject threshold for
+                 % frame_failed in the reverse pass, (b) as the forward repair pass's
+                 % constructive lower bound on tip position (see weak_signal above). Max
+                 % plausible frame-to-frame tip displacement in um before a frame is
+                 % considered a tracking failure rather than real growth+jitter. Empirically
+                 % calibrated (not growth-rate-derived): measured on 3 real datasets (~6500
+                 % transitions) -- genuine growth+jitter never exceeded ~9.7um on two clean
+                 % datasets, while a third (known segmentation failures) showed a sharp gap
+                 % in the distribution with nothing between ~5um and ~41um. 15um sits in that
+                 % gap; any value from 10-30um gives the identical result on all 3 datasets,
+                 % so it's not a sensitive parameter -- re-check if working with a very
+                 % different growth rate/frame rate regime.

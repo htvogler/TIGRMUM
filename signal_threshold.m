@@ -23,6 +23,26 @@ function mask = signal_threshold(frm, method, up_factor, weak_signal)
 %                visible edge (tested on HV197_4_19: kept the dim shank
 %                connected while removing stray background speckle and
 %                tightening the outline -- see session notes).
+%   'bgsigma2' - background-mean-plus-2-sigma. Estimates the background
+%   'bgsigma3'   peak's own mean/std directly from the histogram (not a
+%                geometric line-distance criterion like Triangle), then
+%                thresholds at mean + k*std (k=2 or 3). Verified on
+%                HV198_1_16: Triangle's own threshold sits ~7 background-
+%                sigma out -- needlessly strict for a roughly-Gaussian
+%                noise floor (measured std ~1 count, consistent across
+%                the stack), and undercounts real tube width by roughly
+%                half (~3.7um measured vs the ~5.3um an Arabidopsis PT
+%                should be, cross-checked against a generous "anything
+%                clearly above background" threshold on the raw,
+%                pre-upsampling input). k=2 matches that ~5.3um width
+%                most closely but pulls in more scattered background
+%                speckle before bwareaopen/keep_and_bridge_blobs cleans
+%                it up (verified: ~2-3x more raw connected components
+%                than Triangle); k=3 is a middle ground, still a clear
+%                accuracy improvement over Triangle with cleanliness
+%                closer to Triangle's own. Experimental -- not yet the
+%                default for any dataset, added specifically to compare
+%                side by side against Triangle/Otsu on real data.
 %
 % up_factor: spatial upsampling factor applied upstream (see run_config.m's
 % `upsample` and main_track_movies.m). Default 1 (no upsampling). The
@@ -40,8 +60,11 @@ switch method
     case 'triangle'
         mask = double(frm) > triangle_threshold(frm);
         mask = imerode(mask, strel('disk', up_factor));
+    case {'bgsigma2', 'bgsigma3'}
+        if strcmp(method, 'bgsigma2'), k = 2; else, k = 3; end
+        mask = double(frm) > background_sigma_threshold(frm, k);
     otherwise
-        error('signal_threshold: unknown threshold_method "%s" (use ''otsu'' or ''triangle'')', method);
+        error('signal_threshold: unknown threshold_method "%s" (use ''otsu'', ''triangle'', ''bgsigma2'', or ''bgsigma3'')', method);
 end
 
 % Strip small disconnected noise specks here, at the source, not just in the
@@ -177,4 +200,53 @@ if weak_signal && any(edge_frags(:))
         mask = bridge_to_mask(mask, frag, corridor_r);
     end
 end
+
+% Modest boundary smoothing (bgsigma methods only): this mask becomes
+% M/BT1/L, which feeds the intensity video and kymograph DIRECTLY --
+% unlike the tracking mask U (built fresh, frame by frame, inside
+% main_track_movies.m's own loop), nothing downstream ever smooths this
+% one, so any per-pixel jaggedness right at the true edge (expected and
+% harmless for a looser threshold like bgsigma2 -- confirmed the tracking
+% pipeline's own bwareaopen/imclose/keep_and_bridge_blobs already cleans
+% it up fine for tracking purposes) was going straight into the displayed
+% video looking rough. Scoped to bgsigma2/bgsigma3 only -- confirmed on
+% HV198_1_16 that applying this to 'triangle' too regresses its valid-
+% frame count (13/20 -> 7/20 on a 20-frame test): triangle already has
+% its own erosion step suited to its narrower profile, and stacking this
+% imopen on top over-thins it. bgsigma2/bgsigma3 were unaffected by the
+% same test (21/21 both before and after, diameters within noise).
+if ismember(method, {'bgsigma2', 'bgsigma3'})
+    mask = imopen(imclose(mask, strel('disk', up_factor)), strel('disk', up_factor));
+    mask = bwareafilt(mask, 1); % smoothing can occasionally pinch off a sliver -- keep just the main piece
+end
+end
+
+function thr = background_sigma_threshold(frm, k)
+% Threshold at k standard deviations above the background peak's own
+% mean, estimated directly from the histogram rather than assumed at a
+% fixed absolute value -- scale-independent, so it works the same whether
+% frm is raw camera counts or already bit-depth-rescaled/upsampled.
+vals = double(frm(:));
+nbins = 256;
+[counts, edges] = histcounts(vals, nbins);
+centers = (edges(1:end-1) + edges(2:end)) / 2;
+[peak_count, peak_bin] = max(counts);
+% Background population: bins from the peak up to the first point where
+% the count drops below half the peak count -- the same "departure from
+% the background peak" idea triangle_threshold.m is built on, used here
+% to characterise the peak's own spread instead of finding a geometric
+% line-distance point along the whole histogram.
+half_peak = peak_count / 2;
+bg_cutoff_bin = peak_bin;
+for bi = peak_bin:nbins
+    if counts(bi) < half_peak
+        bg_cutoff_bin = bi;
+        break;
+    end
+end
+bg_vals = vals(vals <= centers(bg_cutoff_bin));
+if numel(bg_vals) < 10
+    bg_vals = vals(vals <= centers(peak_bin));
+end
+thr = mean(bg_vals) + k * std(bg_vals);
 end

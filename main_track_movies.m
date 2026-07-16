@@ -173,13 +173,115 @@ if (video_intensity > 0) && ~strcmp(mode, 'two_raw')
 end
 if (video_intensity == 2), return; end
 
+% Reference-frame sanity check: diamo/U_smp/the whole tip_final_last chain
+% get calibrated off whichever frame is processed first (count==smp), on
+% the assumption that it's the stack's best, most fully-grown frame. If
+% THAT frame's own mask doesn't reach the tracking border, everything
+% calibrated from it is unreliable -- confirmed on HV198_1_16 3050-3349:
+% frame 3349 (the configured smp) measured only 4px wide right at the
+% border-crossing column against a 15px true tube width, and its own tip
+% ended up on the opposite end of the tube from every neighbouring frame,
+% poisoning the tip_final_last chain for the whole surrounding stretch
+% (every later frame's genuinely-correct tip looked like an implausible
+% jump relative to this bad reference and got rejected). Walk backward
+% from the configured smp (same direction and mask-building steps the
+% main loop itself uses, just without the full per-frame pipeline) until
+% a frame's mask actually reaches the border, and use THAT as the real
+% reference -- frames between the original smp and this one are skipped
+% entirely rather than analysed against a reference that was never valid.
+smp_orig = smp;
+smp_found = false;
+for probe = smp:-1:stp
+    Op = M(:,:,probe);
+    if (type == 1) Op = imrotate(Op,-90);
+    elseif (type == 3) Op = imrotate(Op,90);
+    elseif (type == 4) Op = imrotate(Op,180);
+    end
+    if strcmp(mode, 'ratio')
+        Pp = imbinarize(Op, 0.2);
+    else
+        Pp = Op > 0;
+    end
+    Up = bwareafilt(bwareaopen(Pp, round(100 * up_factor^2)), 1);
+    Up = bwmorph(Up, 'clean');
+    Up = medfilt2(Up);
+    rp_probe = regionprops(Up, 'Area', 'MajorAxisLength');
+    if ~isempty(rp_probe) && rp_probe(1).MajorAxisLength > 0
+        close_r_probe = max(1, round((rp_probe(1).Area / rp_probe(1).MajorAxisLength) * 0.15));
+    else
+        close_r_probe = round(2 * up_factor);
+    end
+    Up = imclose(Up, strel('disk', close_r_probe));
+    Up = bwareafilt(Up, 1);
+    % Border-touch alone isn't sufficient: weak_signal's own edge-fragment
+    % reconnect (signal_threshold.m) can patch a thin sliver onto the
+    % border even when the frame's real cross-section there is nowhere
+    % near the tube's actual width -- confirmed on HV198_1_16 3349 itself,
+    % which technically touches the border under weak_signal=1 but only at
+    % 4px wide against a 15px true width. Cross-check the border-column
+    % width against the whole-mask Area/MajorAxisLength estimate (same
+    % width proxy used for diamo's own cross-check) and require rough
+    % agreement, not just binary contact.
+    border_ok = any(Up(:,end));
+    if border_ok
+        border_rows = find(Up(:, size(Up,2)-1));
+        if ~isempty(border_rows)
+            gaps_p = find(diff(border_rows) > 1);
+            run_starts_p = [border_rows(1); border_rows(gaps_p+1)];
+            run_ends_p = [border_rows(gaps_p); border_rows(end)];
+            border_width = max(run_ends_p - run_starts_p) + 1;
+        else
+            border_width = 0;
+        end
+        axis_width = 0;
+        if ~isempty(rp_probe) && rp_probe(1).MajorAxisLength > 0
+            axis_width = rp_probe(1).Area / rp_probe(1).MajorAxisLength;
+        end
+        if axis_width > 0 && border_width < 0.5 * axis_width
+            border_ok = false;
+        end
+    end
+    if border_ok
+        smp = probe;
+        smp_found = true;
+        break;
+    end
+end
+if ~smp_found
+    error('TIGRMUM: no frame between smp=%d and stp=%d has a mask reaching the tracking border -- cannot calibrate a reference.', smp_orig, stp);
+end
+if smp ~= smp_orig
+    fprintf('NOTE: configured smp=%d does not touch the tracking border -- using smp=%d as the reference instead (frames %d-%d skipped).\n', ...
+        smp_orig, smp, smp+1, smp_orig);
+end
+
 % Loop backwards over stack
 if (distributions), d = 1; end
 U_prev = [];
 right_anchor_row_last = []; % weak_signal border-extension continuity, see below
 frame_failed = false(smp, 1);
+% Per-frame triage flag (weak_signal only): does THIS frame's own plain
+% segmentation look severed/noisy/border-touch-failed, reusing the same
+% severed/noisy/border-touch-rate criteria used all session to triage
+% whole stacks, now applied per-frame. Frames flagged here get a shot at
+% the forward repair pass below (see after the main loop); everything
+% else is left exactly as the plain reverse pass produced it.
+needs_repair = false(smp, 1);
+% Cache the plain mask for any frame flagged below, so the forward repair
+% pass (after this loop) can repair it without re-deriving it from scratch.
+% Only populated for flagged frames -- cheap even on long stacks, since
+% most frames aren't flagged.
+U_cache = cell(smp, 1);
 if ~exist('V_frame_size','var'), V_frame_size = []; end
 Vroi_frame_size = [];
+% Buffered (not streamed) video frames: growth.mp4/roi_debug.avi content is
+% held here per-frame and only actually written to disk in one final pass,
+% after the forward repair pass, so a repaired frame's video content can be
+% re-rendered from its corrected data first. See the render_growth_frame/
+% render_roi_debug_frame local functions and the flush loop after the main
+% loop below.
+growth_buf = cell(smp, 1);
+roi_buf = cell(smp, 1);
 tip_final    = NaN(smp, 2);
 diamf_avg    = NaN(1, smp);
 Ucount       = NaN(1, smp);
@@ -225,89 +327,60 @@ for count = smp:-1:stp
     % stray pixel 4 rows from the tube edge at column 117 got bridged in by
     % imclose, thickening the tube's border by ~2px over the last 4 columns
     % approaching the crop edge).
-    U = bwareaopen(P, round(100 * up_factor^2));
-    U = bwareafilt(U,1);
+    U_open = bwareaopen(P, round(100 * up_factor^2));
 
-    % weak_signal only: instead of detecting/bridging fragments in this
-    % frame's own (possibly noisy/incomplete) data, directly reuse the
-    % reference (first analysed, i.e. count==smp) frame's own SMOOTHED mask
-    % as the known-good shape for the stationary base/shank, cropped to
-    % start at THIS frame's own tip. The loop walks backward from the
-    % reference (longest/most-grown) frame toward earlier, shorter ones --
-    % the tip recedes as count decreases, so the reference's own tip is
-    % never valid for any other frame, but the base/shank shape is (it
-    % doesn't move) -- "we kind of keep the reference mask and only shrink
-    % it back on the left to fit the new tip." The tip itself always comes
-    % from THIS frame's own mask (U, just built above from this frame's own
-    % P), never from the reference.
-    %
-    % Replaces an earlier fragment-detection approach (scan P for candidate
-    % blobs within a dilated reference footprint, bridge qualifying ones
-    % with a corridor) that had no upper size or shape limit and could pull
-    % in large non-tube-shaped patches of real signal -- verified: a
-    % "massive blob" several times the tube's own width on one frame, from
-    % nothing more than diffuse real signal happening to fall within the
-    % dilated footprint. Directly reusing the reference's own
-    % already-validated, already-smoothed shape (see where U_smp is built,
-    % after diamo is known) sidesteps that failure mode entirely: there's no
-    % scanning/detecting of ambiguous candidates left to get wrong.
-    if weak_signal && exist('U_smp', 'var')
-        [~, Uc_plain] = find(U);
-        tip_col = size(U, 2);
-        if ~isempty(Uc_plain), tip_col = min(Uc_plain); end
-        U_ref_shrunk = U_smp;
-        U_ref_shrunk(:, 1:(tip_col - 1)) = false;
-        U = U | U_ref_shrunk;
+    % diamo_est: computed here (moved up from where close_r used to derive
+    % it) because the blob-keep-and-bridge step just below needs it too --
+    % it has to run at THIS point (right after bwareaopen), not only after
+    % imclose, because bwareafilt(U_open,1) would otherwise already have
+    % discarded a genuine tube fragment before the later imclose-stage
+    % check ever got a chance to see it.
+    if exist('diamo','var')
+        diamo_est = diamo;
+    else
+        rp_close = regionprops(U_open, 'Area', 'MajorAxisLength');
+        if ~isempty(rp_close) && rp_close(1).MajorAxisLength > 0
+            diamo_est = rp_close(1).Area / rp_close(1).MajorAxisLength;
+        else
+            diamo_est = 2 * up_factor;
+        end
     end
 
-    % Gap repair: recover disconnected P pieces close to U and aligned with its axis
-    Ustats = regionprops(U, 'Centroid', 'Orientation', 'MajorAxisLength');
-    if ~isempty(Ustats)
-        prox_dist = max(round(30 * up_factor), round(Ustats.MajorAxisLength * 0.15));
-        U_grown = imdilate(U, strel('disk', prox_dist));
-        Pother = bwlabel(P & ~U);
-        U_prev_grown = [];
-        if ~isempty(U_prev)
-            U_prev_grown = imdilate(U_prev, strel('disk', prox_dist));
-        end
-        % Opt-in via weak_signal, like the reference-mask block above: prox_dist has
-        % a 30px floor, which in a small crop is close to half the frame, so
-        % the proximity gate barely filters anything. The temporal test then
-        % unconditionally re-admits any disconnected P piece that overlaps
-        % the previous frame's (dilated) mask -- a persistent, fixed-position
-        % artifact (dust speck, hot pixel) recurring near the tube satisfies
-        % that every frame and gets rescued back into U indefinitely, even
-        % though bwareaopen/bwareafilt just discarded it as a small
-        % disconnected component (verified on HV197_4_19 frame 2015: a lone
-        % stray pixel 4 rows from the tube's true edge, thickening the
-        % border by ~1-2px over the last few columns before the crop edge).
-        if weak_signal
-            for k = 1:max(Pother(:))
-                piece = Pother == k;
-                % Proximity gate
-                if ~any(U_grown(:) & piece(:)), continue; end
-                % Temporal test: piece overlaps previous frame's mask → include unconditionally
-                if ~isempty(U_prev_grown) && any(U_prev_grown(:) & piece(:))
-                    U = U | piece;
-                    continue;
-                end
-                % Fallback: orientation check (first frame or no U_prev overlap)
-                ps = regionprops(piece, 'Centroid');
-                v = ps.Centroid - Ustats.Centroid;
-                ang = abs(mod(atan2d(-v(2), v(1)) - Ustats.Orientation + 90, 180) - 90);
-                if ang <= 35
-                    U = U | piece;
-                end
+    if weak_signal
+        U_smp_for_check = [];
+        if exist('U_smp', 'var'), U_smp_for_check = U_smp; end
+        U = keep_and_bridge_blobs(U_open, diamo_est, U_smp_for_check, debug_mode, count);
+    else
+        U = bwareafilt(U_open,1);
+    end
+
+    % Per-frame repair triage (weak_signal only): reuse the severed/noisy/
+    % border-touch-fail criteria used all session to triage whole stacks,
+    % now applied per-frame. This pass stays fully plain regardless of the
+    % result -- flagged frames get a shot at the forward repair pass after
+    % this loop (see below); nothing here changes what THIS pass computes.
+    if weak_signal
+        cc_open = bwconncomp(U_open);
+        comp_areas = cellfun(@numel, cc_open.PixelIdxList);
+        severed = false; noisy = false;
+        if numel(comp_areas) >= 3
+            noisy = true;
+        elseif numel(comp_areas) == 2
+            sorted_areas = sort(comp_areas, 'descend');
+            if sorted_areas(2) >= 0.2 * sorted_areas(1)
+                severed = true;
             end
         end
+        border_fail = ~any(U(:,end)) && ~isempty(U_prev) && any(U_prev(:,end));
+        needs_repair(count) = severed || noisy || border_fail;
+        if debug_mode && needs_repair(count)
+            fprintf('  needs_repair F%d: severed=%d noisy=%d(n=%d) border_fail=%d\n', ...
+                count, severed, noisy, numel(comp_areas), border_fail);
+        end
     end
+
     U = bwmorph(U,'clean');
     U = medfilt2(U);
-    % Re-apply the reference-mask shrink-and-union: medfilt2 can erode away
-    % thin single-pixel-wide connections just added above.
-    if weak_signal && exist('U_smp', 'var')
-        U = U | U_ref_shrunk;
-    end
     % Closing radius scaled to the tube's own measured width (diamo) rather
     % than a fixed pixel count: a fixed radius (originally disk(10), unchanged
     % since the very first commit) is only appropriate for whatever
@@ -328,44 +401,32 @@ for count = smp:-1:stp
     % this alone was enough to make bwmorph('thin') throw off many spurious
     % branches on frame smp that branch_removal.m then pruned incorrectly,
     % picking a mid-tube kink instead of the true tip.
-    if exist('diamo','var')
-        close_r = max(1, round(diamo * 0.15));
-    else
-        rp_close = regionprops(U, 'Area', 'MajorAxisLength');
-        if ~isempty(rp_close) && rp_close(1).MajorAxisLength > 0
-            close_r = max(1, round((rp_close(1).Area / rp_close(1).MajorAxisLength) * 0.15));
-        else
-            close_r = round(2 * up_factor);
-        end
-    end
+    close_r = max(1, round(diamo_est * 0.15));
     U = imclose(U, strel('disk', close_r));
-    % weak_signal only: despike/debay along the WHOLE tube, not just at
-    % specific rescue points -- close_r (diamo*0.15) is too small to fix
-    % anything but very minor notches (verified: left clearly visible
-    % "chewed" narrowings in U_final, some deep enough that the measured
-    % diameter collapsed to 0-2px against a 15px reference and crashed the
-    % boundary-curve code downstream). Uses ws_smooth_r (diamo*0.3, set once
-    % the reference frame's own diamo is known -- see below), the same
-    % radius the reference mask itself was smoothed with. Restore border
-    % contact if this erodes it away (opening can strip a thin border-
-    % touching strip) using the reference's own original border rows as a
-    % stable anchor -- same technique used to build U_smp below.
-    if weak_signal && exist('ws_smooth_r', 'var')
-        had_border = any(U(:,end));
-        U = imclose(U, strel('disk', ws_smooth_r));
-        U = imopen(U, strel('disk', ws_smooth_r));
+    % weak_signal only: a genuine tube fragment can survive imclose as a
+    % SEPARATE component from the main piece rather than actually merging
+    % with it -- the two can look connected at low zoom without truly
+    % being one component. Plain bwareafilt(U,1) then keeps only whichever
+    % piece has more total pixels and silently discards the other,
+    % regardless of size -- confirmed on HV198_1_16 frame 3321: a bright,
+    % well-formed GCaMP tip blob (1121px, comparable width to the rest of
+    % the tube) got discarded outright because the dimmer shank piece
+    % happened to have slightly more pixels. Instead of keeping only the
+    % single largest piece, keep every component that looks like a real
+    % tube fragment -- width comparable to diamo (not a thin noise sliver,
+    % not a blob much wider than the tube), elongated along its own axis
+    % (not round/blobby noise), and overlapping the reference mask (so it
+    % sits where the tube is actually expected to be) -- then bridge the
+    % survivors into one connected mask, corridor width scaled to diamo
+    % (same 0.15 factor close_r uses) so filling the gap can't balloon
+    % past the tube's own real width.
+    if weak_signal
+        U_smp_for_check = [];
+        if exist('U_smp', 'var'), U_smp_for_check = U_smp; end
+        U = keep_and_bridge_blobs(U, diamo_est, U_smp_for_check, debug_mode, count);
+    else
         U = bwareafilt(U, 1);
-        if had_border && ~any(U(:,end)) && ~isempty(U_smp_border_rows)
-            anchor_row = round(median(U_smp_border_rows));
-            [Ur, Uc] = find(U);
-            [~, mi] = max(Uc);
-            corridor = false(size(U));
-            corridor = drawline(corridor, Ur(mi), Uc(mi), anchor_row, size(U,2), true);
-            corridor = imdilate(corridor, strel('disk', up_factor));
-            U = U | corridor;
-        end
     end
-    U = bwareafilt(U, 1);
     U_prev = U;
     if weak_signal && count == smp
         U_smp_raw = U;
@@ -489,6 +550,22 @@ for count = smp:-1:stp
             Qef = Qel;
             Qef(Qepos,:) = [];
         end
+        if isempty(Qef) && ~isempty(Qel)
+            % branch_removal iterates over EVERY branch point when
+            % angdiff==0 (unlike the S/S2 single-point case below), and on
+            % a heavily-branched skeleton can over-prune all the way down
+            % to zero endpoints -- its own final "drop the max-column
+            % endpoint" step then empties Qef entirely, which crashes
+            % locate_tip.m (`major(1,:)` on a 0-row array). Confirmed on
+            % HV198_1_16 frame 3271's repaired mask (Q had 3 endpoints,
+            % branch_removal still emptied Qef). Qef is only ever used as
+            % an approximate seed for locate_tip's own tolerance-growing
+            % ellipse search, so falling back to one of the ORIGINAL
+            % (pre-debranch) endpoints is a reasonable, safe recovery --
+            % better than crashing on an empty seed.
+            [~, Qepos] = max(Qel(:,2));
+            Qef = Qel(Qepos,:);
+        end
     end
 
     % Finding the radius for ellipse fitting
@@ -522,7 +599,13 @@ for count = smp:-1:stp
     [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef);
     tip_ellipsepos = dsearchn(boundb,tip_ellipse);
     tip_ellipsef = boundb(tip_ellipsepos,:);
-   
+    % Reset every iteration (not auto-cleared by the loop) so the
+    % tip-jump-recovery check below can reliably tell whether tip_skel/
+    % tip_mid were actually computed THIS frame via isempty(), rather than
+    % reading stale values left over from an earlier iteration that didn't
+    % take the same code path.
+    tip_skel = []; tip_mid = [];
+
     if strcmp(tip_method, 'skeleton')
         % Skeletonizing and finding endpoints
         S = bwmorph(U,'skel',Inf);
@@ -797,12 +880,50 @@ for count = smp:-1:stp
     if weak_signal && last_flag && pixelsize > 0
         tip_jump_um = pdist2(tip_final(count,:), tip_final_last) * pixelsize;
         if tip_jump_um > max_tip_jump_um
-            frame_failed(count) = true;
-            if debug_mode
-                fprintf('  tip F%d: jump=%.2fum > max_tip_jump_um=%.1fum -- flagged, results NaN''d\n', ...
-                    count, tip_jump_um, max_tip_jump_um);
+            % The chosen candidate is implausibly far -- before giving up,
+            % check whether one of the OTHER candidates this same frame
+            % already produced (ellipsef/skel/mid, whichever this code path
+            % computed) happens to land within range. This was previously a
+            % pure reject-after-the-fact test: it flagged the frame but left
+            % whatever far-off point the voting logic picked in tip_final,
+            % which then got drawn into the growth/roi_debug videos as if it
+            % were a real position (confirmed on HV198_1_16 frame 3314: a
+            % near-empty mask (diam~0px) produced a spurious ellipsef far
+            % from frame 3313's tip; the jump check correctly NaN'd the CSV
+            % but the video still showed the bad point, since video drawing
+            % was never gated on frame_failed -- see Tip plot section below,
+            % now fixed there too). Recovering a nearby alternate candidate
+            % when one exists directly reduces how often this situation can
+            % happen at all, rather than only cleaning up after it.
+            cand = tip_ellipsef; cand_label = {'ellipsef'};
+            if ~isempty(tip_skel), cand = [cand; tip_skel]; cand_label{end+1} = 'skel'; end
+            if ~isempty(tip_mid),  cand = [cand; tip_mid];  cand_label{end+1} = 'mid';  end
+            cand_dist_px = pdist2(cand, tip_final_last);
+            [best_dist_px, best_idx] = min(cand_dist_px);
+            if best_dist_px * pixelsize <= max_tip_jump_um
+                tip_final(count,:) = cand(best_idx,:);
+                if debug_mode
+                    fprintf('  tip F%d: original jump=%.2fum > %.1fum -- recovered via %s candidate (jump=%.2fum)\n', ...
+                        count, tip_jump_um, max_tip_jump_um, cand_label{best_idx}, best_dist_px*pixelsize);
+                end
+            else
+                % No candidate this frame produced is plausible either.
+                % Still assign the closest one (downstream centerline/ROI
+                % code needs *some* numeric point to work with this
+                % iteration), but flag the frame so it's NaN'd in the CSV
+                % and the video skips drawing a marker for it.
+                tip_final(count,:) = cand(best_idx,:);
+                frame_failed(count) = true;
+                if debug_mode
+                    fprintf('  tip F%d: jump=%.2fum > max_tip_jump_um=%.1fum, no candidate within range (best=%.2fum via %s) -- flagged, results NaN''d\n', ...
+                        count, tip_jump_um, max_tip_jump_um, best_dist_px*pixelsize, cand_label{best_idx});
+                end
             end
         end
+    end
+
+    if weak_signal && (needs_repair(count) || frame_failed(count))
+        U_cache{count} = U;
     end
 
     % Update tip_final for the next frame
@@ -1024,34 +1145,55 @@ for count = smp:-1:stp
     dy = gradient(yc); dy(find(dy == 0)) = 0.01;
 
     % Finding the points where the normals hit the edge curves
-    poscross1 = []; poscross2 = [];
+    poscross1 = []; poscross2 = []; t1_all = zeros(length(xc),1); t2_all = zeros(length(xc),1);
     for n = 1:length(xc)
         nfitc = fit(vertcat(xc(n),(xc(n) - dy(n))),vertcat(yc(n),(yc(n) + dx(n))),'poly1');
-    
+
         if (n == 1) start_nfitc(:,:) = [nfitc.p1 nfitc.p2]; end
-        
+
         edge1 = total1(:,1) - nfitc.p1.*total1(:,2) - nfitc.p2;
         [tmp cross1] = min(abs(edge1));
         poscross1(n) = cross1;
-        
+
         edge2 = total2(:,1) - nfitc.p1.*total2(:,2) - nfitc.p2;
         [tmp cross2] = min(abs(edge2));
         poscross2(n) = cross2;
+
+        % Signed half-width at this exact sample, for reconstruct_smooth_mask
+        % (weak_signal visual-only mask) -- stashed here, BEFORE
+        % line_continuity below can drop/reorder poscross1/poscross2 entries,
+        % so this stays index-aligned with xc/yc/dx/dy (length(xc) long)
+        % no matter how many points continuity-pruning removes downstream.
+        normn = sqrt(dx(n)^2 + dy(n)^2); if normn == 0, normn = 1; end
+        p1pt = total1(cross1,:); p2pt = total2(cross2,:);
+        t1_all(n) = (p1pt(1)-yc(n))*(dx(n)/normn) + (p1pt(2)-xc(n))*(-dy(n)/normn);
+        t2_all(n) = (p2pt(1)-yc(n))*(dx(n)/normn) + (p2pt(2)-xc(n))*(-dy(n)/normn);
     end
-    
+
     % Ensure that all overlapping diameter lines are shifted backwards to
-    % ensure continuity     
+    % ensure continuity
     [poscross1, poscross2, distcf] = line_continuity(poscross1,poscross2,1,distc);
     [poscross1, poscross2, distcf] = line_continuity(poscross1,poscross2,2,distcf);
      
-    xy1 = []; xy2 = []; xy1 = total1(poscross1,:); xy2 = total2(poscross2,:); 
+    xy1 = []; xy2 = []; xy1 = total1(poscross1,:); xy2 = total2(poscross2,:);
     if (length(xy1) > 20)
         xy1 = floor(sgolayfilt(xy1,3,15)); xy2 = floor(sgolayfilt(xy2,3,15));
     end
     xyout = vertcat(find(xy1(:,2) > size(U,2)), find(xy2(:,2) > size(U,2)));
     xy1(xyout,:) = []; xy2(xyout,:) = []; distcf(xyout) = [];
-    
-    % Cutoff the tip 
+
+    % weak_signal only, visual only for now (see run_config.m): rebuild a
+    % spike-free, hole-free mask from the tube's own shape for the
+    % growth/roi_debug videos specifically -- U itself (used for
+    % diamf_avg/ROI/tip-finding) is untouched. Uses t1_all/t2_all (NOT
+    % the pipeline's own smoothed xy1/xy2 above) since width needs its own,
+    % wider, decoupled-from-direction smoothing -- see reconstruct_smooth_mask.
+    U_render = U;
+    if weak_signal
+        U_render = reconstruct_smooth_mask(U, boundb, xc, yc, dx, dy, distc, t1_all, t2_all, diamo, postotal1, postotal2);
+    end
+
+    % Cutoff the tip
     [tmp, distpos, tmp] = intersect(distc,distcf);
     distctf = [distct(1:cut-1); distc(distpos)]; xctf = [xct(1:cut-1); xc(distpos)]; yctf = [yct(1:cut-1); yc(distpos)]; 
     linectf = [yctf xctf];
@@ -1310,99 +1452,36 @@ for count = smp:-1:stp
         kymo_avg_fixed(:,count-stp+1) = vertcat(zeros((5 + npoints - kymo_len_smp),1), mean(kymo_f,2));
     end
 
-    % Tip plot
-    Splot = zeros(size(U));
-    r1 = max(1,tip_final(count,1)-3); r2 = min(size(Splot,1),tip_final(count,1)+3);
-    c1 = max(1,tip_final(count,2)-3); c2 = min(size(Splot,2),tip_final(count,2)+3);
-    Splot(r1:r2,c1:c2) = 1;
- %   Splot(tip_ellipsef(1)-1:tip_ellipsef(1)+1,tip_ellipsef(2)-1:tip_ellipsef(2)+1) = 2;
- %   if (size(Sef,1) > 1) Splot(tip_mid(1)-3:tip_mid(1)+3,tip_mid(2)-3:tip_mid(2)+3) = 3; end
- %   Splot(tip_skel(1)-1:tip_skel(1)+1,(2)-1:tip_skel(2)+1) = 4;
-    
-    Cplot = zeros(size(U)); Cplot(sub2ind([size(Cplot,1) size(Cplot,2)],yctk,xctk)) = 2.*ones(size(xctk));
-    %for j = 1:length(xy1) Cplot = drawline(Cplot,xy1(j,1),xy1(j,2),xy2(j,1),xy2(j,2),1); end
-    Cplot(:,size(U,2)+1:end) = [];
-    
-    % Plot two images
-    h = figure('visible', 'off');
-
-    %subplot(1,2,2)
-    image2 = U*20+Splot*40+Cplot*30;
-    if (ROItype > 0) image2 = image2 + double(F1*60 + F2*80); end
-    imagesc(image2);
-
+    % Tip plot / ROI debug frame: rendered here exactly as before, but
+    % BUFFERED rather than written to disk immediately -- see the buffered-
+    % video block comment above growth_buf/roi_buf's pre-allocation. Skip
+    % the tip marker/ROI shading entirely on a frame_failed frame -- same
+    % reasoning as before (confirmed on HV198_1_16 frame 3314/3321: a
+    % rejected point drawn as if valid). tip_final still holds a numeric
+    % point either way (needed above for centerline/ROI to have something
+    % to work with).
+    show_overlay = ~frame_failed(count);
     if (tip_plot)
-        txtstr = strcat('Time(s): ',num2str((count*frame_rate)),'  Frame: ',num2str(count));
-        text(10,10,txtstr,'color','white')
-        set(gca,'xtick',[]);
-        set(gca,'xticklabel',[]);
-        set(gca,'ytick',[])
-        set(gca,'yticklabel',[]);
-        frame = getframe(gcf);
-        writeVideo(V,frame);
-        if isempty(V_frame_size), V_frame_size = size(frame.cdata); end
+        growth_buf{count} = render_growth_frame(U_render, tip_final(count,:), yctk, xctk, F1, F2, ROItype, show_overlay, count, frame_rate);
+        if isempty(V_frame_size), V_frame_size = size(growth_buf{count}); end
     end
-    close(h);
 
     if roi_debug_video
         % O, not L: L is built once for the whole stack and is never
-        % per-frame rotated, while O/U/F1/F2/Cplot all are (see the
-        % imrotate block earlier in this loop) -- using L here would
-        % misalign the overlay against the ROI geometry.
-        Od = min(255, double(O)./Cmax.*255);
-        % Reserve index 1 for pure black, same as video_processing.m's map --
-        % without it, jet(256)'s own index-1 colour (dark blue, not black)
-        % renders the zeroed background as a solid dark-blue field instead
-        % of black, since O==0 always maps to index 1.
-        jetmap = uint8(vertcat([0 0 0], jet(255)) .* 255);
-        idx = uint8(Od) + 1;
-        rgb = reshape(jetmap(idx(:),:), size(O,1), size(O,2), 3);
-        rch = rgb(:,:,1); gch = rgb(:,:,2); bch = rgb(:,:,3);
-        % Outline each ROI half (solid colour, not a blend) so the split is
-        % visible regardless of the underlying jet colour -- a 50% blend was
-        % nearly invisible against jet's own warm tip colours (verified:
-        % the F2/blue blend against a near-zero-blue jet red pixel produced
-        % [.,.,128], barely distinguishable from the unblended tip colour).
-        % bwperim, not imerode-based edge detection, since it still returns
-        % a usable boundary even when the ROI is only a few px wide.
-        % bwperim/the traced skeleton are always exactly 1px wide regardless
-        % of resolution -- at up_factor=2 that's half as visually prominent
-        % relative to the (now 2x wider) tube as it was natively. Thicken
-        % both by the same up_factor so the overlay stays equally visible
-        % whether or not upsampling is on (verified: without this, the ROI
-        % outline/centerline were still being drawn correctly at up_factor=2,
-        % just too thin to notice against the tube at a normal viewing size).
-        line_r = max(0, up_factor - 1);
-        if (ROItype > 0)
-            f1_edge = bwperim(logical(F1));
-            f2_edge = bwperim(logical(F2));
-            if line_r > 0
-                f1_edge = imdilate(f1_edge, strel('disk', line_r));
-                f2_edge = imdilate(f2_edge, strel('disk', line_r));
-            end
-            rch(f1_edge) = 255; gch(f1_edge) = 0;   bch(f1_edge) = 0;
-            rch(f2_edge) = 0;   gch(f2_edge) = 0;   bch(f2_edge) = 255;
-        end
-        % Traced centerline as a bright white line on top of everything.
-        clm = logical(Cplot);
-        if line_r > 0, clm = imdilate(clm, strel('disk', line_r)); end
-        rch(clm) = 255; gch(clm) = 255; bch(clm) = 255;
-        rgb_roi = cat(3, rch, gch, bch);
-        if exist('insertText','file')
-            txtstr = ['Time(s): ' num2str(count*frame_rate) '  Frame: ' num2str(count)];
-            rgb_roi = insertText(rgb_roi,[5 5],txtstr,'FontSize',8,'TextColor','white','BoxOpacity',0);
-        end
-        writeVideo(Vroi, rgb_roi);
-        if isempty(Vroi_frame_size), Vroi_frame_size = size(rgb_roi); end
+        % per-frame rotated, while O/U/F1/F2 all are (see the imrotate
+        % block earlier in this loop) -- using L here would misalign the
+        % overlay against the ROI geometry.
+        roi_buf{count} = render_roi_debug_frame(O, U_render, yctk, xctk, F1, F2, ROItype, show_overlay, up_factor, Cmax, count, frame_rate);
+        if isempty(Vroi_frame_size), Vroi_frame_size = size(roi_buf{count}); end
     end
     catch ME
         warning('TIGRMUM: frame %d failed — %s (%s:%d)', count, ME.message, ME.stack(1).name, ME.stack(1).line);
         frame_failed(count) = true;
         if tip_plot && ~isempty(V_frame_size)
-            writeVideo(V, zeros(V_frame_size, 'uint8'));
+            growth_buf{count} = zeros(V_frame_size, 'uint8');
         end
         if roi_debug_video && ~isempty(Vroi_frame_size)
-            writeVideo(Vroi, zeros(Vroi_frame_size, 'uint8'));
+            roi_buf{count} = zeros(Vroi_frame_size, 'uint8');
         end
         % Fixed-line kymograph: computable from L alone, fill even on failure
         if nkymo > 0 && exist('yctk_smp','var')
@@ -1434,8 +1513,134 @@ for count = smp:-1:stp
 end
 warning('on', 'MATLAB:nearlySingularMatrix');
 
-if (tip_plot == 1) close(V); end
-if roi_debug_video, close(Vroi); end
+% Forward repair pass (weak_signal only): frames flagged severed/noisy/
+% border-touch-failed (needs_repair) or diam_tol/tip_jump-failed
+% (frame_failed) in the reverse pass above get one attempt at repair,
+% walked in chronological order (stp:smp) so max_tip_jump_um can be used
+% constructively as a lower bound on where the tip should be, instead of
+% only as a post-hoc reject test. Only overwrites the specific frames it
+% succeeds on -- anything it can't fix is left flagged for the existing
+% NaN-fill below, exactly as if this pass didn't run.
+if weak_signal && exist('U_smp', 'var')
+    prev_tip_fwd = [];
+    n_repaired = 0; n_attempted = 0;
+    for count = stp:smp
+        if ~(needs_repair(count) || frame_failed(count))
+            if isfinite(tip_final(count,1))
+                prev_tip_fwd = tip_final(count,:);
+            end
+            continue;
+        end
+        if isempty(U_cache{count})
+            continue; % nothing cached -- leave flagged
+        end
+        n_attempted = n_attempted + 1;
+        try
+            U_rep = build_repaired_mask(U_cache{count}, U_smp, prev_tip_fwd, max_tip_jump_um, pixelsize);
+
+            O = M(:,:,count);
+            if (type == 1) O = imrotate(O,-90);
+            elseif (type == 3) O = imrotate(O,90);
+            elseif (type == 4) O = imrotate(O,180);
+            end
+            if (type == 1)
+                BT1r = imrotate(BT1(:,:,count),-90);
+                if ~isempty(BT2), BT2r = imrotate(BT2(:,:,count),-90); else, BT2r = []; end
+            elseif (type == 3)
+                BT1r = imrotate(BT1(:,:,count),90);
+                if ~isempty(BT2), BT2r = imrotate(BT2(:,:,count),90); else, BT2r = []; end
+            elseif (type == 4)
+                BT1r = imrotate(BT1(:,:,count),180);
+                if ~isempty(BT2), BT2r = imrotate(BT2(:,:,count),180); else, BT2r = []; end
+            else
+                BT1r = BT1(:,:,count);
+                if ~isempty(BT2), BT2r = BT2(:,:,count); else, BT2r = []; end
+            end
+
+            old_intens = struct('Fpixelnum', Fpixelnum(count), 'intensityM', intensityM(count), ...
+                'intensityM_F', intensityM_F(count), 'intensityB1_F', intensityB1_F(count), ...
+                'intensityB2_F', intensityB2_F(count), 'F1pixelnum', F1pixelnum(count), ...
+                'F2pixelnum', F2pixelnum(count), 'intensityM_F1', intensityM_F1(count), ...
+                'intensityB1_F1', intensityB1_F1(count), 'intensityB2_F1', intensityB2_F1(count), ...
+                'intensityM_F2', intensityM_F2(count), 'intensityB1_F2', intensityB1_F2(count), ...
+                'intensityB2_F2', intensityB2_F2(count));
+
+            [tip_row, diamf_val, intens, ok, yctk_rep, xctk_rep, F1_rep, F2_rep, U_smooth_rep] = find_tip_and_measure(count, U_rep, prev_tip_fwd, ...
+                weight, diamo, tip_method, pixelsize, ROItype, split, circle, starti, stopi, ...
+                diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um);
+
+            if ok
+                tip_final(count,:) = tip_row;
+                diamf_avg(count) = diamf_val;
+                intensityM(count) = intens.intensityM;
+                intensityM_F(count) = intens.intensityM_F;
+                Fpixelnum(count) = intens.Fpixelnum;
+                intensityB1_F(count) = intens.intensityB1_F;
+                intensityB2_F(count) = intens.intensityB2_F;
+                intensityM_F1(count) = intens.intensityM_F1;
+                intensityM_F2(count) = intens.intensityM_F2;
+                F1pixelnum(count) = intens.F1pixelnum;
+                F2pixelnum(count) = intens.F2pixelnum;
+                intensityB1_F1(count) = intens.intensityB1_F1;
+                intensityB2_F1(count) = intens.intensityB2_F1;
+                intensityB1_F2(count) = intens.intensityB1_F2;
+                intensityB2_F2(count) = intens.intensityB2_F2;
+                frame_failed(count) = false;
+                prev_tip_fwd = tip_row;
+                n_repaired = n_repaired + 1;
+                % Re-render this frame's buffered video content from the
+                % REPAIRED mask/tip/ROI now that it's known good -- the
+                % video is flushed to disk only after this whole pass (see
+                % below), so this replaces whatever the reverse pass's
+                % (since-discarded) attempt looked like before anyone ever
+                % sees it.
+                if tip_plot
+                    growth_buf{count} = render_growth_frame(U_smooth_rep, tip_row, yctk_rep, xctk_rep, F1_rep, F2_rep, ROItype, true, count, frame_rate);
+                end
+                if roi_debug_video
+                    roi_buf{count} = render_roi_debug_frame(O, U_smooth_rep, yctk_rep, xctk_rep, F1_rep, F2_rep, ROItype, true, up_factor, Cmax, count, frame_rate);
+                end
+                if debug_mode
+                    fprintf('  [repair] F%d: REPAIRED\n', count);
+                end
+            else
+                if debug_mode
+                    fprintf('  [repair] F%d: repair attempted but still failed -- left flagged\n', count);
+                end
+            end
+        catch ME_rep
+            if debug_mode
+                fprintf('  [repair] F%d: repair threw -- %s -- left flagged\n', count, ME_rep.message);
+            end
+        end
+    end
+    if debug_mode
+        fprintf('Forward repair pass: %d/%d flagged frames repaired\n', n_repaired, n_attempted);
+    end
+end
+
+% Flush the buffered video frames to disk now, in TRUE CHRONOLOGICAL order
+% (stp:smp) rather than the reverse pass's own processing order (smp:-1:
+% stp) -- both because repaired frames' content is only settled at this
+% point (after the pass above), and because writing in real time order
+% means the video now actually plays forward like a growth movie, instead
+% of the tip visibly receding as playback progressed.
+if (tip_plot == 1)
+    for count = stp:smp
+        if ~isempty(growth_buf{count})
+            writeVideo(V, growth_buf{count});
+        end
+    end
+    close(V);
+end
+if roi_debug_video
+    for count = stp:smp
+        if ~isempty(roi_buf{count})
+            writeVideo(Vroi, roi_buf{count});
+        end
+    end
+    close(Vroi);
+end
 
 % Final tip movement/diameter/pixel number on a per frame basis
 fig1 = figure;
@@ -1700,3 +1905,745 @@ end
 diary off;
 
 if (workspace) save([outpath '/' fname '_result.mat']); end
+
+% ============================================================================
+% Multi-blob keep-and-bridge (weak_signal only). Used at TWO points in the
+% main loop's mask-building (right after bwareaopen, and again after
+% imclose) instead of a plain bwareafilt(U,1): a genuine tube fragment
+% (most often the bright GCaMP tip itself) can survive as a component
+% separate from the main piece rather than actually merging with it -- the
+% two can look connected at low zoom without truly being one component.
+% Plain bwareafilt(U,1) then keeps only whichever piece has more total
+% pixels and silently discards the other, regardless of size -- confirmed
+% on HV198_1_16 frame 3321: a bright, well-formed GCaMP tip blob (1121px,
+% comparable width to the rest of the tube) got discarded outright because
+% the dimmer shank piece happened to have slightly more pixels. Has to run
+% at BOTH points, not just after imclose: the earlier bwareafilt (right
+% after bwareaopen) would otherwise already have discarded the fragment
+% before the later, imclose-stage check ever got a chance to see it.
+% ============================================================================
+
+function U = keep_and_bridge_blobs(U_in, diamo_est, U_smp, debug_mode, count)
+    cc = bwconncomp(U_in);
+    if cc.NumObjects <= 1
+        U = bwareafilt(U_in, 1);
+        return;
+    end
+    stats = regionprops(cc, 'Area', 'MajorAxisLength');
+    [~, largest_idx] = max([stats.Area]);
+    keep = false(cc.NumObjects, 1);
+    keep(largest_idx) = true;
+    has_ref = ~isempty(U_smp) && any(U_smp(:));
+    for ci = 1:cc.NumObjects
+        if ci == largest_idx, continue; end
+        s = stats(ci);
+        if s.MajorAxisLength <= 0, continue; end
+        % Width comparable to the tube's own measured diameter -- not a
+        % thin noise sliver, not a blob much wider than the real tube.
+        width_est = s.Area / s.MajorAxisLength;
+        width_ok = width_est >= 0.5*diamo_est && width_est <= 1.5*diamo_est;
+        % Elongated along its own axis (several tube-widths long), not
+        % round/blobby noise.
+        length_ok = s.MajorAxisLength >= 3*diamo_est;
+        % Sits where the reference mask says the tube should be. On the
+        % very first frame processed (establishing the reference itself,
+        % before U_smp exists), there's nothing to check against yet --
+        % defaulting this to false would mean the one frame that most
+        % needs the rescue could never get it (caught via HV198_1_16
+        % frame 3321 itself being the reference: its own tip blob kept
+        % getting discarded because there was no U_smp yet to validate
+        % against). Default to true (not checked, not penalised) when no
+        % reference exists; only require real overlap once one does.
+        overlap_ok = true;
+        if has_ref
+            comp_mask = false(size(U_in));
+            comp_mask(cc.PixelIdxList{ci}) = true;
+            overlap_ok = nnz(comp_mask & U_smp) / s.Area >= 0.3;
+        end
+        if width_ok && length_ok && overlap_ok
+            keep(ci) = true;
+            if debug_mode
+                fprintf('  blob-keep F%d: component %d kept (width=%.1f len=%.1f overlap_ok=%d, diamo_est=%.1f)\n', ...
+                    count, ci, width_est, s.MajorAxisLength, overlap_ok, diamo_est);
+            end
+        end
+    end
+    U = false(size(U_in));
+    U(cc.PixelIdxList{largest_idx}) = true;
+    if nnz(keep) > 1
+        bridge_r = max(1, round(diamo_est * 0.15));
+        remaining = setdiff(find(keep), largest_idx);
+        while ~isempty(remaining)
+            D = bwdist(U);
+            piece_dists = zeros(numel(remaining), 1);
+            for ri = 1:numel(remaining)
+                piece_dists(ri) = min(D(cc.PixelIdxList{remaining(ri)}));
+            end
+            [~, nearest] = min(piece_dists);
+            piece = false(size(U_in));
+            piece(cc.PixelIdxList{remaining(nearest)}) = true;
+            U = bridge_to_mask(U, piece, bridge_r);
+            remaining(nearest) = [];
+        end
+    end
+    U = bwareafilt(U, 1);
+end
+
+% ============================================================================
+% Video frame rendering (growth.mp4 / roi_debug.avi), factored out so the
+% SAME rendering code produces both the initial (reverse-pass) frame and
+% any later re-render for a repaired frame -- video writing itself is
+% buffered (not streamed) and flushed to disk only after the forward
+% repair pass, in chronological order, so a repaired frame's video content
+% matches its corrected CSV data instead of showing whatever the (later
+% discarded) reverse-pass attempt looked like. See project notes for why
+% this had to change: ~1/3 of frames on HV198_1_16 went through repair,
+% and every one of them previously showed a blank marker in the video
+% despite having valid, corrected data in the CSV.
+% ============================================================================
+
+function img = render_growth_frame(U, tip_row, yctk, xctk, F1, F2, ROItype, show_overlay, count, frame_rate)
+    Splot = zeros(size(U));
+    if show_overlay
+        r1 = max(1,tip_row(1)-3); r2 = min(size(Splot,1),tip_row(1)+3);
+        c1 = max(1,tip_row(2)-3); c2 = min(size(Splot,2),tip_row(2)+3);
+        Splot(r1:r2,c1:c2) = 1;
+    end
+    Cplot = zeros(size(U));
+    Cplot(sub2ind([size(Cplot,1) size(Cplot,2)], yctk, xctk)) = 2.*ones(size(xctk));
+    image2 = U*20 + Splot*40 + Cplot*30;
+    if (ROItype > 0) && show_overlay
+        image2 = image2 + double(F1*60 + F2*80);
+    end
+    h = figure('visible', 'off');
+    imagesc(image2);
+    clim([0 200]);
+    txtstr = strcat('Time(s): ',num2str((count*frame_rate)),'  Frame: ',num2str(count));
+    text(10,10,txtstr,'color','white')
+    set(gca,'xtick',[]); set(gca,'xticklabel',[]); set(gca,'ytick',[]); set(gca,'yticklabel',[]);
+    frame = getframe(gcf);
+    img = frame.cdata;
+    close(h);
+end
+
+function rgb_roi = render_roi_debug_frame(O, U, yctk, xctk, F1, F2, ROItype, show_overlay, up_factor, Cmax, count, frame_rate)
+    Od = min(255, double(O)./Cmax.*255);
+    jetmap = uint8(vertcat([0 0 0], jet(255)) .* 255);
+    idx = uint8(Od) + 1;
+    rgb = reshape(jetmap(idx(:),:), size(O,1), size(O,2), 3);
+    rch = rgb(:,:,1); gch = rgb(:,:,2); bch = rgb(:,:,3);
+    line_r = max(0, up_factor - 1);
+    if (ROItype > 0) && show_overlay
+        f1_edge = bwperim(logical(F1));
+        f2_edge = bwperim(logical(F2));
+        if line_r > 0
+            f1_edge = imdilate(f1_edge, strel('disk', line_r));
+            f2_edge = imdilate(f2_edge, strel('disk', line_r));
+        end
+        rch(f1_edge) = 255; gch(f1_edge) = 0;   bch(f1_edge) = 0;
+        rch(f2_edge) = 0;   gch(f2_edge) = 0;   bch(f2_edge) = 255;
+    end
+    Cplot = zeros(size(U));
+    Cplot(sub2ind([size(Cplot,1) size(Cplot,2)], yctk, xctk)) = 1;
+    clm = logical(Cplot);
+    if line_r > 0, clm = imdilate(clm, strel('disk', line_r)); end
+    rch(clm) = 255; gch(clm) = 255; bch(clm) = 255;
+    rgb_roi = cat(3, rch, gch, bch);
+    if exist('insertText','file')
+        txtstr = ['Time(s): ' num2str(count*frame_rate) '  Frame: ' num2str(count)];
+        rgb_roi = insertText(rgb_roi,[5 5],txtstr,'FontSize',8,'TextColor','white','BoxOpacity',0);
+    end
+end
+
+function U_smooth = reconstruct_smooth_mask(U, boundb, xc, yc, dx, dy, distc, t1_all, t2_all, diamo, postotal1, postotal2)
+% Rebuild a spike-free, hole-free mask from the tube's own shape, for the
+% growth/roi_debug videos specifically (weak_signal only) -- does not feed
+% back into diamf_avg/ROI/tip-finding, which stay based on the original U.
+%
+% Direction/bends and width are smoothed SEPARATELY on purpose (v2 design,
+% see project notes): xc/yc (the already-tracked medial-axis centerline)
+% and dx/dy (its local tangent, hence the perpendicular probe direction)
+% are used AS-IS, so a real bend is followed exactly as tightly as before
+% -- only the per-side half-width (t1_all/t2_all, the raw signed offset
+% from the centerline along that same perpendicular, one entry per xc/yc
+% sample -- computed and stashed in the main per-sample loop above, BEFORE
+% line_continuity can drop/reorder points, so it stays index-aligned with
+% xc/yc/dx/dy no matter how much continuity-pruning shortens poscross1/
+% poscross2 downstream) gets smoothed, with a much wider, robust (median)
+% window than a plain positional smoothing of xy1/xy2 could use. A local
+% dark-spot threshold pinch is an imaging artifact, not a real width
+% change, and needs a wide enough window to be outvoted by the genuine
+% width around it; but smoothing xy1/xy2's raw (row,col) POSITIONS with a
+% window that wide also rounds off real bends (the two curves round
+% unevenly, distorting width right where the tube turns). Decoupling means
+% a wide width-window can't cause bend-thickening: a bend only ever moves
+% `center`/the perpendicular direction here, never the half-widths. The
+% median filter also absorbs the occasional wrong-index outlier that
+% line_continuity would otherwise have corrected for the real measurement
+% path -- fine here since this is visual only.
+U_smooth = U;
+n = numel(xc);
+if n < 2 || numel(t1_all) ~= n || numel(t2_all) ~= n
+    return; % not enough boundary data this frame -- fall back to the raw mask
+end
+
+norm_t = sqrt(dx(:).^2 + dy(:).^2);
+norm_t(norm_t == 0) = 1;
+perp_row =  dx(:) ./ norm_t;
+perp_col = -dy(:) ./ norm_t;
+center = [yc(:) xc(:)];
+
+t1 = t1_all(:);
+t2 = t2_all(:);
+
+% Window sized in arc-length terms (a few tube-diameters), converted to a
+% sample count via the centerline's own point spacing -- diamo-relative,
+% not a fixed pixel count, consistent with how the rest of this codebase
+% scales corridor/closing radii.
+spacing = mean(abs(diff(distc(:))));
+if ~isfinite(spacing) || spacing <= 0, spacing = 1; end
+win = round(6 * diamo / spacing);
+win = max(5, win);
+if mod(win, 2) == 0, win = win + 1; end
+win = min(win, 2*floor((n-1)/2) + 1);
+win = max(3, win);
+
+t1s = medfilt1(t1, win, 'truncate');
+t2s = medfilt1(t2, win, 'truncate');
+
+xy1_new = center + t1s .* [perp_row perp_col];
+xy2_new = center + t2s .* [perp_row perp_col];
+
+% Tip needs a small stitched cap: xy1/xy2 both stop short of the very tip
+% by design (postotal1/postotal2 exclude boundary points within
+% diamo*0.75px of it), so closing [xy1_new; flipud(xy2_new)] directly
+% would leave an unnaturally flat/blunt edge right at the tip instead of
+% its real taper. boundb(postotal2(1):postotal1(2),:) is the same
+% tip-region boundary arc already used to close the ROI polygon near the
+% tip (see the ROI construction above) -- same technique, reused here.
+% It's smoothed too (was raw/unfiltered before -- the tip is exactly
+% where GCaMP signal/mask quality is roughest, so it showed real spikes
+% even after xy1/xy2 got smoothed), then endpoint-blended (linear ramp)
+% onto xy1_new(1,:)/xy2_new(1,:) so the join has no visible seam. Window
+% sized relative to diamo (like the width window above), not a fixed
+% point count: boundb steps ~1px apart, so a fixed small window (an
+% earlier version used 9) is a shrinking fraction of a tip-cap arc as
+% diamo grows, and left real 1-2px-wide boundary-tracing spikes only
+% partially smoothed (confirmed on HV198_1_16 frame 3090 -- a genuine
+% double spike survived at window 9, mostly resolved at window~1.5x
+% diamo; going wider still leaves a 1px residual right at the seam
+% (medfilt1's 'truncate' edge-padding weakens right at the array boundary
+% no matter how wide the nominal window is) while starting to blunt the
+% true taper, so 1.5x is the point of diminishing returns, not a full fix).
+tip_cap = double(boundb(postotal2(1):postotal1(2), :));
+if size(tip_cap,1) >= 5
+    cap_step = mean(sqrt(sum(diff(tip_cap).^2, 2)));
+    if ~isfinite(cap_step) || cap_step <= 0, cap_step = 1; end
+    cap_win = round(1.5 * diamo / cap_step);
+    cap_win = max(3, cap_win);
+    if mod(cap_win, 2) == 0, cap_win = cap_win + 1; end
+    cap_win = min(cap_win, 2*floor((size(tip_cap,1)-1)/2) + 1);
+    tip_cap = [medfilt1(tip_cap(:,1), cap_win, 'truncate'), medfilt1(tip_cap(:,2), cap_win, 'truncate')];
+end
+n_cap = size(tip_cap, 1);
+frac = (0:n_cap-1)' / max(1, n_cap-1);
+err_start = xy2_new(1,:) - tip_cap(1,:);
+err_end   = xy1_new(1,:) - tip_cap(end,:);
+tip_cap = tip_cap + (1-frac).*err_start + frac.*err_end;
+
+poly = [tip_cap; xy1_new; flipud(xy2_new)];
+candidate = poly2mask(poly(:,2), poly(:,1), size(U,1), size(U,2));
+if any(candidate(:))
+    U_smooth = candidate;
+end
+end
+
+% ============================================================================
+% Forward repair pass support (weak_signal only). See project notes: the
+% main loop above walks backward (smp:-1:stp), so "previous frame in the
+% loop" means "later frame in real time" -- useful for shrinking a known-
+% good reference shape toward the tip, but the wrong direction for using
+% "the tip can't have retracted more than max_tip_jump_um" as a
+% constructive repair bound (that needs the REAL previous-in-time frame).
+% These two functions implement that: build_repaired_mask unions in the
+% reference mask's own shape (same technique the old always-on weak_signal
+% used) for the shank, then extends the mask forward toward the expected
+% tip location when this frame's own tip falls short of the growth-rate
+% bound; find_tip_and_measure is a faithful re-derivation of the main
+% loop's own tip-finding + curves/centerline/ROI/diameter logic (kept
+% deliberately parallel to the inline code above, not shared with it, to
+% avoid regression risk to the already-verified reverse pass), used only
+% by the forward repair pass below so a repaired frame's tip/diameter/ROI
+% numbers are mutually consistent. Diagnostics, kymograph, and the two
+% output videos are NOT reproduced here -- see session notes: video
+% writing is append-only (no seeking back to patch one frame), and kymo/
+% diagnostics are visualization aids, not the measurements.csv data this
+% pass exists to fix.
+% ============================================================================
+
+function U = build_repaired_mask(U0, U_smp, prev_tip, max_tip_jump_um, pixelsize)
+    % Shank/base repair: union in the reference mask's own shape, cropped to
+    % this frame's own detected tip column (same technique the old
+    % always-on weak_signal used, now applied only to flagged frames).
+    [~, Uc_plain] = find(U0);
+    tip_col = size(U0, 2);
+    if ~isempty(Uc_plain), tip_col = min(Uc_plain); end
+    U_ref_shrunk = U_smp;
+    U_ref_shrunk(:, 1:(tip_col - 1)) = false;
+    U = U0 | U_ref_shrunk;
+    U = bwareafilt(U, 1);
+
+    % Tip repair: the tip cannot have retracted more than max_tip_jump_um
+    % since the previous (chronologically earlier) frame's own tip. If this
+    % frame's own mask doesn't reach that far, extend it using the
+    % reference mask's own shape as a guide -- same crop-and-union
+    % technique as the shank repair above, just cropped less aggressively.
+    if ~isempty(prev_tip) && pixelsize > 0
+        max_jump_px = max_tip_jump_um / pixelsize;
+        [~, Uc] = find(U);
+        this_tip_col = min(Uc);
+        expected_min_col = max(1, prev_tip(2) - max_jump_px);
+        if this_tip_col > expected_min_col
+            U_ref_extend = U_smp;
+            ext_col = max(1, round(expected_min_col));
+            U_ref_extend(:, 1:(ext_col - 1)) = false;
+            U = U | U_ref_extend;
+            U = bwareafilt(U, 1);
+        end
+    end
+end
+
+function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_smooth_out] = find_tip_and_measure(count, U, prev_tip, ...
+        weight, diamo, tip_method, pixelsize, ROItype, split, circle, starti, stopi, ...
+        diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um)
+
+    ok = true;
+    last_flag = ~isempty(prev_tip);
+    intens = old_intens; % ROItype==2 (stationary ROI, reused from smp) not
+                          % supported here -- falls back to the reverse
+                          % pass's own values for that stack layout.
+    F1_out = zeros(size(U)); F2_out = zeros(size(U)); % default when ROItype<=0/==2/split==0 -- video re-render just skips ROI shading then
+
+    % Finding the tip-ward reference point (Qef) -- skeleton + branch-removal
+    % only; ringwalk not supported in the repair pass (experimental, unused
+    % on real stacks as of this session).
+    Q = bwmorph(U,'thin',Inf);
+    Qe = bwmorph(Q,'endpoints');
+    [Qer,Qec] = find(Qe > 0);
+    Qel = [Qer Qec];
+    Qb = bwmorph(Q,'branchpoints');
+    [Qbr,Qbc] = find(Qb > 0);
+    if (Qbr > 0)
+        Qbf = [Qbr Qbc];
+        [Q2, Qef, tmp] = branch_removal(Q,Qbf,Qel,0,1);
+    else
+        Q2 = Q;
+        [tmp,Qepos] = max(Qec);
+        Qef = Qel;
+        Qef(Qepos,:) = [];
+    end
+    if isempty(Qef) && ~isempty(Qel)
+        % Same defensive fallback as the reverse pass's own copy above --
+        % see that comment for the full explanation (confirmed root cause
+        % of the F3271 crash: branch_removal over-pruned a 3-endpoint
+        % skeleton to zero endpoints).
+        [~, Qepos] = max(Qel(:,2));
+        Qef = Qel(Qepos,:);
+    end
+
+    % Finding the radius for ellipse fitting
+    tols = 0; rad=1;
+    while (tols == 0)
+        sides = false; connect = false;
+        try
+            K = U(Qef(1)-rad:Qef(1)+rad,Qef(2)-rad:Qef(2)+rad);
+        catch
+            rad = 100;
+            tols = 40;
+            break;
+        end
+        Ke = [K(:,1)' K(end,2:end) K(end-1:-1:1,end)' K(1,end-1:-1:2)];
+        Kd = diff(Ke);
+        Kd(end+1) = Ke(1) - Ke(end);
+        if (nnz(Kd) == 2) connect = true; end
+        Ks = [sum(K(:,1)) sum(K(1,:)) sum(K(:,end)) sum(K(end,:))];
+        if (nnz(Ks) <= 2)
+            bou = bwboundaries(K);
+            if ~isempty(bou)
+                Kb = bou{1};
+                Kbl = [find(Kb(:,1) == 1); find(Kb(:,2) == 1); find(Kb(:,1) == size(K,1)); find(Kb(:,2) == size(K,1))];
+                if (size(Kbl,1) < size(K,1)) sides = true; end
+            end
+        end
+        if(connect == true && sides == true) tols = rad; end
+        rad = rad + 1;
+    end
+
+    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef);
+    tip_ellipsepos = dsearchn(boundb,tip_ellipse);
+    tip_ellipsef = boundb(tip_ellipsepos,:);
+
+    S = bwmorph(U,'skel',Inf);
+    Se = bwmorph(S,'endpoints');
+    [Ser,Sec] = find(Se > 0);
+    Sel = [Ser Sec];
+    Sb = bwmorph(S,'branchpoints');
+    [Sbr,Sbc] = find(Sb > 0);
+    Sbl = [Sbr Sbc];
+
+    % Diameter sanity check against the frozen reference (same as the
+    % reverse pass) -- if repair still can't produce a plausible diameter,
+    % report failure so the caller leaves this frame flagged/NaN'd.
+    diam_tol = 2;
+    if (diam < diamo/diam_tol) || (diam > diamo*diam_tol)
+        ok = false;
+        if debug_mode
+            fprintf('  [repair] diam F%d: diam=%.1fpx vs diamo=%.1fpx -- still out of tolerance\n', count, diam, diamo);
+        end
+    end
+
+    if isempty(Sbl)
+        S2 = S; S2area = 1;
+        [~, base_pos] = max(Sel(:,2));
+        Sef = Sel; Sef(base_pos,:) = [];
+    else
+        if (last_flag == 0) Sbf = Sbl(dsearchn(Sbl,Qef),:);
+        else [tmp, Sbmin] = min(pdist2(Sbl,prev_tip) + pdist2(Sbl,Qef));
+            Sbf = Sbl(Sbmin,:);
+        end
+        close_dist = 0;
+        if (pdist2(Qef,Sbf) > weight*diamo) close_dist = 1; end
+        if (weight == 0) kill_angle = 0;
+        else kill_angle = 75;
+        end
+        [S2,Sef,S2area] = branch_removal(S,Sbf,Sel,kill_angle,close_dist);
+    end
+
+    if (size(Sef,1) > 1)
+        if size(Sef,1) > 2
+            d_to_ellipse = pdist2(Sef, tip_ellipsef);
+            [~, order] = sort(d_to_ellipse);
+            Sef = Sef(order(1:2),:);
+        end
+        [tmp, skel_ellipsepos] = min(pdist2(Sef,tip_ellipsef));
+        if (last_flag == 1)
+            [tmp, skel_lastpos] = min(pdist2(Sef,prev_tip));
+            if ((skel_lastpos+skel_ellipsepos+1) > 4) choice = 2; else choice = 1; end
+        else
+            choice = skel_ellipsepos;
+        end
+        tip_choice = [dsearchn(boundb,Sef(1,:));dsearchn(boundb,Sef(2,:))];
+        if (min(tip_choice) == tip_choice(2)) S2area = 1/S2area; end
+        tip_skelpos = tip_choice(choice);
+        tip_skel = boundb(tip_skelpos,:);
+
+        cn = 0; tip_angle = [];
+        for i = min(tip_choice):max(tip_choice)
+            cn = cn+1;
+            tip_angle(cn) = atan2((boundb(i,2) - Sbf(2)),(boundb(i,1) - Sbf(1)));
+            if (pi - abs(max(tip_angle)) < abs(min(tip_angle)))
+                if (tip_angle(cn) < 0) tip_angle(cn) = 2*pi + tip_angle(cn); end
+            end
+        end
+        target_angle = (tip_angle(1) + tip_angle(end)*S2area)/(S2area+1);
+        tip_anglediff = abs(tip_angle - target_angle);
+        [tmp, tip_anglepos] = min(tip_anglediff);
+        tip_midpos = tip_anglepos+min(tip_choice)-1;
+        tip_mid = boundb(tip_midpos,:);
+
+        tip_range_tol = 2;
+        if (tip_ellipsepos>min(tip_choice)-tip_range_tol && tip_ellipsepos<max(tip_choice)+tip_range_tol)
+            tip_row = tip_ellipsef;
+        else
+            tip_ellipsedist = [pdist2(tip_ellipsef,tip_mid) pdist2(tip_ellipsef,tip_skel)];
+            if (last_flag)
+                tip_finaldist = [pdist2(prev_tip,tip_mid) pdist2(prev_tip,tip_skel)];
+                [tmp, tip_finalpos] = min([(1-0.33)*tip_finaldist(1)+0.33*tip_ellipsedist(1) (1-0.33)*tip_finaldist(2)+0.33*tip_ellipsedist(2)]);
+            else
+                [tmp, tip_finalpos] = min(tip_ellipsedist);
+            end
+            if (tip_finalpos == 1) tip_row = tip_mid; else tip_row = tip_skel; end
+        end
+    else
+        tip_skel = boundb(dsearchn(boundb,Sef(1,:)),:);
+        if (last_flag) [tmp, tip_finaldistpos] = min([pdist2(prev_tip,tip_ellipsef) pdist2(prev_tip,tip_skel)]);
+        else tip_finaldistpos = 2;
+        end
+        if (tip_finaldistpos == 1) tip_row = tip_ellipsef; else tip_row = tip_skel; end
+    end
+
+    if debug_mode
+        fprintf('  [repair] tip F%d -> [%d %d]\n', count, tip_row(1), tip_row(2));
+    end
+
+    % Tip-jump sanity check against the real previous-in-time frame -- same
+    % physical bound as the reverse pass's own check, just now checked
+    % against the correct chronological neighbour.
+    if last_flag && pixelsize > 0
+        tip_jump_um = pdist2(tip_row, prev_tip) * pixelsize;
+        if tip_jump_um > max_tip_jump_um
+            ok = false;
+            if debug_mode
+                fprintf('  [repair] tip F%d: jump=%.2fum > max_tip_jump_um=%.1fum -- repair did not converge\n', ...
+                    count, tip_jump_um, max_tip_jump_um);
+            end
+        end
+    end
+
+    % Find the curves along the sides of the tubes
+    total1 = []; total2 = [];
+    range1 = ceil(length(boundb)*0.5):length(boundb);
+    dist1 = pdist2(boundb(range1,:),tip_row);
+    postotal1 = find(dist1 > diamo*0.75)+range1(1)-1;
+    if (~isempty(find(diff(postotal1(1:floor(length(postotal1)/2))>1))))
+        postotal1(1:find(diff(postotal1(1:floor(length(postotal1)/2))>1))) = [];
+    end
+    total1(:,:) = boundb(postotal1,:);
+
+    range2 = ceil(length(boundb)*0.5)-1:-1:1;
+    dist2 = pdist2(boundb(range2,:),tip_row);
+    postotal2 = range2(1)-find(dist2 > diamo*0.75)+1;
+    if (~isempty(find(diff(postotal2(1:floor(length(postotal2)/2))>1))))
+        postotal2(1:find(diff(postotal2(1:floor(length(postotal2)/2))>1))) = [];
+    end
+    total2(:,:) = boundb(postotal2,:);
+
+    if isempty(total1) || isempty(total2)
+        dist_all = pdist2(boundb, tip_row);
+        postotal_all = find(dist_all > diamo*0.75);
+        half = ceil(length(postotal_all)*0.5);
+        total1 = boundb(postotal_all(1:half),:);
+        total2 = boundb(postotal_all(half+1:end),:);
+    end
+    if ~isempty(total1) && ~isempty(total2)
+        if (max(total1(:,2)) < (maxy-1))
+            while(max(total1(:,2)) < (maxy-1) && ~isempty(total2))
+                total1 = vertcat(total1,total2(end,:));
+                total2(end,:) = [];
+            end
+        elseif (max(total2(:,2)) < (maxy-1))
+            while(max(total2(:,2)) < (maxy-1) && ~isempty(total1))
+                total2 = vertcat(total2, total1(end,:));
+                total1(end,:) = [];
+            end
+        end
+    end
+    if isempty(total1) || isempty(total2)
+        dist_all = pdist2(boundb, tip_row);
+        postotal_all = find(dist_all > diamo*0.75);
+        if ~isempty(postotal_all)
+            half = ceil(length(postotal_all)*0.5);
+            total1 = boundb(postotal_all(1:half),:);
+            total2 = boundb(postotal_all(half+1:end),:);
+        end
+    end
+    if ~isempty(total1) && ~isempty(total2) && (abs(total1(end,1) - total2(end,1)) < 0.75*diam)
+        total1(find(total1(:,2) >= max(total1(:,2))),:) = [];
+        total2(find(total2(:,2) >= max(total2(:,2))),:) = [];
+    end
+
+    % Centerline: minimum-cost path through tube, weighted by distance from wall
+    right_col = size(U,2) - 1;
+    right_pix = find(U(:, right_col));
+    while isempty(right_pix) && right_col > 1
+        right_col = right_col - 1;
+        right_pix = find(U(:, right_col));
+    end
+    ra_row = round(mean(right_pix));
+    if ~U(ra_row, right_col)
+        [~, snap] = min(abs(right_pix - ra_row));
+        ra_row = right_pix(snap);
+    end
+    right_anchor = [ra_row, right_col];
+
+    D_tube = bwdist(~U);
+    W_tube = Inf(size(U));
+    W_tube(U) = 1 ./ (D_tube(U) + 1);
+    GD = graydist(W_tube, right_anchor(2), right_anchor(1));
+    GD(~U) = Inf;
+
+    [Ur_all, Uc_all] = find(U);
+    [~, tpos] = min(pdist2([Ur_all Uc_all], tip_row));
+    r = Ur_all(tpos); c = Uc_all(tpos);
+    if ~isfinite(GD(r,c))
+        [~, epos] = max(Qec);
+        r = Qel(epos,1); c = Qel(epos,2);
+    end
+
+    max_path = 3*nnz(U);
+    path = zeros(max_path, 2);
+    path(1,:) = [r c];
+    n_path = 1;
+    visited = false(size(U));
+    visited(r,c) = true;
+    for step = 1:max_path-1
+        if GD(r,c) == 0, break; end
+        r0 = max(1,r-1); r1 = min(size(U,1),r+1);
+        c0 = max(1,c-1); c1 = min(size(U,2),c+1);
+        nbhd = GD(r0:r1, c0:c1);
+        nbhd(visited(r0:r1, c0:c1)) = Inf;
+        [min_val, idx] = min(nbhd(:));
+        if min_val >= GD(r,c), break; end
+        [dr, dc] = ind2sub(size(nbhd), idx);
+        r = r0+dr-1; c = c0+dc-1;
+        n_path = n_path + 1;
+        path(n_path,:) = [r c];
+        visited(r,c) = true;
+    end
+    path = path(1:n_path,:);
+    yctk = path(:,1); xctk = path(:,2);
+    path_dist = [0; cumsum(sqrt(sum(diff(path).^2, 2)))];
+
+    nline = 1:100; norder = floor(nline*path_dist(end)/100);
+    nfinal = dsearchn(path_dist, norder');
+    yct = yctk(nfinal); xct = xctk(nfinal); distct = path_dist(nfinal);
+    xct = round(sgolayfilt(double(xct),3,15)); yct = round(sgolayfilt(double(yct),3,15));
+    xct = max(1, min(xct, size(U,2))); yct = max(1, min(yct, size(U,1)));
+
+    distc_t = pdist2(tip_row, Qef);
+    [tmp, cut] = min(abs(distct - distc_t));
+    xc = xct(cut:end); yc = yct(cut:end); distc = distct(cut:end);
+
+    dx = gradient(xc); dx(find(dx == 0)) = 0.01;
+    dy = gradient(yc); dy(find(dy == 0)) = 0.01;
+
+    poscross1 = []; poscross2 = []; t1_all = zeros(length(xc),1); t2_all = zeros(length(xc),1);
+    for n = 1:length(xc)
+        nfitc = fit(vertcat(xc(n),(xc(n) - dy(n))),vertcat(yc(n),(yc(n) + dx(n))),'poly1');
+        edge1 = total1(:,1) - nfitc.p1.*total1(:,2) - nfitc.p2;
+        [tmp, cross1] = min(abs(edge1));
+        poscross1(n) = cross1;
+        edge2 = total2(:,1) - nfitc.p1.*total2(:,2) - nfitc.p2;
+        [tmp, cross2] = min(abs(edge2));
+        poscross2(n) = cross2;
+
+        % Signed half-width at this exact sample, for reconstruct_smooth_mask
+        % -- see the reverse pass's own copy of this loop for why it's
+        % stashed here rather than derived from xy1/xy2 after continuity
+        % pruning below.
+        normn = sqrt(dx(n)^2 + dy(n)^2); if normn == 0, normn = 1; end
+        p1pt = total1(cross1,:); p2pt = total2(cross2,:);
+        t1_all(n) = (p1pt(1)-yc(n))*(dx(n)/normn) + (p1pt(2)-xc(n))*(-dy(n)/normn);
+        t2_all(n) = (p2pt(1)-yc(n))*(dx(n)/normn) + (p2pt(2)-xc(n))*(-dy(n)/normn);
+    end
+
+    [poscross1, poscross2, distcf] = line_continuity(poscross1,poscross2,1,distc);
+    [poscross1, poscross2, distcf] = line_continuity(poscross1,poscross2,2,distcf);
+
+    xy1 = total1(poscross1,:); xy2 = total2(poscross2,:);
+    if (length(xy1) > 20)
+        xy1 = floor(sgolayfilt(xy1,3,15)); xy2 = floor(sgolayfilt(xy2,3,15));
+    end
+    xyout = vertcat(find(xy1(:,2) > size(U,2)), find(xy2(:,2) > size(U,2)));
+    xy1(xyout,:) = []; xy2(xyout,:) = []; distcf(xyout) = [];
+
+    % Same smoothed-boundary mask reconstruction as the reverse pass's own
+    % copy (see reconstruct_smooth_mask) -- this function only ever runs
+    % under weak_signal=1 (called by the forward repair pass), so no
+    % separate gate needed here.
+    U_smooth_out = reconstruct_smooth_mask(U, boundb, xc, yc, dx, dy, distc, t1_all, t2_all, diamo, postotal1, postotal2);
+
+    [tmp, distpos, tmp] = intersect(distc,distcf);
+    distctf = [distct(1:cut-1); distc(distpos)]; xctf = [xct(1:cut-1); xc(distpos)]; yctf = [yct(1:cut-1); yc(distpos)];
+    linectf = [yctf xctf];
+
+    if (ROItype > 0) && (ROItype ~= 2)
+        Esize = size(U);
+        if (pixelsize == 0)
+            percent = (100*distctf)./(distctf(end));
+            stop_length = abs(percent - stopi); [tmp, stoppos] = min(stop_length);
+            distc_t = (100*distc_t)/max(distctf);
+            tip_excl_dist = (100*diamo*0.75)/max(distctf);
+        else
+            stop_length = abs(distctf*pixelsize - stopi); [tmp, stoppos] = min(stop_length);
+            distc_t = distc_t*pixelsize;
+            tip_excl_dist = diamo*0.75*pixelsize;
+        end
+
+        if pixelsize > 0
+            arc_start_px = starti / pixelsize;
+            arc_stop_px  = min(stopi / pixelsize, distc(end));
+        else
+            arc_start_px = starti / 100 * distc(end);
+            arc_stop_px  = stopi  / 100 * distc(end);
+        end
+        [~, k_start] = min(abs(distc - arc_start_px));
+        [~, k_stop]  = min(abs(distc - arc_stop_px));
+        k_start = max(1, min(k_start, length(xc)));
+        k_stop  = max(1, min(k_stop,  length(xc)));
+
+        [startc1,stopc1] = closest_bound(total1,xc,yc,k_start,k_stop,diamo*2);
+        [startc2,stopc2] = closest_bound(total2,xc,yc,k_start,k_stop,diamo*2);
+        if stopc1 < startc1, [startc1,stopc1] = deal(stopc1,startc1); end
+        if stopc2 < startc2, [startc2,stopc2] = deal(stopc2,startc2); end
+
+        if (circle == 0)
+            roi = vertcat(total1(startc1:stopc1,:), total2(stopc2:-1:startc2,:));
+            if (starti < tip_excl_dist), roi = vertcat(boundb(postotal2(1):postotal1(2),:),roi); end
+            F = poly2mask(roi(:,2),roi(:,1),Esize(1),Esize(2));
+        else
+            maskc = zeros(Esize(1),Esize(2));
+            roi = [linectf(stoppos,1) linectf(stoppos,2)];
+            maskc(roi(1),roi(2)) = 1;
+            F = bwdist(maskc) >= 0.5*circle.*diamo;
+            F = imcomplement(F);
+        end
+
+        if (split == 1)
+            if (circle > 0)
+                stoppos = length(linectf); stopc1 = length(total1); stopc2 = length(total2);
+            end
+            roi1 = vertcat(total1(startc1:stopc1,:), [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
+            roi2 = vertcat(total2(startc2:stopc2,:), [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
+            if (starti < tip_excl_dist)
+                tip_boundpos = dsearchn(boundb, tip_row);
+                roi1 = vertcat(boundb(tip_boundpos:postotal1(2),:),roi1,boundb(tip_boundpos,:));
+                roi2 = vertcat(boundb(tip_boundpos:-1:postotal2(1),:),roi2,boundb(tip_boundpos,:));
+            end
+            F1 = F.*poly2mask(roi1(:,2),roi1(:,1),Esize(1),Esize(2));
+            F2 = F.*poly2mask(roi2(:,2),roi2(:,1),Esize(1),Esize(2));
+        end
+
+        if (max(O(:)) <= 255) FO = uint8(F);
+        else FO = uint16(F);
+        end
+        F = uint16(F);
+
+        intens.Fpixelnum = nnz(O.*FO);
+        intens.intensityM = sum(O(:))/nnz(O);
+        if ~strcmp(mode, 'two_raw')
+            intens.intensityM_F = sum(sum(O.*FO))/intens.Fpixelnum;
+            intens.intensityB1_F = sum(sum(BT1r.*F))/intens.Fpixelnum;
+            if ~isempty(BT2r), intens.intensityB2_F = sum(sum(BT2r.*F))/intens.Fpixelnum; end
+        end
+
+        if (split)
+            if (max(O(:)) <= 255) F1O = uint8(F1); F2O = uint8(F2);
+            else F1O = uint16(F1); F2O = uint16(F2);
+            end
+            F1 = uint16(F1); F2 = uint16(F2);
+            F1_out = F1; F2_out = F2;
+            intens.F1pixelnum = nnz(O.*F1O);
+            intens.F2pixelnum = nnz(O.*F2O);
+            if ~strcmp(mode, 'two_raw')
+                intens.intensityM_F1 = sum(sum(O.*F1O))/intens.F1pixelnum;
+                intens.intensityB1_F1 = sum(sum(BT1r.*F1))/intens.F1pixelnum;
+                if ~isempty(BT2r), intens.intensityB2_F1 = sum(sum(BT2r.*F1))/intens.F1pixelnum; end
+                intens.intensityM_F2 = sum(sum(O.*F2O))/intens.F2pixelnum;
+                intens.intensityB1_F2 = sum(sum(BT1r.*F2))/intens.F2pixelnum;
+                if ~isempty(BT2r), intens.intensityB2_F2 = sum(sum(BT2r.*F2))/intens.F2pixelnum; end
+            end
+        end
+    else
+        intens.intensityM = sum(O(:))/nnz(O);
+    end
+
+    if (pixelsize > 0), cutoffp = dsearchn(distcf',diamcutoff/pixelsize);
+    else, cutoffp = dsearchn(distcf',diamcutoff);
+    end
+    if (cutoffp > 1), xy1(cutoffp-1,:) = []; xy2(cutoffp-1,:) = []; end
+
+    diamf = diag(pdist2(xy1,xy2));
+    diamf_val = sum(diamf)/length(diamf);
+    yctk_out = yctk; xctk_out = xctk;
+end
