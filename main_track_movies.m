@@ -1804,7 +1804,7 @@ end
 % Intensities are mean per non-zero pixel inside each mask.
 % Total signal = mean × pixel_count.
 csv_frames  = (stp:smp)';
-csv_time_s  = csv_frames .* frame_rate;
+csv_time_s  = (csv_frames - 1) .* frame_rate; % Frame 1 = t=0, matching the video overlays
 csv_tip_row = tip_final(stp:smp, 1);
 csv_tip_col = tip_final(stp:smp, 2);
 csv_diam_px = diamf_avg(stp:smp)';
@@ -2018,8 +2018,15 @@ function img = render_growth_frame(U, tip_row, yctk, xctk, F1, F2, ROItype, show
     h = figure('visible', 'off');
     imagesc(image2);
     clim([0 200]);
-    txtstr = strcat('Time(s): ',num2str((count*frame_rate)),'  Frame: ',num2str(count));
-    text(10,10,txtstr,'color','white')
+    % Time and Frame are two SEPARATE text() calls, not one concatenated
+    % string -- Time's own digit count changes over the course of a run,
+    % which shifted a single combined string's "Frame: N" left/right frame
+    % to frame. Frame is right-aligned against the image width so its
+    % position never depends on Time's width.
+    timestr = strcat('Time(s): ',num2str(((count-1)*frame_rate)));
+    framestr = strcat('Frame: ',num2str(count));
+    text(10,10,timestr,'color','white')
+    text(size(image2,2)-10,10,framestr,'color','white','HorizontalAlignment','right')
     set(gca,'xtick',[]); set(gca,'xticklabel',[]); set(gca,'ytick',[]); set(gca,'yticklabel',[]);
     frame = getframe(gcf);
     img = frame.cdata;
@@ -2050,8 +2057,16 @@ function rgb_roi = render_roi_debug_frame(O, U, yctk, xctk, F1, F2, ROItype, sho
     rch(clm) = 255; gch(clm) = 255; bch(clm) = 255;
     rgb_roi = cat(3, rch, gch, bch);
     if exist('insertText','file')
-        txtstr = ['Time(s): ' num2str(count*frame_rate) '  Frame: ' num2str(count)];
-        rgb_roi = insertText(rgb_roi,[5 5],txtstr,'FontSize',8,'TextColor','white','BoxOpacity',0);
+        % Time and Frame are two SEPARATE insertText calls, not one
+        % concatenated string -- Time's own digit count changes over the
+        % course of a run, which shifted a single combined string's
+        % "Frame: N" left/right frame to frame. Frame is right-anchored
+        % (AnchorPoint 'RightTop') so its position never depends on Time's
+        % width.
+        timestr = ['Time(s): ' num2str((count-1)*frame_rate)];
+        framestr = ['Frame: ' num2str(count)];
+        rgb_roi = insertText(rgb_roi,[5 5],timestr,'FontSize',8,'TextColor','white','BoxOpacity',0);
+        rgb_roi = insertText(rgb_roi,[size(rgb_roi,2)-5 5],framestr,'FontSize',8,'TextColor','white','BoxOpacity',0,'AnchorPoint','RightTop');
     end
 end
 

@@ -37,11 +37,21 @@ for count = 1:size(L,3)
     frame_rgb = cat(2, rgb, cb_strip);
 
     % Burn timestamp text (simple pixel-level not needed — use insertText if
-    % available, otherwise skip to avoid figure overhead)
+    % available, otherwise skip to avoid figure overhead). Time and Frame are
+    % two SEPARATE insertText calls, not one concatenated string -- Time's
+    % own digit count changes over the course of a run (e.g. "0.5" ->
+    % "125.0"), which shifted a single combined string's "Frame: N" left/right
+    % frame to frame. Frame is right-anchored (AnchorPoint 'RightTop') against
+    % the IMAGE width specifically (size(rgb,2), before the colourbar strip
+    % is appended below), so it stays pinned clear of the colourbar and its
+    % own position never depends on Time's width.
     if exist('insertText','file')
-        txtstr = ['Time(s): ' num2str((count+stp-1)*timestep) '  Frame: ' num2str(count+stp-1)];
-        frame_rgb = insertText(frame_rgb,[5 5],txtstr,'FontSize',12, ...
+        timestr = ['Time(s): ' num2str((count+stp-2)*timestep)];
+        framestr = ['Frame: ' num2str(count+stp-1)];
+        frame_rgb = insertText(frame_rgb,[5 5],timestr,'FontSize',12, ...
             'TextColor','white','BoxOpacity',0);
+        frame_rgb = insertText(frame_rgb,[size(rgb,2)-5 5],framestr,'FontSize',12, ...
+            'TextColor','white','BoxOpacity',0,'AnchorPoint','RightTop');
     end
 
     writeVideo(V, frame_rgb);
