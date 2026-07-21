@@ -3,6 +3,37 @@ close all
 
 run('run_config.m'); % Per-run parameters (gitignored) — copy from run_config.example.m
 
+% max_tip_jump_um derivation: frame-rate/growth-rate coupled instead of a
+% fixed constant, since real frame rates in use span a 6.7x range (0.15s to
+% 1.0s across datasets characterized this session) and a single fixed-um
+% threshold can't be right for all of them. Defensively defaulted here (not
+% just in run_config.example.m) since existing per-user run_config.m files
+% predate these parameters and won't define them at all. max_tip_jump_um
+% left positive (old-style, e.g. = 15) skips the derivation entirely and is
+% used verbatim everywhere below -- full backward compatibility.
+if ~exist('jitter_margin_um', 'var'), jitter_margin_um = 10; end
+if ~exist('max_growth_rate_um_per_min', 'var'), max_growth_rate_um_per_min = 5; end
+if ~exist('growth_safety_factor', 'var'), growth_safety_factor = 3; end
+if ~exist('max_tip_jump_um', 'var') || isempty(max_tip_jump_um), max_tip_jump_um = -1; end
+if max_tip_jump_um <= 0
+    max_tip_jump_um = jitter_margin_um + (max_growth_rate_um_per_min/60) * growth_safety_factor * frame_rate;
+    if exist('debug_mode', 'var') && debug_mode
+        fprintf('max_tip_jump_um: auto-derived = %.2fum (jitter=%.1f + growth=%.4fum/s * safety=%.1f * frame_rate=%.3fs)\n', ...
+            max_tip_jump_um, jitter_margin_um, max_growth_rate_um_per_min/60, growth_safety_factor, frame_rate);
+    end
+elseif exist('debug_mode', 'var') && debug_mode
+    fprintf('max_tip_jump_um: explicit override = %.2fum (frame-rate derivation skipped)\n', max_tip_jump_um);
+end
+
+% ringwalk tip-seeding defaults (see run_config.example.m for full docs) --
+% defensively defaulted here for the same reason as above: existing
+% run_config.m files predate these and won't define them.
+if ~exist('ringwalk_seed_from_tip', 'var'), ringwalk_seed_from_tip = 0; end
+if ~exist('ringwalk_seed_max_steps', 'var'), ringwalk_seed_max_steps = 30; end
+if ~exist('ringwalk_reanchor_interval', 'var'), ringwalk_reanchor_interval = 50; end
+if ~exist('ringwalk_seed_offset_factor', 'var'), ringwalk_seed_offset_factor = 2.5; end
+if ~exist('ringwalk_fallback_to_skeleton', 'var'), ringwalk_fallback_to_skeleton = 0; end
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Detect input file and select analysis mode
 pathf = path;
@@ -259,7 +290,35 @@ end
 if (distributions), d = 1; end
 U_prev = [];
 right_anchor_row_last = []; % weak_signal border-extension continuity, see below
+frames_since_base_walk = 0; % ringwalk_seed_from_tip only: forces a full base-anchored
+                            % ring_walk_tip walk every ringwalk_reanchor_interval frames
+last_iter_failed = false; % ringwalk_seed_from_tip only, belt-and-suspenders: tip_final_last
+                            % itself is now only ever updated on a GOOD frame (see
+                            % frames_since_last_good below), so this shouldn't be load-bearing
+                            % any more, but costs nothing to keep as an extra guard against a
+                            % seeded walk trusting a just-failed frame's neighborhood.
+frames_since_last_good = 1; % tip_final_last holds the LAST GOOD (non-frame_failed) tip, not
+                            % just the previous frame's -- a failed frame still needs SOME
+                            % numeric tip_final(count,:) for downstream ROI/video code, but
+                            % that value must never become the comparison baseline for the
+                            % NEXT frame's own jump check. Confirmed needed: without this, one
+                            % genuinely bad frame (11, ring_walk_tip teleporting to ~[174 389])
+                            % got its bad position propagated forward as tip_final_last, which
+                            % then made the FOLLOWING frame's own perfectly correct tip
+                            % (~[70 67], matching its real neighbors) look like a huge jump
+                            % relative to that contaminated reference -- a real, correctly-
+                            % tracked frame flagged as collateral damage from a different
+                            % frame's failure. The jump-check threshold scales by this counter
+                            % (max_tip_jump_um * frames_since_last_good) so comparing against
+                            % an N-frames-stale reference allows roughly N frames' worth of
+                            % real growth, not a single frame's budget.
 frame_failed = false(smp, 1);
+% ringwalk_fallback_to_skeleton only: records whether this frame's tip
+% jump-check recovery used the skeleton_tip_fallback candidate (whether or
+% not that candidate ultimately passed the jump check) -- lets the CSV
+% distinguish "fallback tried and failed" from "fallback never applicable"
+% (e.g. tip_method='skeleton', or the frame never failed the jump check).
+tip_recovered_via_skeleton = false(smp, 1);
 % Per-frame triage flag (weak_signal only): does THIS frame's own plain
 % segmentation look severed/noisy/border-touch-failed, reusing the same
 % severed/noisy/border-touch-rate criteria used all session to triage
@@ -522,14 +581,112 @@ for count = smp:-1:stp
             [~, snap] = min(abs(rw_pix - rw_row));
             rw_row = rw_pix(snap);
         end
-        % Cross-frame continuity, mirroring the skeleton method's own use
-        % of tip_final_last/last_flag: gated behind last_flag so it's
-        % never referenced before it's actually assigned (count==smp, the
-        % cold-start reference frame, always has last_flag==0).
-        if last_flag
-            Qef = ring_walk_tip(U, [rw_row, rw_col], 'prev_tip', tip_final_last);
-        else
-            Qef = ring_walk_tip(U, [rw_row, rw_col]);
+
+        % Tip-seeded walk (opt-in, ringwalk_seed_from_tip): start from the
+        % PREVIOUS frame's tip instead of always walking the whole tube from
+        % the base. Shortens the walk, which reduces exposure to
+        % ring_walk_tip's own known failure modes (T-junction misjudgment,
+        % false width-collapse stops) -- both scale with walk length, and a
+        % full base-to-tip walk exposes every frame to them over the WHOLE
+        % tube even though only the last bit actually changed. Confirmed
+        % needed: on 20260327_3_cropped frame 11, a full base walk produced
+        % a catastrophic tip jump (~100+px row, ~320+px col vs. neighbors)
+        % on a frame whose raw image was visually identical to its
+        % neighbors -- a pure algorithmic failure exposed by walking the
+        % entire tube, not a data problem.
+        % Reuses last_flag (Ucount(count)>=0.95, i.e. this frame's mask
+        % overlaps the previous one enough to trust it) as the outer gate --
+        % same signal the codebase already uses to decide tip_final_last is
+        % trustworthy, not a new parallel condition. force_base_walk
+        % periodically forces a full walk regardless, to bound slow
+        % systematic drift that per-frame jump-checking alone can't catch
+        % (each seeded step can look individually fine while still
+        % accumulating error over many consecutive seeded frames).
+        % last_iter_failed additionally blocks seeding right after a
+        % frame_failed frame -- tip_final_last is updated unconditionally
+        % (see its assignment below), so without this a single bad seeded
+        % result cascades into every subsequent frame instead of being
+        % caught and recovered from.
+        force_base_walk = (ringwalk_reanchor_interval > 0) && ...
+                          (frames_since_base_walk >= ringwalk_reanchor_interval);
+        seed_ok = false;
+        if last_flag && ringwalk_seed_from_tip && ~force_base_walk && ~last_iter_failed
+            % Seed point is NOT tip_final_last itself -- it's offset back
+            % (base-ward) from it by ringwalk_seed_offset_factor*diamo along
+            % the tube's own local tangent, then snapped to the nearest real
+            % mask pixel. This fixes a failure the previous approach (seed
+            % exactly at tip_final_last, bias the walk with an estimated
+            % direction) never could: seeded exactly at tip_final_last, real
+            % per-frame growth (~1px on 20260327_3_cropped) leaves almost no
+            % genuine mask beyond it, far short of the ring's own radius
+            % (~0.65*diamo) -- so the ring can't even DETECT a tip-ward
+            % crossing, finds only the base-ward one, and takes it
+            % unconditionally (ring_walk_tip.m: ncomp==1 skips scoring
+            % entirely). No direction estimate, however accurate, can fix a
+            % choice that never gets made. Seeding further back guarantees
+            % real mask on BOTH sides of the first ring, so a genuine
+            % tip-ward candidate actually exists to be selected.
+            dir_vec = local_tip_tangent(U, tip_final_last, diamo);
+            if ~isempty(dir_vec)
+                offset_px = ringwalk_seed_offset_factor * diamo;
+                seed_float = tip_final_last - offset_px * dir_vec; % step base-ward
+                [snap_r, snap_c, snapped] = snap_to_mask(U, seed_float, diamo);
+                if snapped
+                    sw = max(1, round(diamo));
+                    sr0 = max(1, snap_r-sw); sr1 = min(size(U,1), snap_r+sw);
+                    sc0 = max(1, snap_c-sw); sc1 = min(size(U,2), snap_c+sw);
+                    seed_ok = nnz(U(sr0:sr1, sc0:sc1)) >= 3;
+                    if seed_ok, seed_pt = [snap_r, snap_c]; end
+                end
+            end
+        end
+
+        if seed_ok
+            % Disambiguate step 1 with a hard rule instead of an estimated
+            % direction: this pipeline's own crop convention already
+            % guarantees tip-ward = smaller column (every tube enters the
+            % crop from the right border -- see the base-anchor scan just
+            % above), so directly preferring the smaller-column candidate is
+            % both simpler and more robust than scoring against a tangent
+            % estimate that can be thrown off by local curvature right at
+            % the seed. From step 2 on, ring_walk_tip's own
+            % direction-continuity scoring takes over automatically (it
+            % always sets prev_dir from the actual observed move after step
+            % 1), so this only ever affects the single first-step choice.
+            [Qef, rw_walk_path] = ring_walk_tip(U, seed_pt, 'prev_tip', tip_final_last, ...
+                'prefer_smaller_col', true, 'max_steps', ringwalk_seed_max_steps);
+            if size(rw_walk_path,1) <= 1
+                % Seeded walk took zero steps (first ring found nothing) --
+                % don't trust it, fall through to a full base-anchored walk
+                % for this frame instead.
+                seed_ok = false;
+                if debug_mode
+                    fprintf('  ringwalk F%d: seeded walk took 0 steps -- falling back to base walk\n', count);
+                end
+            end
+        end
+
+        if ~seed_ok
+            % Cross-frame continuity, mirroring the skeleton method's own use
+            % of tip_final_last/last_flag: gated behind last_flag so it's
+            % never referenced before it's actually assigned (count==smp, the
+            % cold-start reference frame, always has last_flag==0).
+            if last_flag
+                Qef = ring_walk_tip(U, [rw_row, rw_col], 'prev_tip', tip_final_last);
+            else
+                Qef = ring_walk_tip(U, [rw_row, rw_col]);
+            end
+        end
+
+        % Any base walk (forced, or a seed attempt that fell through) resets
+        % the re-anchor counter; a successful seeded walk advances it.
+        if seed_ok, frames_since_base_walk = frames_since_base_walk + 1;
+        else frames_since_base_walk = 0;
+        end
+        if debug_mode
+            walk_label = 'base'; if seed_ok, walk_label = 'seeded'; end
+            fprintf('  ringwalk F%d: %s (frames_since_base_walk=%d)\n', count, ...
+                walk_label, frames_since_base_walk);
         end
     else
         % Removing branches from thinned image
@@ -597,6 +754,19 @@ for count = smp:-1:stp
     end
 
     [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef);
+    % locate_tip/edge_quant measures diam at a single column (maxy-1, the
+    % tube's crossing into the crop) -- that one column can read
+    % artificially low on a frame-specific segmentation quirk (a marginal
+    % pixel dropout, a slightly different crossing angle) even when the
+    % tube itself looks completely normal, since nothing else about the
+    % frame feeds into it. Overwrite with the same robust multi-column
+    % estimate used for the frozen diamo reference below (see
+    % robust_diam), so the diam_tol check compares like-for-like instead
+    % of a robust reference against one noisy per-frame sample. Confirmed
+    % false-positive on 20260327_3_cropped frames 53/57: diam=19px vs
+    % diamo=45px flagged both as failures, but growth.mp4 shows nothing
+    % unusual at either frame.
+    diam = robust_diam(U, size(U,2) - 1, diam, count, debug_mode);
     tip_ellipsepos = dsearchn(boundb,tip_ellipse);
     tip_ellipsef = boundb(tip_ellipsepos,:);
     % Reset every iteration (not auto-cleared by the loop) so the
@@ -620,69 +790,13 @@ for count = smp:-1:stp
     end
 
     if (count == smp)
-        % Single-column diam (measured at maxy-1 by locate_tip/edge_quant)
-        % underestimates the true diameter on weak-signal stacks: that
-        % column sits right where the tube crosses into the frame, which
-        % is where segmentation is most marginal. Average the cross-
-        % sectional span over several columns moving inward from the edge
-        % instead of trusting one column. Verified on HV202_2_11 frame
-        % 623: single-column=17px vs multi-column mean=20.3px.
-        ref_col = size(U,2) - 1; % same column locate_tip/edge_quant uses
-        diamo_samples = [];
-        for doff = 0:5:50
-            dcol = ref_col - doff;
-            if dcol < 1, break; end
-            drows = find(U(:,dcol));
-            if ~isempty(drows)
-                % Largest contiguous run, not the full row span: a small
-                % disconnected speck elsewhere in the same column (weak_signal's
-                % rescue logic can leave these) would otherwise inflate the
-                % span-based width several-fold. Confirmed on 20260327_2 frame
-                % 500: true tube run ~81px, full span 386px because of three
-                % stray 5px specks in the same column -- fed a bogus diamo=356
-                % into ws_smooth_r, which then collapsed the reference mask
-                % from 38244px to 9px and broke almost every later frame.
-                gaps = find(diff(drows) > 1);
-                run_starts = [drows(1); drows(gaps+1)];
-                run_ends = [drows(gaps); drows(end)];
-                diamo_samples(end+1) = max(run_ends - run_starts) + 1;
-            end
-        end
-        if ~isempty(diamo_samples)
-            % Median, not mean: doff=0 (the column closest to the crop edge)
-            % is the sample most exposed to border artifacts (e.g. a
-            % genuine but localised thickening right where the tube meets
-            % the crop boundary -- see session notes on HV197_4_19 frame
-            % 2015). A single inflated sample pulls the mean proportionally;
-            % median ignores it as long as fewer than half the samples are
-            % affected, at no cost when the samples are well-behaved.
-            diamo = median(diamo_samples);
-        else
-            diamo = diam; % fallback if no columns had any mask pixels
-        end
-        % The column-scan above assumes the tube crosses these columns close
-        % to perpendicular -- when it instead meets the border at a shallow/
-        % diagonal angle, a vertical slice measures a much longer span than
-        % the tube's true cross-section (confirmed on 20260327_2 frame 500:
-        % tube runs diagonally, column-scan gave ~356px against a true
-        % ~80-100px width). Cross-check against Area/MajorAxisLength -- the
-        % same width proxy already used in signal_threshold.m for bent/
-        % diagonal shapes -- and fall back to it if the column-scan estimate
-        % looks implausibly large.
-        rp_diamo = regionprops(U, 'Area', 'MajorAxisLength');
-        if ~isempty(rp_diamo) && rp_diamo(1).MajorAxisLength > 0
-            diamo_axis = rp_diamo(1).Area / rp_diamo(1).MajorAxisLength;
-            if diamo > 1.5 * diamo_axis
-                if debug_mode
-                    fprintf('  diamo F%d: column-scan=%.1fpx implausible vs Area/MajorAxisLength=%.1fpx -- using axis estimate\n', ...
-                        count, diamo, diamo_axis);
-                end
-                diamo = diamo_axis;
-            end
-        end
+        % diam is already the robust multi-column estimate by this point
+        % (see robust_diam, applied right after locate_tip above) -- the
+        % frozen reference is just that same value, no separate column-scan
+        % needed here anymore.
+        diamo = diam;
         if debug_mode
-            fprintf('  diamo F%d: single-col=%.1fpx multi-col-median=%.1fpx (n=%d cols) samples=%s\n', ...
-                count, diam, diamo, numel(diamo_samples), mat2str(diamo_samples));
+            fprintf('  diamo F%d: using robust diam=%.1fpx as frozen reference\n', count, diamo);
         end
         % weak_signal only: finalize the reference mask now that diamo is
         % known -- heavily smoothed (despike+debay, same operation as every
@@ -866,20 +980,40 @@ for count = smp:-1:stp
     end
     end
 
-    % Tip-position sanity check (weak_signal only): a real tube tip cannot
-    % jump implausibly far between adjacent frames. Empirically calibrated,
-    % not growth-rate-derived: frame-to-frame tip displacement was measured
-    % on 3 real datasets (~6500 transitions total) -- genuine growth+jitter
-    % never exceeded ~9.7um on two clean datasets, while a third (known
-    % segmentation failures, e.g. the mask splitting the tube in two) showed
-    % a sharp gap in the distribution: nothing between ~5um and ~41um, with
-    % ~2% of frames landing at 65-69um. 15um sits in the middle of that gap
-    % -- same flagging result (0 false positives on the clean datasets, ~68
-    % frames flagged on the bad one) at any threshold from 10 to 30um, so
-    % the exact value isn't sensitive. See session notes for the analysis.
-    if weak_signal && last_flag && pixelsize > 0
+    % Tip-position sanity check: a real tube tip cannot jump implausibly far
+    % between adjacent frames. Unconditional -- applies regardless of
+    % weak_signal (this is a "did the tip physically teleport" check, a
+    % different concern from weak_signal's "is the mask fragmented") and
+    % identically to both tip_method values (this check sits after both the
+    % ringwalk and skeleton branches have already converged on
+    % tip_final(count,:), so no method-specific handling is needed here).
+    % Confirmed needed with weak_signal=0: ring_walk_tip produced a
+    % catastrophic single-frame tip jump on 20260327_3_cropped frame 11
+    % (~100+px row, ~320+px col vs. neighbors) that went completely
+    % unflagged while this check was gated behind weak_signal, even though
+    % the raw image data for that frame was visually identical to its
+    % neighbors -- a pure tracking-algorithm failure, exactly what this
+    % check exists to catch.
+    % max_tip_jump_um itself is frame-rate/growth-rate derived when left at
+    % its default -- see the derivation block near the top of this script.
+    % Threshold empirically calibrated (jitter_margin_um component): frame-
+    % to-frame tip displacement was measured on 3 real datasets (~6500
+    % transitions total) -- genuine growth+jitter never exceeded ~9.7um on
+    % two clean datasets, while a third (known segmentation failures, e.g.
+    % the mask splitting the tube in two) showed a sharp gap in the
+    % distribution: nothing between ~5um and ~41um, with ~2% of frames
+    % landing at 65-69um. 15um sits in the middle of that gap -- same
+    % flagging result (0 false positives on the clean datasets, ~68 frames
+    % flagged on the bad one) at any threshold from 10 to 30um, so the
+    % exact value isn't sensitive. See session notes for the analysis.
+    if last_flag && pixelsize > 0
         tip_jump_um = pdist2(tip_final(count,:), tip_final_last) * pixelsize;
-        if tip_jump_um > max_tip_jump_um
+        % Threshold scales by frames_since_last_good: tip_final_last is the
+        % LAST GOOD tip, which may be several frames stale if recent frames
+        % failed -- comparing against a stale reference must allow roughly
+        % that many frames' worth of real growth, not a single frame's
+        % budget (see frames_since_last_good's declaration comment).
+        if tip_jump_um > max_tip_jump_um * frames_since_last_good
             % The chosen candidate is implausibly far -- before giving up,
             % check whether one of the OTHER candidates this same frame
             % already produced (ellipsef/skel/mid, whichever this code path
@@ -898,13 +1032,40 @@ for count = smp:-1:stp
             cand = tip_ellipsef; cand_label = {'ellipsef'};
             if ~isempty(tip_skel), cand = [cand; tip_skel]; cand_label{end+1} = 'skel'; end
             if ~isempty(tip_mid),  cand = [cand; tip_mid];  cand_label{end+1} = 'mid';  end
+            % Cross-method fallback (ringwalk only): tip_skel/tip_mid above
+            % are only ever populated when tip_method='skeleton' natively
+            % runs, so a failing ringwalk frame otherwise has just ONE
+            % candidate (ellipsef) to recover from. Retry this SAME frame
+            % with the skeleton method's own logic and add its result to
+            % the pool -- see skeleton_tip_fallback's doc comment for why
+            % this is a self-contained duplicate, not a refactor.
+            fb_ok = false;
+            if strcmp(tip_method, 'ringwalk') && ringwalk_fallback_to_skeleton
+                [fb_tip, fb_diam, fb_maxy, fb_boundb, fb_Qef, fb_Qel, fb_Qec, ...
+                 fb_tip_ellipse, fb_center, fb_phin, fb_axes, fb_stats, fb_edges, fb_ok] = ...
+                    skeleton_tip_fallback(U, weight, diamo, tip_final_last, last_flag, count, debug_mode);
+                if fb_ok && ~isempty(fb_tip)
+                    cand = [cand; fb_tip]; cand_label{end+1} = 'skeleton_fallback';
+                end
+            end
             cand_dist_px = pdist2(cand, tip_final_last);
             [best_dist_px, best_idx] = min(cand_dist_px);
-            if best_dist_px * pixelsize <= max_tip_jump_um
+            if strcmp(cand_label{best_idx}, 'skeleton_fallback')
+                diam = fb_diam; maxy = fb_maxy; boundb = fb_boundb; Qef = fb_Qef;
+                Qel = fb_Qel; Qec = fb_Qec; tip_ellipse = fb_tip_ellipse;
+                center = fb_center; phin = fb_phin; axes = fb_axes; stats = fb_stats; edges = fb_edges;
+                tip_recovered_via_skeleton(count) = true;
+            end
+            if best_dist_px * pixelsize <= max_tip_jump_um * frames_since_last_good
                 tip_final(count,:) = cand(best_idx,:);
                 if debug_mode
-                    fprintf('  tip F%d: original jump=%.2fum > %.1fum -- recovered via %s candidate (jump=%.2fum)\n', ...
-                        count, tip_jump_um, max_tip_jump_um, cand_label{best_idx}, best_dist_px*pixelsize);
+                    if strcmp(cand_label{best_idx}, 'skeleton_fallback')
+                        fprintf('  tip F%d: original jump=%.2fum > %.1fum -- recovered via SKELETON FALLBACK (jump=%.2fum)\n', ...
+                            count, tip_jump_um, max_tip_jump_um * frames_since_last_good, best_dist_px*pixelsize);
+                    else
+                        fprintf('  tip F%d: original jump=%.2fum > %.1fum -- recovered via %s candidate (jump=%.2fum)\n', ...
+                            count, tip_jump_um, max_tip_jump_um * frames_since_last_good, cand_label{best_idx}, best_dist_px*pixelsize);
+                    end
                 end
             else
                 % No candidate this frame produced is plausible either.
@@ -915,8 +1076,8 @@ for count = smp:-1:stp
                 tip_final(count,:) = cand(best_idx,:);
                 frame_failed(count) = true;
                 if debug_mode
-                    fprintf('  tip F%d: jump=%.2fum > max_tip_jump_um=%.1fum, no candidate within range (best=%.2fum via %s) -- flagged, results NaN''d\n', ...
-                        count, tip_jump_um, max_tip_jump_um, best_dist_px*pixelsize, cand_label{best_idx});
+                    fprintf('  tip F%d: jump=%.2fum > max_tip_jump_um=%.1fum (frames_since_last_good=%d), no candidate within range (best=%.2fum via %s) -- flagged, results NaN''d\n', ...
+                        count, tip_jump_um, max_tip_jump_um * frames_since_last_good, frames_since_last_good, best_dist_px*pixelsize, cand_label{best_idx});
                 end
             end
         end
@@ -926,9 +1087,22 @@ for count = smp:-1:stp
         U_cache{count} = U;
     end
 
-    % Update tip_final for the next frame
-    tip_final_last(:,:) = tip_final(count,:);
-    
+    % Update tip_final for the next frame. tip_final_last only ever advances
+    % to a GOOD (non-frame_failed) tip -- see frames_since_last_good's
+    % declaration comment for why. Still force the update on the very
+    % first-ever iteration regardless of frame_failed (rare, but possible
+    % if e.g. diam_tol itself flags the cold-start frame): tip_final_last
+    % must exist by the time any later iteration's last_flag branch reads
+    % it, via (:,:) assignment which auto-creates on first use (a plain
+    % read of a never-yet-assigned tip_final_last would error).
+    if ~frame_failed(count) || ~exist('tip_final_last', 'var')
+        tip_final_last(:,:) = tip_final(count,:);
+        frames_since_last_good = 1;
+    else
+        frames_since_last_good = frames_since_last_good + 1;
+    end
+    last_iter_failed = frame_failed(count); % see ringwalk seed-validity gate above
+
     % Find the curves along the sides of the tubes
     total1 = []; total2 = [];
     range1 = ceil(length(boundb)*0.5):length(boundb);
@@ -1811,6 +1985,13 @@ csv_diam_px = diamf_avg(stp:smp)';
 csv_diam_um = csv_diam_px .* pixelsize;
 csv_wtmean  = intensityM(stp:smp)';
 csv_overlap = Ucount(stp:smp)';
+% ringwalk_fallback_to_skeleton only: 1 if this row's tip came from
+% skeleton_tip_fallback (whether or not it ultimately passed the jump
+% check), 0 otherwise. NOT NaN'd for frame_failed rows below -- distinct
+% from the measurement columns, this should still record that recovery was
+% attempted/used even when the frame is still flagged, so the CSV
+% distinguishes "fallback tried and failed" from "fallback never applicable".
+csv_fb_used = double(tip_recovered_via_skeleton(stp:smp));
 
 if (ROItype > 0)
     csv_roi_npx   = Fpixelnum(stp:smp)';
@@ -1830,29 +2011,29 @@ if (ROItype > 0)
                   csv_diam_px, csv_diam_um, csv_overlap, csv_wtmean, ...
                   csv_roi_npx, csv_roi_mean, csv_roi_total, ...
                   csv_h1_npx, csv_h1_mean, csv_h1_total, ...
-                  csv_h2_npx, csv_h2_mean, csv_h2_total, csv_ratio_h2h1, ...
+                  csv_h2_npx, csv_h2_mean, csv_h2_total, csv_ratio_h2h1, csv_fb_used, ...
                   'VariableNames', { ...
                   'Frame', 'Time_s', 'Tip_row_px', 'Tip_col_px', ...
                   'Diameter_px', 'Diameter_um', 'Frame_overlap_ratio', 'WholeTube_mean_intensity', ...
                   'ROI_pixel_count', 'ROI_mean_intensity', 'ROI_total_signal', ...
                   'Half1_pixel_count', 'Half1_mean_intensity', 'Half1_total_signal', ...
                   'Half2_pixel_count', 'Half2_mean_intensity', 'Half2_total_signal', ...
-                  'Ratio_Half2_Half1'});
+                  'Ratio_Half2_Half1', 'Tip_skeleton_fallback_used'});
     else
         T = table(csv_frames, csv_time_s, csv_tip_row, csv_tip_col, ...
                   csv_diam_px, csv_diam_um, csv_overlap, csv_wtmean, ...
-                  csv_roi_npx, csv_roi_mean, csv_roi_total, ...
+                  csv_roi_npx, csv_roi_mean, csv_roi_total, csv_fb_used, ...
                   'VariableNames', { ...
                   'Frame', 'Time_s', 'Tip_row_px', 'Tip_col_px', ...
                   'Diameter_px', 'Diameter_um', 'Frame_overlap_ratio', 'WholeTube_mean_intensity', ...
-                  'ROI_pixel_count', 'ROI_mean_intensity', 'ROI_total_signal'});
+                  'ROI_pixel_count', 'ROI_mean_intensity', 'ROI_total_signal', 'Tip_skeleton_fallback_used'});
     end
 else
     T = table(csv_frames, csv_time_s, csv_tip_row, csv_tip_col, ...
-              csv_diam_px, csv_diam_um, csv_overlap, csv_wtmean, ...
+              csv_diam_px, csv_diam_um, csv_overlap, csv_wtmean, csv_fb_used, ...
               'VariableNames', { ...
               'Frame', 'Time_s', 'Tip_row_px', 'Tip_col_px', ...
-              'Diameter_px', 'Diameter_um', 'Frame_overlap_ratio', 'WholeTube_mean_intensity'});
+              'Diameter_px', 'Diameter_um', 'Frame_overlap_ratio', 'WholeTube_mean_intensity', 'Tip_skeleton_fallback_used'});
 end
 writetable(T, fullfile(outpath, [fname '_measurements.csv']));
 disp(['CSV saved: ' fullfile(outpath, [fname '_measurements.csv'])]);
@@ -1922,6 +2103,160 @@ if (workspace) save([outpath '/' fname '_result.mat']); end
 % after bwareaopen) would otherwise already have discarded the fragment
 % before the later, imclose-stage check ever got a chance to see it.
 % ============================================================================
+
+% ============================================================================
+% Local tip-ward tangent for ring_walk_tip seed placement (ringwalk_seed_from_tip):
+% fits the tube's own LOCAL direction from the current frame's own skeleton
+% near the seed point, via PCA over a small window -- not from tip-history
+% (too noisy when real per-frame growth is only ~1px) or a base-to-seed
+% chord (wrong on a curved tube: the chord's direction can differ a lot from
+% the tube's actual local path there). Used only to pick WHERE to place the
+% offset seed point (walk back along this axis from tip_final_last, then
+% snap to the mask -- see snap_to_mask below and the seeding block in the
+% main loop); the walk's own first-step direction choice is resolved
+% separately, by a hard smaller-column rule (ring_walk_tip's
+% prefer_smaller_col), not by this tangent -- an earlier version tried using
+% this tangent AS the direction estimate directly and it made no difference
+% either way, since the real problem was the seed point itself (see
+% ringwalk_seed_from_tip's doc comment in run_config.example.m).
+%
+% A tangent line has no direction, only an axis -- sign is fixed using this
+% pipeline's own established convention (see the ringwalk base-anchor scan
+% in the main loop, which already assumes every tube crosses the crop's
+% RIGHT border): smaller column is tip-ward, larger column is base-ward.
+% Picking which SIDE of an axis is correct is a far coarser, easier
+% question than getting the axis's precise angle right, so this convention
+% (already relied on everywhere else ringwalk anchors itself) is a safe way
+% to resolve it.
+%
+% Returns [] when a reliable tangent can't be fit (too few local skeleton
+% pixels), so the caller can skip seeding for this frame and fall back to a
+% full base-anchored walk instead.
+% ============================================================================
+function dir_vec = local_tip_tangent(U, seed, diamo_est)
+    dir_vec = [];
+    [rows, cols] = size(U);
+    r = round(seed(1)); c = round(seed(2));
+    win = max(3, round(1.5 * diamo_est));
+    r0 = max(1, r-win); r1 = min(rows, r+win);
+    c0 = max(1, c-win); c1 = min(cols, c+win);
+    sub = U(r0:r1, c0:c1);
+    skel = bwmorph(sub, 'skel', Inf);
+    [sr, sc] = find(skel);
+    if numel(sr) < 3
+        return; % too few local skeleton points to fit a reliable tangent
+    end
+    pts = double([sr, sc]);
+    pts = pts - mean(pts, 1);
+    [~, ~, V] = svd(pts, 0);
+    tangent = V(:,1)'; % [drow dcol], principal (largest-variance) direction -- sign arbitrary
+    if tangent(2) > 0
+        % This pipeline's tubes always enter from the right border (see the
+        % base-anchor scan in the main loop) -- smaller column is tip-ward.
+        tangent = -tangent;
+    end
+    dir_vec = tangent;
+end
+
+% Robust cross-sectional width estimate, replacing locate_tip/edge_quant's
+% single-column reading (at ref_col, the tube's crossing into the crop) --
+% that one column can read artificially low on a frame-specific
+% segmentation quirk (a marginal pixel dropout, a slightly different
+% crossing angle) even when the tube itself looks completely normal in the
+% actual footage, since nothing else about the frame feeds into a
+% single-column read. Median over several columns stepping inward absorbs
+% one bad column without hiding a real, sustained taper (same reasoning as
+% the old diamo-only version of this logic, now applied to every frame's
+% `diam` too -- see main loop and find_tip_and_measure). Verified needed:
+% frames 53/57 of 20260327_3_cropped read diam=19px vs a diamo=45px
+% reference and got NaN'd by diam_tol, despite looking unremarkable in
+% growth.mp4 -- both are single-column artifacts, not real width changes.
+%
+% fallback_val is used only if every sampled column is empty (no mask
+% pixels at all near the border that frame) -- pass the raw locate_tip
+% diam as fallback, same as the original diamo cold-start logic did.
+function d = robust_diam(U, ref_col, fallback_val, count, debug_mode)
+    samples = [];
+    for doff = 0:5:50
+        dcol = ref_col - doff;
+        if dcol < 1, break; end
+        drows = find(U(:,dcol));
+        if ~isempty(drows)
+            % Largest contiguous run, not the full row span: a small
+            % disconnected speck elsewhere in the same column (weak_signal's
+            % rescue logic can leave these) would otherwise inflate the
+            % span-based width several-fold. Confirmed on 20260327_2 frame
+            % 500: true tube run ~81px, full span 386px because of three
+            % stray 5px specks in the same column -- fed a bogus diamo=356
+            % into ws_smooth_r, which then collapsed the reference mask
+            % from 38244px to 9px and broke almost every later frame.
+            gaps = find(diff(drows) > 1);
+            run_starts = [drows(1); drows(gaps+1)];
+            run_ends = [drows(gaps); drows(end)];
+            samples(end+1) = max(run_ends - run_starts) + 1; %#ok<AGROW>
+        end
+    end
+    if ~isempty(samples)
+        % Median, not mean: doff=0 (the column closest to the crop edge) is
+        % the sample most exposed to border artifacts (e.g. a genuine but
+        % localised thickening right where the tube meets the crop boundary
+        % -- see session notes on HV197_4_19 frame 2015). A single inflated
+        % sample pulls the mean proportionally; median ignores it as long as
+        % fewer than half the samples are affected, at no cost when the
+        % samples are well-behaved.
+        d = median(samples);
+    else
+        d = fallback_val;
+    end
+    % The column-scan above assumes the tube crosses these columns close to
+    % perpendicular -- when it instead meets the border at a shallow/
+    % diagonal angle, a vertical slice measures a much longer span than the
+    % tube's true cross-section (confirmed on 20260327_2 frame 500: tube
+    % runs diagonally, column-scan gave ~356px against a true ~80-100px
+    % width). Cross-check against Area/MajorAxisLength -- the same width
+    % proxy already used in signal_threshold.m for bent/diagonal shapes --
+    % and fall back to it if the column-scan estimate looks implausibly
+    % large.
+    rp = regionprops(U, 'Area', 'MajorAxisLength');
+    if ~isempty(rp) && rp(1).MajorAxisLength > 0
+        d_axis = rp(1).Area / rp(1).MajorAxisLength;
+        if d > 1.5 * d_axis
+            if debug_mode
+                fprintf('  diam F%d: column-scan=%.1fpx implausible vs Area/MajorAxisLength=%.1fpx -- using axis estimate\n', ...
+                    count, d, d_axis);
+            end
+            d = d_axis;
+        end
+    end
+end
+
+% Snaps a float point (e.g. an offset seed computed along an estimated
+% tangent, which won't generally land exactly on a mask pixel, especially
+% once the tube curves over the offset distance) to the nearest actual TRUE
+% pixel of U within a diamo-scaled search window. Returns snapped=false if
+% no mask pixel is found in that window at all (e.g. the offset walked off
+% the tube entirely, or off the edge of the frame) -- caller should treat
+% that as "seeding not possible this frame" and fall back to a base walk.
+function [r, c, snapped] = snap_to_mask(U, pt, diamo_est)
+    r = NaN; c = NaN; snapped = false;
+    [rows, cols] = size(U);
+    win = max(3, round(1.5 * diamo_est));
+    r0 = max(1, round(pt(1))-win); r1 = min(rows, round(pt(1))+win);
+    c0 = max(1, round(pt(2))-win); c1 = min(cols, round(pt(2))+win);
+    if r0 > r1 || c0 > c1
+        return;
+    end
+    sub = U(r0:r1, c0:c1);
+    [ys, xs] = find(sub);
+    if isempty(ys)
+        return;
+    end
+    d = hypot(double(ys) + r0 - 1 - pt(1), double(xs) + c0 - 1 - pt(2));
+    [~, k] = min(d);
+    r = ys(k) + r0 - 1;
+    c = xs(k) + c0 - 1;
+    snapped = true;
+end
 
 function U = keep_and_bridge_blobs(U_in, diamo_est, U_smp, debug_mode, count)
     cc = bwconncomp(U_in);
@@ -2228,6 +2563,198 @@ function U = build_repaired_mask(U0, U_smp, prev_tip, max_tip_jump_um, pixelsize
     end
 end
 
+% Cross-method fallback (ringwalk_fallback_to_skeleton): retries a SINGLE
+% frame using the skeleton method's own Qef/branch-removal/voting logic,
+% for when tip_method='ringwalk' produces a tip that fails the jump-check
+% (main loop, ~line 1000) and has no other same-frame candidate to recover
+% from (tip_skel/tip_mid are only ever populated when tip_method='skeleton'
+% natively runs). A self-contained duplicate of the primary skeleton path
+% (main loop, ~lines 692-980) -- deliberately NOT refactored into a shared
+% function with that path or with find_tip_and_measure's own near-identical
+% copy (the forward repair pass), so neither of those already-verified
+% paths carries any regression risk from this addition. Confirmed needed
+% on 20260327_3_cropped (ringwalk_seed_from_tip=1): frames 63/97/134 hit a
+% sharp bend where ring_walk_tip's direction-continuity scoring picks the
+% wrong branch with a clear margin, and had no rescue candidate available.
+%
+% Returns ok=false (tip_out=[]) if the computation raises -- this only ever
+% runs on already-anomalous frames (sharp bends, marginal masks), exactly
+% where branch_removal/dsearchn are most likely to hit an edge case, and
+% must never crash a run that would otherwise have just NaN'd one frame.
+function [tip_out, diam_out, maxy_out, boundb_out, Qef_out, Qel_out, Qec_out, ...
+          tip_ellipse_out, center_out, phin_out, axes_out, stats_out, edges_out, ok] = ...
+    skeleton_tip_fallback(U, weight, diamo, tip_final_last, last_flag, count, debug_mode)
+
+    tip_out = []; diam_out = []; maxy_out = []; boundb_out = []; Qef_out = [];
+    Qel_out = []; Qec_out = []; tip_ellipse_out = []; center_out = []; phin_out = [];
+    axes_out = []; stats_out = []; edges_out = []; ok = false;
+
+    try
+        % Removing branches from thinned image (same as main loop's skeleton branch)
+        Q = bwmorph(U,'thin',Inf);
+
+        Qe = bwmorph(Q,'endpoints');
+        [Qer,Qec] = find(Qe > 0);
+        Qel = [Qer Qec];
+
+        Qb = bwmorph(Q,'branchpoints');
+        [Qbr,Qbc] = find(Qb > 0);
+        if (Qbr > 0)
+            Qbf = [Qbr Qbc];
+            [Q2, Qef, tmp] = branch_removal(Q,Qbf,Qel,0,1);
+        else
+            Q2 = Q;
+            [tmp,Qepos] = max(Qec);
+            Qef = Qel;
+            Qef(Qepos,:) = [];
+        end
+        if isempty(Qef) && ~isempty(Qel)
+            [~, Qepos] = max(Qel(:,2));
+            Qef = Qel(Qepos,:);
+        end
+
+        % Finding the radius for ellipse fitting -- re-run here since it
+        % depends on THIS call's own Qef, not the primary method's.
+        tols = 0; rad=1;
+        while (tols == 0)
+            sides = false; connect = false;
+            try
+                K = U(Qef(1)-rad:Qef(1)+rad,Qef(2)-rad:Qef(2)+rad);
+            catch
+                rad = 100;
+                tols = 40;
+                break;
+            end
+            Ke = [K(:,1)' K(end,2:end) K(end-1:-1:1,end)' K(1,end-1:-1:2)];
+            Kd = diff(Ke);
+            Kd(end+1) = Ke(1) - Ke(end);
+            if (nnz(Kd) == 2) connect = true; end
+            Ks = [sum(K(:,1)) sum(K(1,:)) sum(K(:,end)) sum(K(end,:))];
+            if (nnz(Ks) <= 2)
+                bou = bwboundaries(K);
+                if ~isempty(bou)
+                    Kb = bou{1};
+                    Kbl = [find(Kb(:,1) == 1); find(Kb(:,2) == 1); find(Kb(:,1) == size(K,1)); find(Kb(:,2) == size(K,1))];
+                    if (size(Kbl,1) < size(K,1)) sides = true; end
+                end
+            end
+            if(connect == true && sides == true) tols = rad; end
+            rad = rad + 1;
+        end
+
+        [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef);
+        diam = robust_diam(U, size(U,2) - 1, diam, count, debug_mode);
+        tip_ellipsepos = dsearchn(boundb,tip_ellipse);
+        tip_ellipsef = boundb(tip_ellipsepos,:);
+
+        S = bwmorph(U,'skel',Inf);
+        Se = bwmorph(S,'endpoints');
+        [Ser,Sec] = find(Se > 0);
+        Sel = [Ser Sec];
+
+        Sb = bwmorph(S,'branchpoints');
+        [Sbr,Sbc] = find(Sb > 0);
+        Sbl = [Sbr Sbc];
+
+        tip_skel = []; tip_mid = [];
+
+        if isempty(Sbl)
+            S2 = S; S2area = 1;
+            [~, base_pos] = max(Sel(:,2));
+            Sef = Sel; Sef(base_pos,:) = [];
+        else
+            if (last_flag == 0) Sbf = Sbl(dsearchn(Sbl,Qef),:);
+            else [tmp, Sbmin] = min(pdist2(Sbl,tip_final_last) + pdist2(Sbl,Qef));
+                Sbf = Sbl(Sbmin,:);
+            end
+
+            close_dist = 0;
+            if (pdist2(Qef,Sbf) > weight*diamo) close_dist = 1; end
+            if (weight == 0) kill_angle = 0;
+            else kill_angle = 75;
+            end
+            [S2,Sef,S2area] = branch_removal(S,Sbf,Sel,kill_angle,close_dist);
+        end
+
+        if (size(Sef,1) > 1)
+            if size(Sef,1) > 2
+                d_to_ellipse = pdist2(Sef, tip_ellipsef);
+                [~, order] = sort(d_to_ellipse);
+                Sef = Sef(order(1:2),:);
+            end
+            [tmp, skel_ellipsepos] = min(pdist2(Sef,tip_ellipsef));
+            if (last_flag == 1)
+                [tmp, skel_lastpos] = min(pdist2(Sef,tip_final_last));
+                if ((skel_lastpos+skel_ellipsepos+1) > 4) choice = 2; else choice = 1; end
+            else
+                choice = skel_ellipsepos;
+            end
+
+            tip_choice = [dsearchn(boundb,Sef(1,:));dsearchn(boundb,Sef(2,:))];
+            if (min(tip_choice) == tip_choice(2)) S2area = 1/S2area; end
+            tip_skelpos = tip_choice(choice);
+            tip_skel = boundb(tip_skelpos,:);
+
+            cn = 0; tip_angle = [];
+            for i = min(tip_choice):max(tip_choice)
+                cn = cn+1;
+                tip_angle(cn) = atan2((boundb(i,2) - Sbf(2)),(boundb(i,1) - Sbf(1)));
+                if (pi - abs(max(tip_angle)) < abs(min(tip_angle)))
+                    if (tip_angle(cn) < 0) tip_angle(cn) = 2*pi + tip_angle(cn); end
+                end
+            end
+            target_angle = (tip_angle(1) + tip_angle(end)*S2area)/(S2area+1);
+
+            tip_anglediff = abs(tip_angle - target_angle);
+            [tmp, tip_anglepos] = min(tip_anglediff);
+            tip_midpos = tip_anglepos+min(tip_choice)-1;
+            tip_mid = boundb(tip_midpos,:);
+
+            tip_range_tol = 2;
+            if (tip_ellipsepos>min(tip_choice)-tip_range_tol && tip_ellipsepos<max(tip_choice)+tip_range_tol)
+                tip_final_fb = tip_ellipsef;
+                if debug_mode
+                    fprintf('  [fallback] tip F%d: branched choice=%d ellipsepos=%d in range -> ellipsef\n', count, choice, tip_ellipsepos);
+                end
+            else
+                tip_ellipsedist = [pdist2(tip_ellipsef,tip_mid) pdist2(tip_ellipsef,tip_skel)];
+                if (last_flag)
+                    tip_finaldist = [pdist2(tip_final_last,tip_mid) pdist2(tip_final_last,tip_skel)];
+                    [tmp, tip_finalpos] = min([(1-0.33)*tip_finaldist(1)+0.33*tip_ellipsedist(1) (1-0.33)*tip_finaldist(2)+0.33*tip_ellipsedist(2)]);
+                else
+                    [tmp, tip_finalpos] = min(tip_ellipsedist);
+                end
+                if (tip_finalpos == 1) tip_final_fb = tip_mid; else tip_final_fb = tip_skel; end
+                if debug_mode
+                    srclabel = 'skel'; if (tip_finalpos==1), srclabel = 'mid'; end
+                    fprintf('  [fallback] tip F%d: branched choice=%d ellipsepos=%d NOT in range -> %s\n', count, choice, tip_ellipsepos, srclabel);
+                end
+            end
+        else
+            tip_skel = boundb(dsearchn(boundb,Sef(1,:)),:);
+            if (last_flag) [tmp, tip_finaldistpos] = min([pdist2(tip_final_last,tip_ellipsef) pdist2(tip_final_last,tip_skel)]);
+            else tip_finaldistpos = 2;
+            end
+            if (tip_finaldistpos == 1) tip_final_fb = tip_ellipsef; else tip_final_fb = tip_skel; end
+            if debug_mode
+                srclabel = 'skel'; if (tip_finaldistpos==1), srclabel = 'ellipsef'; end
+                fprintf('  [fallback] tip F%d: unbranched last_flag=%d -> %s\n', count, last_flag, srclabel);
+            end
+        end
+
+        tip_out = tip_final_fb; diam_out = diam; maxy_out = maxy; boundb_out = boundb;
+        Qef_out = Qef; Qel_out = Qel; Qec_out = Qec; tip_ellipse_out = tip_ellipse;
+        center_out = center; phin_out = phin; axes_out = axes; stats_out = stats; edges_out = edges;
+        ok = true;
+    catch err
+        if debug_mode
+            fprintf('  [fallback] tip F%d: skeleton_tip_fallback raised (%s) -- not used\n', count, err.message);
+        end
+        ok = false;
+        tip_out = [];
+    end
+end
+
 function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_smooth_out] = find_tip_and_measure(count, U, prev_tip, ...
         weight, diamo, tip_method, pixelsize, ROItype, split, circle, starti, stopi, ...
         diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um)
@@ -2295,6 +2822,10 @@ function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_
     end
 
     [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef);
+    % Same robust-diam overwrite as the reverse pass (see main loop) -- keeps
+    % the tolerance check below comparing like-for-like instead of a robust
+    % diamo reference against one noisy single-column per-frame sample.
+    diam = robust_diam(U, size(U,2) - 1, diam, count, debug_mode);
     tip_ellipsepos = dsearchn(boundb,tip_ellipse);
     tip_ellipsef = boundb(tip_ellipsepos,:);
 

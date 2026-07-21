@@ -51,6 +51,40 @@ function [tip_final, walk_path] = ring_walk_tip(U, anchor, varargin)
 %                  own branch-choice voting already uses tip_final_last;
 %                  ring_walk_tip had no cross-frame memory at all before
 %                  this parameter existed.
+%   prefer_smaller_col  when true, step 1's cold-start tiebreak (prev_dir
+%                  still empty, so the direction-continuity score below
+%                  doesn't apply yet) prefers whichever candidate has the
+%                  SMALLER mean column, instead of nearest-to-anchor
+%                  distance. Needed when `anchor` is NOT the base (e.g.
+%                  caller seeds the walk from a point behind the previous
+%                  frame's tip, to shorten the walk and reduce exposure to
+%                  the failure modes below, which scale with walk length):
+%                  a base-anchor start sits on the crop border where the
+%                  mask only extends one way, so nearest-to-anchor is a
+%                  fine tiebreak there. A mid-tube start has substantial
+%                  mask in BOTH directions, and nearest-to-anchor has no
+%                  principled reason to prefer the tip-ward crossing over
+%                  the base-ward one -- but this pipeline's own crop
+%                  convention already guarantees tip-ward = smaller column
+%                  (tube always enters the crop from the right border), so
+%                  a direct column comparison resolves it with no direction
+%                  estimate needed at all. Only affects step 1: from step 2
+%                  on, prev_dir is always set from the actual observed
+%                  move, so normal direction-continuity scoring takes over
+%                  regardless of this flag. No effect on a normal
+%                  base-anchored call (default false).
+%                  (An earlier `init_dir` parameter -- pre-seeding prev_dir
+%                  from an estimated local tangent -- was tried and removed:
+%                  seeding exactly AT the previous tip left, on real data,
+%                  only ~1px of genuine mask beyond it (real per-frame
+%                  growth), far short of the ~ring_r=0.65*width the ring
+%                  needs to even detect a tip-ward crossing -- so ncomp==1
+%                  and the ONLY candidate found was base-ward, unconditionally
+%                  taken (see code below), regardless of how correct the
+%                  direction estimate was. Direction never got a vote. The
+%                  fix is seeding further back (see main_track_movies.m's
+%                  ringwalk_seed_offset_factor), not a better direction
+%                  estimate for the same broken seed point.)
 %
 % Returns tip_final ([row col], the last valid point before stopping) and
 % the full walk_path (Nx2, base to tip) for optional debug/comparison
@@ -72,10 +106,12 @@ addParameter(p, 'thickness', 3);
 addParameter(p, 'width_collapse', 0.5);
 addParameter(p, 'max_steps', 500);
 addParameter(p, 'prev_tip', []);
+addParameter(p, 'prefer_smaller_col', false);
 parse(p, varargin{:});
 k_ring = p.Results.k_ring; k_cut = p.Results.k_cut;
 thickness = p.Results.thickness; width_collapse = p.Results.width_collapse;
 max_steps = p.Results.max_steps; prev_tip = p.Results.prev_tip;
+prefer_smaller_col = p.Results.prefer_smaller_col;
 
 [rows, cols] = size(U);
 remaining = U;
@@ -109,7 +145,7 @@ init_w = max(4, 2 * max(D0(r0:r1, c0:c1), [], 'all'));
 w_hist = init_w;
 
 walk_path = [r c];
-prev_dir = [];
+prev_dir = []; % set from the actual observed move after step 1 (see below)
 
 for step = 1:max_steps
     ref_w = median(w_hist);
@@ -199,6 +235,8 @@ for step = 1:max_steps
                 vec = [cy_list(ci) - r, cx_list(ci) - c];
                 n = norm(vec);
                 if n > 0, local_score(idx) = dot(vec, prev_dir) / n; end
+            elseif prefer_smaller_col
+                local_score(idx) = -cx_list(ci); % smaller column = tip-ward (see prefer_smaller_col doc)
             else
                 local_score(idx) = -hypot(cy_list(ci) - r, cx_list(ci) - c); % nearest to anchor
             end
