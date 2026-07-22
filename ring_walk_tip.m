@@ -260,7 +260,23 @@ for step = 1:max_steps
         if numel(candidate_idx) > 1 && ~isempty(prev_tip)
             margin = sorted_score(1) - sorted_score(2);
             if is_direction_score
-                is_near_tie = margin < 0.15; % dot-product units, [-1,1]
+                % Step 2 is the very first time direction-continuity scoring
+                % ever runs -- prev_dir at that point reflects exactly ONE
+                % observed move, not accumulated history, so it's inherently
+                % low-confidence regardless of how large the score margin
+                % looks. Always defer to prev_tip proximity here instead of
+                % only when the margin happens to be under the normal
+                % near-tie threshold. Confirmed needed on HV203_4_21 frame
+                % 3005: step 2 had two real candidates, margin 0.233 (clear
+                % of the normal 0.15 threshold, so the tiebreak below never
+                % ran) -- direction-score picked the WRONG one (0.550 vs
+                % 0.317), sending the walk on a 28-step detour across the
+                % whole tube, while the correct candidate was 32.6px from
+                % prev_tip vs the wrong one's 60.7px -- unambiguous by that
+                % measure. From step 3 on, prev_dir has real accumulated
+                % history and the normal margin-based near-tie check applies
+                % unchanged.
+                is_near_tie = (step == 2) || (margin < 0.15); % dot-product units, [-1,1]
             else
                 is_near_tie = margin < 0.3 * ref_w; % px, scaled to local tube width
             end
