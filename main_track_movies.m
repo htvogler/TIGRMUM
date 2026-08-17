@@ -1319,19 +1319,39 @@ for count = smp:-1:stp
     dx = gradient(xc); dx(find(dx == 0)) = 0.01;
     dy = gradient(yc); dy(find(dy == 0)) = 0.01;
 
-    % Finding the points where the normals hit the edge curves
+    % Finding the points where the normals hit the edge curves. Restricted
+    % to a local arc-length window, then to genuine crossings of the fitted
+    % line within it, tie-broken by distance to the centerline sample (see
+    % nearest_crossing_to_sample below) -- a plain global nearest-point-to-
+    % the-LINE search is what let a bend send this cross-section jumping to
+    % a spatially-nearby-to-the-line but topologically-distant point on the
+    % far side of the bend (verified on real HV207_9 frame 2746: samples
+    % landed ~90-150px away along the boundary at the tube's sharper kink,
+    % discarded downstream by line_continuity -- see session notes for the
+    % full geometric writeup).
+    al1 = [0; cumsum(sqrt(sum(diff(total1).^2, 2)))];
+    al2 = [0; cumsum(sqrt(sum(diff(total2).^2, 2)))];
+    crossing_window = diamo * 2; % arc-length px -- generous local margin, not a
+                 % speed optimization (these arrays are a few hundred points
+                 % either way); guards against a tube folding close enough to
+                 % itself that a spatially-near-but-topologically-distant
+                 % point could otherwise win the tie-break in step 2. Not
+                 % expected to matter for tubes that don't self-fold (those
+                 % fail mask segmentation before reaching this code anyway).
+
     poscross1 = []; poscross2 = []; t1_all = zeros(length(xc),1); t2_all = zeros(length(xc),1);
     for n = 1:length(xc)
         nfitc = fit(vertcat(xc(n),(xc(n) - dy(n))),vertcat(yc(n),(yc(n) + dx(n))),'poly1');
 
         if (n == 1) start_nfitc(:,:) = [nfitc.p1 nfitc.p2]; end
 
+        sample_pt = [yc(n), xc(n)];
         edge1 = total1(:,1) - nfitc.p1.*total1(:,2) - nfitc.p2;
-        [tmp cross1] = min(abs(edge1));
+        cross1 = nearest_crossing_to_sample(edge1, total1, al1, sample_pt, crossing_window);
         poscross1(n) = cross1;
 
         edge2 = total2(:,1) - nfitc.p1.*total2(:,2) - nfitc.p2;
-        [tmp cross2] = min(abs(edge2));
+        cross2 = nearest_crossing_to_sample(edge2, total2, al2, sample_pt, crossing_window);
         poscross2(n) = cross2;
 
         % Signed half-width at this exact sample, for reconstruct_smooth_mask
@@ -1547,9 +1567,14 @@ for count = smp:-1:stp
     if (cutoffp > 1) xy1(cutoffp-1,:) = []; xy2(cutoffp-1,:) = []; end
 
     % Diameter of tube
+    % Median, not mean: a plain mean lets a handful of bad cross-section
+    % samples (most often right at a bend -- see nearest_crossing_to_sample
+    % above, which reduces but doesn't eliminate these) drag the whole
+    % frame's reported diameter. Median is robust to exactly that without
+    % needing to know which samples are bad.
     diamf = diag(pdist2(xy1,xy2));
-    diamf_avg(count) = sum(diamf)/length(diamf);
-    
+    diamf_avg(count) = median(diamf);
+
     % Kymograph
     if (nkymo > 0)
         kymo_len = ceil(path_dist(end));
@@ -2257,6 +2282,84 @@ function [r, c, snapped] = snap_to_mask(U, pt, diamo_est)
     r = ys(k) + r0 - 1;
     c = xs(k) + c0 - 1;
     snapped = true;
+end
+
+function idx = nearest_crossing_to_sample(edge_vals, side_pts, side_arclen, sample_pt, window_radius)
+% Used by the per-sample diameter cross-section search (both the reverse
+% pass and find_tip_and_measure's own copy): finds where the fitted
+% normal line actually crosses this boundary side, then picks whichever
+% crossing is physically nearest (Euclidean) to the centerline sample.
+%
+% Two things this is NOT, and why:
+%
+% 1. NOT a plain global min(abs(edge_vals)) ("take the point with smallest
+%    perpendicular distance to the line, period"). A bent tube's boundary
+%    is not convex, so a single line can cross it more than twice -- on
+%    real data (HV207_9 frame 2746) the SAME fitted line crossed one side
+%    at three genuinely separate points, 8px, 92px, and 151px along the
+%    boundary from the centerline sample, with perpendicular residuals of
+%    0.37, 0.03, and 0.25 respectively. All three are real crossings (all
+%    near-zero); which one has the single smallest residual is decided by
+%    sub-pixel discretization noise (exactly where each boundary vertex
+%    happens to fall relative to the true continuous crossing), not by
+%    which one is the true local cross-section. The old code took the
+%    global min and got the 92px one. See session notes for the full
+%    diagnostic images/writeup.
+% 2. NOT a plain nearest-point-on-the-boundary-to-the-sample either
+%    (skipping the line fit entirely). That would independently pick a
+%    "nearest" point on each side with no guarantee the two points
+%    correspond to the same true cross-section -- in a tapering or
+%    asymmetric stretch they could correspond to different points along
+%    the tube's length, skewing the measured width, and other code
+%    downstream (the Half1/Half2 ROI split) depends on both sides being
+%    found along the same tangent-perpendicular direction.
+%
+% Two-stage search: (1) restrict candidates to a local window of
+% window_radius (arc-length px along this side, via side_arclen) around
+% whichever point on this side is raw-nearest (Euclidean) to the sample --
+% a fresh, one-shot anchor computed from scratch every call, not carried
+% over from the previous sample (so one bad sample can't drag the next one
+% off course). (2) within that window, restrict further to genuine
+% crossings of the fitted line (local minima of |edge_vals|), then break
+% the tie between them by distance to the sample -- the one criterion the
+% line-only residual ignores entirely.
+%
+% The window in step (1) is a deliberate second line of defense, not just
+% a speed optimization (arrays here are a few hundred points either way --
+% cheap regardless): a raw nearest-point search alone (skip straight to
+% step 2 with no window) is provably safe UNLESS the tube ever curves back
+% close enough to itself in image space that a genuinely different stretch
+% of boundary is physically nearer to the sample than the true local
+% cross-section -- a hairpin/near-self-touching case. Restricting by
+% ARC-LENGTH first (not raw distance) means a point that's spatially close
+% but topologically far along the boundary can never enter the candidate
+% set to begin with, regardless of how the tie-break in step 2 would have
+% scored it. Not expected to matter on tubes that don't fold back on
+% themselves (which would fail mask segmentation before reaching this
+% code anyway) -- kept as a low-cost safety margin, not because it's been
+% observed to trigger on real data.
+d_to_sample = hypot(side_pts(:,1) - sample_pt(1), side_pts(:,2) - sample_pt(2));
+[~, anchor] = min(d_to_sample);
+in_window = abs(side_arclen - side_arclen(anchor)) <= window_radius;
+window_idx = find(in_window); % contiguous, since side_arclen is monotonic
+
+a = abs(edge_vals(window_idx));
+nloc = numel(a);
+is_min = false(nloc, 1);
+if nloc == 1
+    is_min(1) = true;
+else
+    is_min(2:end-1) = a(2:end-1) <= a(1:end-2) & a(2:end-1) <= a(3:end);
+    is_min(1) = a(1) <= a(2);
+    is_min(end) = a(end) <= a(end-1);
+end
+cand = window_idx(is_min);
+if isempty(cand)
+    cand = window_idx; % degenerate fallback: no local minimum found within
+                 % the window (should not happen in practice)
+end
+[~, rel] = min(d_to_sample(cand));
+idx = cand(rel);
 end
 
 function U = keep_and_bridge_blobs(U_in, diamo_est, U_smp, debug_mode, count)
@@ -3054,14 +3157,24 @@ function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_
     dx = gradient(xc); dx(find(dx == 0)) = 0.01;
     dy = gradient(yc); dy(find(dy == 0)) = 0.01;
 
+    % See the reverse pass's own copy of this loop for why the search is
+    % windowed by arc-length, then restricted to genuine line crossings,
+    % tie-broken by distance to the centerline sample
+    % (nearest_crossing_to_sample), instead of a global nearest-point-to-
+    % the-line search.
+    al1 = [0; cumsum(sqrt(sum(diff(total1).^2, 2)))];
+    al2 = [0; cumsum(sqrt(sum(diff(total2).^2, 2)))];
+    crossing_window = diamo * 2;
+
     poscross1 = []; poscross2 = []; t1_all = zeros(length(xc),1); t2_all = zeros(length(xc),1);
     for n = 1:length(xc)
         nfitc = fit(vertcat(xc(n),(xc(n) - dy(n))),vertcat(yc(n),(yc(n) + dx(n))),'poly1');
+        sample_pt = [yc(n), xc(n)];
         edge1 = total1(:,1) - nfitc.p1.*total1(:,2) - nfitc.p2;
-        [tmp, cross1] = min(abs(edge1));
+        cross1 = nearest_crossing_to_sample(edge1, total1, al1, sample_pt, crossing_window);
         poscross1(n) = cross1;
         edge2 = total2(:,1) - nfitc.p1.*total2(:,2) - nfitc.p2;
-        [tmp, cross2] = min(abs(edge2));
+        cross2 = nearest_crossing_to_sample(edge2, total2, al2, sample_pt, crossing_window);
         poscross2(n) = cross2;
 
         % Signed half-width at this exact sample, for reconstruct_smooth_mask
@@ -3190,7 +3303,7 @@ function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_
     end
     if (cutoffp > 1), xy1(cutoffp-1,:) = []; xy2(cutoffp-1,:) = []; end
 
-    diamf = diag(pdist2(xy1,xy2));
-    diamf_val = sum(diamf)/length(diamf);
+    diamf = diag(pdist2(xy1,xy2)); % median, not mean -- see the reverse pass's own copy
+    diamf_val = median(diamf);
     yctk_out = yctk; xctk_out = xctk;
 end
