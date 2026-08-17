@@ -54,24 +54,38 @@ Cmax = 3; % Max pixel value in Ratio stack
 nkymo = 3; % Number of pixels line width average for kymograph (odd number) (0 means no kymo)
 diamcutoff = 0; % In pixels if pixelsize is not given
 bit_depth = 12; % Camera bit depth (12 or 16) — must match FRET-IBRA config
-threshold_method = 'triangle'; % Per-frame background/foreground separation for single-channel
+threshold_method = 'otsu'; % Per-frame background/foreground separation for single-channel
                  % and two-channel-without-ratio modes (ratio mode is unaffected -- its
                  % background is already handled upstream by FRET-IBRA). Pick based on the
                  % sensor's intensity distribution along the tube, not the imaging mode:
-                 %   'triangle' - for sensors where a small, very bright region sits next to
-                 %                much dimmer but still-real signal, e.g. a saturated GCaMP
-                 %                tip next to a dim shank. Otsu's variance criterion gets
-                 %                pulled toward isolating the rare bright outlier and throws
-                 %                the dim-but-real shank away as "background"; Triangle finds
-                 %                where the histogram departs from the background peak
-                 %                instead, regardless of how far the bright tail extends.
-                 %                Default, since most current work is GCaMP.
-                 %   'otsu'     - for sensors with fairly uniform intensity along the tube's
-                 %                length, e.g. yellow cameleon CFP/YFP (tip and shank
-                 %                comparably bright). Triangle over-includes background noise
-                 %                here (tested on YC11: kept ~4x more pixels than Otsu, mostly
-                 %                noise speckle, not tube) because there's no sharp peak-to-
-                 %                tail departure for it to key off.
+                 %   'otsu'     - per-frame Otsu, biased by otsu_sensitivity below. DEFAULT,
+                 %                including for GCaMP (bright tip next to a dimmer-but-still-
+                 %                clearly-above-background shank) -- reversing an earlier
+                 %                recommendation to use 'triangle' here. Compared directly on a
+                 %                real GCaMP dataset (HV207_9): with otsu_sensitivity relaxed
+                 %                enough to stop severing the mask on real per-frame signal dips,
+                 %                otsu beat triangle on every axis checked -- closer to the true
+                 %                diameter (independently measured via cross-sectional FWHM: otsu
+                 %                ~14% over vs. triangle ~36% over), visibly smoother mask
+                 %                boundary, and ~3x more stable frame-to-frame diameter. See
+                 %                signal_threshold.m for the full writeup.
+                 %   'triangle' - for GENUINELY weak signal specifically: the tip still bright,
+                 %                but the shank barely above the background noise floor at all
+                 %                (not just dimmer than the tip). otsu_sensitivity has no good
+                 %                setting there -- relaxed enough to admit a barely-visible
+                 %                shank, it also admits background noise broadly, since there's
+                 %                no longer a comfortable margin between "real dim shank" and
+                 %                "noise" for a fixed fraction-of-Otsu-level cut to exploit.
+                 %                Triangle finds where the histogram departs from the
+                 %                background peak's own shape instead of a fixed offset, so it
+                 %                can still separate real-but-faint signal from noise here.
+otsu_sensitivity = 0.7; % otsu method only. Multiplier on the raw Otsu level -- 1.0 is
+                 % unbiased Otsu, <1.0 lowers the effective cutoff to admit more of the
+                 % dim-but-real signal (e.g. GCaMP shank) as foreground. 0.7 is what stopped
+                 % per-frame mask severing on HV207_9 (0.8 was not enough); not yet swept on
+                 % other datasets, so treat 0.7 as a starting point, not a proven constant --
+                 % if severing/NaN'd frames show up, try lowering it before switching to
+                 % 'triangle'. See signal_threshold.m for the full writeup.
 tip_method = 'skeleton'; % How to find the tip each frame (fluorescence-only pipeline).
                  %   'skeleton' - thin the mask, prune spurious branches (branch_removal.m),
                  %                seed an ellipse fit from the surviving endpoint. Default,

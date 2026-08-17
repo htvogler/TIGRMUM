@@ -129,15 +129,16 @@ end
 
 % Zero background for non-ratio modes. Method controlled by threshold_method
 % (see run_config.m for which to use for which signal distribution).
+if ~exist('otsu_sensitivity', 'var'), otsu_sensitivity = []; end
 if ~strcmp(mode, 'ratio')
     for fc = 1:size(BT1,3)
         frm = BT1(:,:,fc);
-        BT1(:,:,fc) = frm .* cast(signal_threshold(frm, threshold_method, up_factor, weak_signal), class(BT1));
+        BT1(:,:,fc) = frm .* cast(signal_threshold(frm, threshold_method, up_factor, weak_signal, otsu_sensitivity), class(BT1));
     end
     if ~isempty(BT2)
         for fc = 1:size(BT2,3)
             frm = BT2(:,:,fc);
-            BT2(:,:,fc) = frm .* cast(signal_threshold(frm, threshold_method, up_factor, weak_signal), class(BT2));
+            BT2(:,:,fc) = frm .* cast(signal_threshold(frm, threshold_method, up_factor, weak_signal, otsu_sensitivity), class(BT2));
         end
     end
     M = BT1;

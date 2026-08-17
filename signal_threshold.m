@@ -1,28 +1,47 @@
-function mask = signal_threshold(frm, method, up_factor, weak_signal)
+function mask = signal_threshold(frm, method, up_factor, weak_signal, otsu_sensitivity)
 % Per-frame binary foreground mask, method selectable via threshold_method
 % (see run_config.m). Which one to use depends on the signal's intensity
 % distribution along the tube, not the imaging mode:
 %
-%   'otsu'     - per-frame Otsu (mat2gray-normalised). Best when signal
-%                intensity is fairly uniform along the tube's length, e.g.
-%                yellow cameleon CFP/YFP, where tip and shank are
-%                comparably bright. Otsu maximises between-class variance,
-%                which assumes roughly two comparable populations
-%                (background vs. signal) -- true here.
-%   'triangle' - per-frame Triangle/Zack thresholding, eroded by 1px. Best
-%                when a small, very bright region sits next to much dimmer
-%                but still-real signal, e.g. a saturated GCaMP tip next to
-%                a dim shank. Otsu's variance criterion gets pulled toward
-%                isolating the rare bright outlier and throws the dim-but-
-%                real shank signal away as "background"; Triangle finds
-%                where the histogram departs from the background peak
-%                instead, regardless of how far the bright tail extends.
-%                That low cutoff also reaches into the PSF blur skirt
-%                around the whole tube, not just along the dim shank, so
-%                the raw mask is eroded by 1px to trim it back toward the
-%                visible edge (tested on HV197_4_19: kept the dim shank
-%                connected while removing stray background speckle and
-%                tightening the outline -- see session notes).
+%   'otsu'     - per-frame Otsu (mat2gray-normalised), biased by
+%                otsu_sensitivity (see below). DEFAULT for GCaMP (bright tip
+%                next to a dimmer-but-still-clearly-above-background shank),
+%                given otsu_sensitivity=0.7 -- reversing an earlier
+%                recommendation to use 'triangle' for this case. Compared
+%                directly against 'triangle' on a real GCaMP dataset
+%                (HV207_9): once otsu_sensitivity is relaxed enough to stop
+%                severing the mask on real per-frame signal dips (~0.7 was
+%                sufficient there), otsu comes out ahead on every axis
+%                checked -- closer to the true diameter (measured
+%                independently via cross-sectional FWHM: otsu ~14% over vs.
+%                triangle ~36% over), visibly smoother/less spiky mask
+%                boundary (confirmed directly in real pipeline diagnostic
+%                images, not just a proxy metric), and ~3x more stable
+%                frame-to-frame diameter (jitter std 0.16px vs 0.52px over
+%                600 real consecutive frames). Mechanism: triangle's cutoff
+%                sits close to the background noise floor to catch the dim
+%                shank, which is exactly the regime most exposed to
+%                per-frame noise fluctuation and most prone to small
+%                boundary speckle; otsu's (even relaxed) cutoff sits well
+%                clear of that floor.
+%   'triangle' - per-frame Triangle/Zack thresholding, eroded by 1px. Now
+%                reserved for GENUINELY weak signal specifically -- the tip
+%                still bright, but the shank barely above the background
+%                noise floor at all (not just dimmer than the tip). In that
+%                regime otsu_sensitivity has no good setting: relaxed enough
+%                to admit the barely-visible shank, it also admits
+%                background noise broadly (there's no longer a comfortable
+%                margin between "real dim shank" and "noise" for a fixed
+%                fraction-of-Otsu-level cut to exploit). Triangle finds
+%                where the histogram departs from the background peak's own
+%                shape instead of applying a fixed offset, so it can still
+%                separate real-but-faint signal from noise here. That low
+%                cutoff also reaches into the PSF blur skirt around the
+%                whole tube, not just along the dim shank, so the raw mask
+%                is eroded by 1px to trim it back toward the visible edge
+%                (tested on HV197_4_19: kept the dim shank connected while
+%                removing stray background speckle and tightening the
+%                outline -- see session notes).
 %   'bgsigma2' - background-mean-plus-2-sigma. Estimates the background
 %   'bgsigma3'   peak's own mean/std directly from the histogram (not a
 %                geometric line-distance criterion like Triangle), then
@@ -42,7 +61,17 @@ function mask = signal_threshold(frm, method, up_factor, weak_signal)
 %                accuracy improvement over Triangle with cleanliness
 %                closer to Triangle's own. Experimental -- not yet the
 %                default for any dataset, added specifically to compare
-%                side by side against Triangle/Otsu on real data.
+%                side by side against Triangle/Otsu on real data. Not
+%                re-benchmarked against the otsu_sensitivity findings above.
+%
+% otsu_sensitivity: multiplier on the raw Otsu level (graythresh), otsu
+% method only. Default 1.0 (unbiased Otsu) when not passed -- run_config.m
+% should set 0.7 for GCaMP-style signals (see 'otsu' above). <1.0 lowers the
+% effective cutoff, admitting more of the dim-but-real signal as
+% foreground. There isn't a universally-correct value -- it's the point
+% where per-frame severing on real signal dips stops (too high) without yet
+% admitting broad background speckle (too low); 0.7 was sufficient on
+% HV207_9 and 0.8 was not, but this hasn't been swept on other datasets.
 %
 % up_factor: spatial upsampling factor applied upstream (see run_config.m's
 % `upsample` and main_track_movies.m). Default 1 (no upsampling). The
@@ -53,10 +82,18 @@ function mask = signal_threshold(frm, method, up_factor, weak_signal)
 
 if nargin < 3 || isempty(up_factor), up_factor = 1; end
 if nargin < 4 || isempty(weak_signal), weak_signal = false; end
+if nargin < 5 || isempty(otsu_sensitivity), otsu_sensitivity = 1.0; end
 
 switch method
     case 'otsu'
-        mask = imbinarize(mat2gray(frm));
+        % See otsu_sensitivity doc above. NOTE: imbinarize's own
+        % 'Sensitivity' name-value pair only applies to its 'adaptive'
+        % method, not global Otsu (confirmed via a real runtime error --
+        % 'global'/plain imbinarize doesn't accept it) -- this multiplies
+        % graythresh's own level directly instead, which is the actual
+        % equivalent knob for global Otsu.
+        normfrm = mat2gray(frm);
+        mask = normfrm > (otsu_sensitivity * graythresh(normfrm));
     case 'triangle'
         mask = double(frm) > triangle_threshold(frm);
         mask = imerode(mask, strel('disk', up_factor));
