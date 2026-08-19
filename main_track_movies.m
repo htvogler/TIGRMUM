@@ -34,6 +34,14 @@ if ~exist('ringwalk_reanchor_interval', 'var'), ringwalk_reanchor_interval = 50;
 if ~exist('ringwalk_seed_offset_factor', 'var'), ringwalk_seed_offset_factor = 2.5; end
 if ~exist('ringwalk_fallback_to_skeleton', 'var'), ringwalk_fallback_to_skeleton = 0; end
 
+% FWHM diameter calibration defaults (see fwhm_diameter_correction in
+% run_config.example.m) -- defensively defaulted here for the same reason
+% as above.
+if ~exist('fwhm_diameter_correction', 'var'), fwhm_diameter_correction = 0; end
+if ~exist('fwhm_calib_interval', 'var'), fwhm_calib_interval = 50; end
+if ~exist('fwhm_calib_samples', 'var'), fwhm_calib_samples = 12; end
+if ~exist('fwhm_calib_window', 'var'), fwhm_calib_window = 5; end
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Detect input file and select analysis mode
 pathf = path;
@@ -73,6 +81,7 @@ cfg = struct('path',path,'fname',fname,'stp',stp,'smp',smp,'outpath',outpath, ..
     'ringwalk_fallback_to_skeleton',ringwalk_fallback_to_skeleton, ...
     'ROItype',ROItype,'split',split,'circle',circle,'starti',starti,'stopi',stopi,'pixelsize',pixelsize, ...
     'threshold_method',threshold_method,'otsu_sensitivity',otsu_sensitivity,'bit_depth',bit_depth,'diamcutoff',diamcutoff, ...
+    'fwhm_diameter_correction',fwhm_diameter_correction,'fwhm_calib_interval',fwhm_calib_interval,'fwhm_calib_samples',fwhm_calib_samples,'fwhm_calib_window',fwhm_calib_window, ...
     'Cmin',Cmin,'Cmax',Cmax,'nkymo',nkymo);
 settings_groups = { ...
     'Input / Output',              {'path','fname','stp','smp','outpath'}; ...
@@ -80,7 +89,7 @@ settings_groups = { ...
     'Tip Detection',                {'weight','tip_method','weak_signal','max_tip_jump_um','jitter_margin_um','max_growth_rate_um_per_min','growth_safety_factor'}; ...
     'Ringwalk Tip-Seeding',          {'ringwalk_seed_from_tip','ringwalk_seed_offset_factor','ringwalk_seed_max_steps','ringwalk_reanchor_interval','ringwalk_fallback_to_skeleton'}; ...
     'ROI Options',                   {'ROItype','split','circle','starti','stopi','pixelsize'}; ...
-    'Segmentation / Thresholding',   {'threshold_method','otsu_sensitivity','bit_depth','diamcutoff'}; ...
+    'Segmentation / Thresholding',   {'threshold_method','otsu_sensitivity','bit_depth','diamcutoff','fwhm_diameter_correction','fwhm_calib_interval','fwhm_calib_samples','fwhm_calib_window'}; ...
     'Kymograph / Movie Output',      {'Cmin','Cmax','nkymo'}; ...
 };
 write_settings_log(cfg, settings_groups, fullfile(outpath, [fname '_settings.log']));
@@ -158,7 +167,23 @@ end
 % Zero background for non-ratio modes. Method controlled by threshold_method
 % (see run_config.m for which to use for which signal distribution).
 if ~exist('otsu_sensitivity', 'var'), otsu_sensitivity = []; end
+if fwhm_diameter_correction && strcmp(mode, 'ratio')
+    warning('TIGRMUM: fwhm_diameter_correction has no effect in ratio mode (background already handled upstream by FRET-IBRA, signal_threshold never runs) -- disabling for this run.');
+    fwhm_diameter_correction = 0;
+end
 if ~strcmp(mode, 'ratio')
+    % Unmasked copy, kept ONLY for the optional FWHM diameter calibration
+    % below (see fwhm_diameter_correction) -- signal_threshold's own masking
+    % just below zeroes out everything outside the segmented region, so
+    % this is the last point where real background-level intensity (needed
+    % for a true half-max crossing, not a threshold-dependent mask edge)
+    % is still available. Same stack TIGRMUM itself tracks on (post-crop,
+    % post-background-subtraction, post-bleach-correction) -- confirmed on
+    % real data (HV208_100) that FRET-IBRA's own processing doesn't move
+    % the FWHM measurement at all (differences <0.001um across three test
+    % frames), so calibrating against this stack isolates just the
+    % threshold-method bias, which is what this correction targets.
+    if fwhm_diameter_correction, M_raw = BT1; end
     for fc = 1:size(BT1,3)
         frm = BT1(:,:,fc);
         BT1(:,:,fc) = frm .* cast(signal_threshold(frm, threshold_method, up_factor, weak_signal, otsu_sensitivity), class(BT1));
@@ -372,6 +397,9 @@ growth_buf = cell(smp, 1);
 roi_buf = cell(smp, 1);
 tip_final    = NaN(smp, 2);
 diamf_avg    = NaN(1, smp);
+fwhm_calib_mask_px = []; fwhm_calib_fwhm_px = []; % see fwhm_diameter_correction
+fwhm_calib_pass_frame = []; fwhm_calib_pass_n = []; % per-pass log, one row per
+fwhm_calib_pass_mask_med = []; fwhm_calib_pass_fwhm_med = []; fwhm_calib_pass_ratio = []; % calibration pass -- see fwhm_diameter_correction
 Ucount       = NaN(1, smp);
 intensityM   = NaN(1, smp);
 intensityM_F = NaN(1, smp);
@@ -391,10 +419,18 @@ for count = smp:-1:stp
     disp(['Image Analysis:' num2str(count)]);
     try
     O = M(:,:,count);
-    
+
     if (type == 1) O = imrotate(O,-90);
     elseif (type == 3) O = imrotate(O,90);
     elseif (type == 4) O = imrotate(O,180);
+    end
+
+    if fwhm_diameter_correction && exist('M_raw', 'var')
+        O_raw = double(M_raw(:,:,count));
+        if (type == 1) O_raw = imrotate(O_raw,-90);
+        elseif (type == 3) O_raw = imrotate(O_raw,90);
+        elseif (type == 4) O_raw = imrotate(O_raw,180);
+        end
     end
 
     if strcmp(mode, 'ratio')
@@ -1447,6 +1483,62 @@ for count = smp:-1:stp
         t2_all(n) = (p2pt(1)-yc(n))*(dx(n)/normn) + (p2pt(2)-xc(n))*(-dy(n)/normn);
     end
 
+    % FWHM diameter calibration (see fwhm_diameter_correction in
+    % run_config.m): periodically, on a handful of samples away from the
+    % tip/base, measure a threshold-independent width straight off the raw
+    % (unmasked) intensity profile -- using the SAME perpendicular line
+    % (xc/yc/dx/dy) and the SAME mask crossings (poscross1/poscross2) as
+    % the real per-sample diameter measurement above, just before
+    % line_continuity can prune/reorder them -- and compare it to what the
+    % mask itself reported at that exact sample. The ratio across all
+    % calibration samples collected over the run becomes a single
+    % correction factor applied to Diameter_um_corrected in the CSV (see
+    % near the CSV export below). Deliberately NOT applied to diamo itself
+    % or anything derived from it (exclusion radii, crossing windows,
+    % corridor widths, etc.) -- all of that was tuned against mask-based
+    % diamo semantics, and this correction is only trying to fix the
+    % reported number, not rewire geometry that currently works.
+    if fwhm_diameter_correction && exist('O_raw', 'var') && mod(count, fwhm_calib_interval) == 0
+        n_total = length(xc);
+        lo = max(1, round(0.15*n_total)); hi = min(n_total, round(0.85*n_total));
+        if hi > lo
+            samp_idx = unique(round(linspace(lo, hi, fwhm_calib_samples)));
+            pass_mask = []; pass_fwhm = [];
+            for si = samp_idx
+                mask_w = pdist2(total1(poscross1(si),:), total2(poscross2(si),:));
+                fwhm_w = fwhm_cross_section(O_raw, yc(si), xc(si), dx(si), dy(si), crossing_window);
+                if isfinite(fwhm_w) && isfinite(mask_w) && mask_w > 0
+                    fwhm_calib_mask_px(end+1) = mask_w;
+                    fwhm_calib_fwhm_px(end+1) = fwhm_w;
+                    pass_mask(end+1) = mask_w; %#ok<AGROW>
+                    pass_fwhm(end+1) = fwhm_w; %#ok<AGROW>
+                end
+            end
+            % Per-pass record (frame, sample count, this pass's own median
+            % mask/FWHM width and ratio) -- kept SEPARATE from the pooled
+            % fwhm_calib_mask_px/fwhm_calib_fwhm_px arrays above (which
+            % only feed the single run-level correction factor) so a
+            % post-hoc check can see whether the bias ratio itself is
+            % stable across the run or drifts -- e.g. around a mid-run
+            % treatment that might change signal characteristics (not
+            % just true diameter) and invalidate a single blended factor.
+            % Written to {fname}_fwhm_calibration.csv alongside the main
+            % measurements CSV; see near the CSV export below.
+            if ~isempty(pass_mask)
+                pass_ratio = median(pass_fwhm ./ pass_mask);
+                fwhm_calib_pass_frame(end+1) = count;
+                fwhm_calib_pass_n(end+1) = numel(pass_mask);
+                fwhm_calib_pass_mask_med(end+1) = median(pass_mask);
+                fwhm_calib_pass_fwhm_med(end+1) = median(pass_fwhm);
+                fwhm_calib_pass_ratio(end+1) = pass_ratio;
+                if debug_mode
+                    fprintf('  fwhm_calib F%d: n=%d mask_med=%.2fpx fwhm_med=%.2fpx ratio=%.3f\n', ...
+                        count, numel(pass_mask), median(pass_mask), median(pass_fwhm), pass_ratio);
+                end
+            end
+        end
+    end
+
     % Ensure that all overlapping diameter lines are shifted backwards to
     % ensure continuity
     [poscross1, poscross2, distcf] = line_continuity(poscross1,poscross2,1,distc);
@@ -1958,6 +2050,54 @@ if roi_debug_video
     close(Vroi);
 end
 
+% Resolve the FWHM diameter correction factor (see fwhm_diameter_correction
+% and the calibration hook in the main per-frame loop above). PER-FRAME,
+% not a single run-level number -- an earlier version used one global
+% median factor, but confirmed on real data (HV208_100, frames 1-300,
+% otherwise unperturbed) that the bias this corrects for is NOT actually
+% constant: the raw mask-based diameter drifted -6.6% over that stretch
+% while an independent FWHM ground truth stayed flat (-1.9%, i.e. noise)
+% -- a threshold/SNR artifact (bleaching narrows the mask even though the
+% true tube width hasn't moved), not a real diameter change. A single
+% global factor can only rescale the whole curve, not remove a trend, so
+% it silently carried that same -6.6% drift straight through into
+% "corrected" too. Fix: interpolate the correction factor between
+% calibration passes (mild moving-median smoothing across
+% fwhm_calib_window passes first, since any one pass's ratio is only
+% fwhm_calib_samples points), so a real, slow drift in the bias gets
+% tracked and removed instead of baked into the output. Frames outside
+% the calibrated range hold the nearest edge value rather than
+% extrapolating a trend past where it was actually measured. Resolved
+% BEFORE fig1 below (not just at CSV export) so the "Average Diameter"
+% panel can plot the corrected trace too.
+fwhm_correction_factor_by_frame = ones(numel(stp:smp), 1);
+if fwhm_diameter_correction
+    if numel(fwhm_calib_pass_frame) >= 2
+        [pf_sorted, sidx] = sort(fwhm_calib_pass_frame(:));
+        pr_sorted = fwhm_calib_pass_ratio(sidx);
+        if fwhm_calib_window > 1
+            pr_smooth = movmedian(pr_sorted, fwhm_calib_window);
+        else
+            pr_smooth = pr_sorted;
+        end
+        all_frames = (stp:smp)';
+        fwhm_correction_factor_by_frame = interp1(pf_sorted, pr_smooth, all_frames, 'linear');
+        fwhm_correction_factor_by_frame(all_frames < pf_sorted(1))   = pr_smooth(1);
+        fwhm_correction_factor_by_frame(all_frames > pf_sorted(end)) = pr_smooth(end);
+        fprintf('FWHM diameter calibration: %d passes (%d samples total), factor range %.3f-%.3f, median %.3f\n', ...
+            numel(pf_sorted), numel(fwhm_calib_mask_px), min(pr_smooth), max(pr_smooth), median(pr_smooth));
+    else
+        warning('TIGRMUM: fwhm_diameter_correction enabled but only %d calibration pass(es) collected (need >=2 to interpolate a trend) -- Diameter_um_corrected left uncorrected (factor=1).', numel(fwhm_calib_pass_frame));
+    end
+    if ~isempty(fwhm_calib_pass_frame)
+        Tcal = table(fwhm_calib_pass_frame(:), fwhm_calib_pass_n(:), ...
+                     fwhm_calib_pass_mask_med(:), fwhm_calib_pass_fwhm_med(:), fwhm_calib_pass_ratio(:), ...
+                     'VariableNames', {'Frame', 'N_samples', 'Mask_median_px', 'FWHM_median_px', 'Ratio'});
+        writetable(Tcal, fullfile(outpath, [fname '_fwhm_calibration.csv']));
+        disp(['FWHM calibration log saved: ' fullfile(outpath, [fname '_fwhm_calibration.csv'])]);
+    end
+end
+
 % Final tip movement/diameter/pixel number on a per frame basis
 fig1 = figure;
 if strcmp(mode, 'two_raw')
@@ -1973,14 +2113,51 @@ title('Tip Final Position', 'FontSize',16);
 
 subplot(nsp,1,2)
 dvals = diamf_avg(stp:smp); dvals = dvals(isfinite(dvals));
+% Corrected (FWHM-calibrated) trace, same computation the CSV's
+% Diameter_um_corrected column uses below -- plotted alongside the raw
+% trace (not instead of it) so the correction's actual effect is visible
+% directly in the figure, not just in the CSV. Equal to the raw trace
+% whenever fwhm_diameter_correction is off.
+diam_corrected_px = diamf_avg(stp:smp)' .* fwhm_correction_factor_by_frame;
+dvals_c = diam_corrected_px(isfinite(diam_corrected_px));
+maxval = max([dvals, dvals_c']);
+% Extra headroom (1.6x instead of the usual 1.25x) ONLY when the
+% FWHM-corrected legend is drawn -- gives the legend genuinely empty space
+% to sit in above both curves (top ~37% of the panel) instead of hoping a
+% corner happens to be clear. A specific corner ('northeast' etc.) was
+% tried first and still covered real data on real output (HV209_85) --
+% picking a corner assumes the data leaves one clear, which isn't
+% guaranteed; carving out real headroom is. 'northeastoutside' was tried
+% too and made exportgraphics hang in headless MATLAB (confirmed on real
+% data) -- stays inside the axes.
+if fwhm_diameter_correction, headroom = 1.6; else, headroom = 1.25; end
+% Name the raw trace after whichever threshold method actually produced
+% it (and its sensitivity, for otsu specifically -- the only method that
+% multiplier applies to) so the figure is self-describing about which
+% mask bias it's showing, without needing to cross-reference the CSV.
+if strcmp(threshold_method, 'otsu')
+    raw_label = sprintf('raw (otsu, %.2g)', otsu_sensitivity);
+else
+    raw_label = sprintf('raw (%s)', threshold_method);
+end
 if (pixelsize > 0)
     plot(stp:smp, diamf_avg(stp:smp)*pixelsize, 'b')
+    hold on
+    if fwhm_diameter_correction
+        plot(stp:smp, diam_corrected_px*pixelsize, 'r')
+        legend(raw_label, 'FWHM-corrected', 'Location', 'northeast')
+    end
     ylabel('µm', 'FontSize',12);
-    if ~isempty(dvals), axis([stp-1 smp+1 0.5*max(dvals)*pixelsize 1.25*max(dvals)*pixelsize]); end
+    if ~isempty(dvals), axis([stp-1 smp+1 0.5*maxval*pixelsize headroom*maxval*pixelsize]); end
 else
     plot(stp:smp, diamf_avg(stp:smp), 'b')
+    hold on
+    if fwhm_diameter_correction
+        plot(stp:smp, diam_corrected_px, 'r')
+        legend(raw_label, 'FWHM-corrected', 'Location', 'northeast')
+    end
     ylabel('pixels', 'FontSize',12);
-    if ~isempty(dvals), axis([stp-1 smp+1 0.5*max(dvals) 1.25*max(dvals)]); end
+    if ~isempty(dvals), axis([stp-1 smp+1 0.5*maxval headroom*maxval]); end
 end
 xlabel('Frame', 'FontSize',12);
 title('Average Diameter','FontSize',16)
@@ -2125,6 +2302,13 @@ csv_tip_row = tip_final(stp:smp, 1);
 csv_tip_col = tip_final(stp:smp, 2);
 csv_diam_px = diamf_avg(stp:smp)';
 csv_diam_um = csv_diam_px .* pixelsize;
+% Diameter_um_corrected: Diameter_um scaled by fwhm_correction_factor_by_frame
+% (see above, PER-FRAME not a single scalar) -- equal to Diameter_um
+% wherever fwhm_diameter_correction is off or calibration didn't collect
+% enough passes (factor stays 1 there). Always present (not gated behind
+% fwhm_diameter_correction) so a run's CSV format doesn't change shape
+% based on that setting.
+csv_diam_um_corrected = csv_diam_um .* fwhm_correction_factor_by_frame;
 csv_wtmean  = intensityM(stp:smp)';
 csv_overlap = Ucount(stp:smp)';
 % ringwalk_fallback_to_skeleton only: 1 if this row's tip came from
@@ -2150,32 +2334,32 @@ if (ROItype > 0)
         csv_ratio_h2h1 = csv_h2_mean ./ csv_h1_mean;
 
         T = table(csv_frames, csv_time_s, csv_tip_row, csv_tip_col, ...
-                  csv_diam_px, csv_diam_um, csv_overlap, csv_wtmean, ...
+                  csv_diam_px, csv_diam_um, csv_diam_um_corrected, csv_overlap, csv_wtmean, ...
                   csv_roi_npx, csv_roi_mean, csv_roi_total, ...
                   csv_h1_npx, csv_h1_mean, csv_h1_total, ...
                   csv_h2_npx, csv_h2_mean, csv_h2_total, csv_ratio_h2h1, csv_fb_used, ...
                   'VariableNames', { ...
                   'Frame', 'Time_s', 'Tip_row_px', 'Tip_col_px', ...
-                  'Diameter_px', 'Diameter_um', 'Frame_overlap_ratio', 'WholeTube_mean_intensity', ...
+                  'Diameter_px', 'Diameter_um', 'Diameter_um_corrected', 'Frame_overlap_ratio', 'WholeTube_mean_intensity', ...
                   'ROI_pixel_count', 'ROI_mean_intensity', 'ROI_total_signal', ...
                   'Half1_pixel_count', 'Half1_mean_intensity', 'Half1_total_signal', ...
                   'Half2_pixel_count', 'Half2_mean_intensity', 'Half2_total_signal', ...
                   'Ratio_Half2_Half1', 'Tip_skeleton_fallback_used'});
     else
         T = table(csv_frames, csv_time_s, csv_tip_row, csv_tip_col, ...
-                  csv_diam_px, csv_diam_um, csv_overlap, csv_wtmean, ...
+                  csv_diam_px, csv_diam_um, csv_diam_um_corrected, csv_overlap, csv_wtmean, ...
                   csv_roi_npx, csv_roi_mean, csv_roi_total, csv_fb_used, ...
                   'VariableNames', { ...
                   'Frame', 'Time_s', 'Tip_row_px', 'Tip_col_px', ...
-                  'Diameter_px', 'Diameter_um', 'Frame_overlap_ratio', 'WholeTube_mean_intensity', ...
+                  'Diameter_px', 'Diameter_um', 'Diameter_um_corrected', 'Frame_overlap_ratio', 'WholeTube_mean_intensity', ...
                   'ROI_pixel_count', 'ROI_mean_intensity', 'ROI_total_signal', 'Tip_skeleton_fallback_used'});
     end
 else
     T = table(csv_frames, csv_time_s, csv_tip_row, csv_tip_col, ...
-              csv_diam_px, csv_diam_um, csv_overlap, csv_wtmean, csv_fb_used, ...
+              csv_diam_px, csv_diam_um, csv_diam_um_corrected, csv_overlap, csv_wtmean, csv_fb_used, ...
               'VariableNames', { ...
               'Frame', 'Time_s', 'Tip_row_px', 'Tip_col_px', ...
-              'Diameter_px', 'Diameter_um', 'Frame_overlap_ratio', 'WholeTube_mean_intensity', 'Tip_skeleton_fallback_used'});
+              'Diameter_px', 'Diameter_um', 'Diameter_um_corrected', 'Frame_overlap_ratio', 'WholeTube_mean_intensity', 'Tip_skeleton_fallback_used'});
 end
 writetable(T, fullfile(outpath, [fname '_measurements.csv']));
 disp(['CSV saved: ' fullfile(outpath, [fname '_measurements.csv'])]);
@@ -2539,6 +2723,39 @@ function r = ordered_range(a, b)
 % just walk each side's own index range in whichever direction its own
 % start/stop crossing indices imply, independently per side.
 if a <= b, r = a:b; else, r = a:-1:b; end
+end
+
+function w = fwhm_cross_section(O_raw, row0, col0, dx_n, dy_n, max_radius)
+% Full-width-at-half-maximum across the tube, measured directly off raw
+% (unmasked) intensity along the perpendicular "diameter line" through
+% (row0,col0) -- same line the mask-crossing search uses (normal to the
+% centerline tangent (dx_n,dy_n)), just evaluated against the continuous
+% intensity profile instead of walking to a binary mask edge. Used only
+% for the periodic FWHM diameter calibration (fwhm_diameter_correction),
+% not the per-frame measurement itself, so this is deliberately strict:
+% a rejected sample here just means one fewer calibration point, not a
+% wrong per-frame diameter, so there's no fallback/best-effort path like
+% nearest_crossing_to_sample's.
+normn = sqrt(dx_n^2 + dy_n^2);
+if normn == 0, w = NaN; return; end
+ts = (-max_radius:0.25:max_radius)';
+rows_q = row0 + ts.*(dx_n/normn);
+cols_q = col0 + ts.*(-dy_n/normn);
+vals = interp2(O_raw, cols_q, rows_q, 'linear', 0);
+baseline = min(vals(1), vals(end));
+peak = max(vals);
+noise_est = std(vals(1:min(5,numel(vals))));
+if peak <= baseline || (peak - baseline) < max(3*noise_est, 1)
+    w = NaN; return; % no clean peak above the noise floor -- reject
+end
+half = baseline + (peak - baseline)/2;
+idx = find(vals >= half);
+if isempty(idx), w = NaN; return; end
+i0 = idx(1); i1 = idx(end);
+if i0 > 1, left = interp1(vals([i0-1 i0]), ts([i0-1 i0]), half); else, left = ts(i0); end
+if i1 < numel(ts), right = interp1(vals([i1 i1+1]), ts([i1 i1+1]), half); else, right = ts(i1); end
+w = right - left;
+if ~isfinite(w) || w <= 0, w = NaN; end
 end
 
 function write_settings_log(cfg, groups, filepath)

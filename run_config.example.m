@@ -86,6 +86,60 @@ otsu_sensitivity = 0.7; % otsu method only. Multiplier on the raw Otsu level -- 
                  % other datasets, so treat 0.7 as a starting point, not a proven constant --
                  % if severing/NaN'd frames show up, try lowering it before switching to
                  % 'triangle'. See signal_threshold.m for the full writeup.
+fwhm_diameter_correction = 0; % 0 = off (default). 1 = periodically measure a
+                 % threshold-independent width directly off the raw (unmasked) intensity
+                 % profile -- Full Width at Half Max, same perpendicular line as the real
+                 % diameter cross-section search -- and use it to correct the REPORTED
+                 % diameter only. Does NOT change diamo or anything derived from it
+                 % (exclusion radii, crossing windows, corridor widths, ...) -- all of that
+                 % stays on the existing mask-based diamo, since it was tuned assuming that
+                 % semantics and this is only fixing what gets reported. Adds a
+                 % Diameter_um_corrected column to the CSV (always present, equal to
+                 % Diameter_um when this is off or too few calibration samples were
+                 % collected). Motivated by a systematic threshold-method bias found on real
+                 % data: triangle overestimates true (FWHM) diameter by ~30-36% vs otsu's
+                 % ~0-14%, confirmed on both HV207_9 and HV208_100 -- see session notes.
+                 % Has no effect in ratio mode (background already handled upstream by
+                 % FRET-IBRA there). Also writes {fname}_fwhm_calibration.csv, one row per
+                 % calibration pass (Frame, N_samples, Mask_median_px, FWHM_median_px,
+                 % Ratio) -- the correction factor applied to Diameter_um_corrected is
+                 % interpolated PER-FRAME from this file's own Ratio column (see
+                 % fwhm_calib_window), not one blended run-level number. Confirmed on real
+                 % data (HV208_100) that a single global factor is NOT safe to assume: the
+                 % raw mask-based diameter drifted -6.6% over just 300 frames of an
+                 % otherwise-unperturbed run while an independent FWHM ground truth stayed
+                 % flat (-1.9%, i.e. noise) -- almost certainly bleaching/SNR narrowing the
+                 % mask, not a real diameter change. A single factor can only rescale a
+                 % curve, not remove a trend, so it silently carried that same drift
+                 % straight into "corrected" too. Plot Ratio vs Frame in the calibration CSV
+                 % to see this directly for your own run, especially around a mid-run
+                 % treatment that might shift signal characteristics (brightness,
+                 % background, bleaching), not just true diameter.
+fwhm_calib_interval = 50; % fwhm_diameter_correction only. Frames between calibration
+                 % passes -- sets the time resolution the correction factor can track drift
+                 % at. Lower = tracks faster changes (e.g. a fast-acting treatment) but each
+                 % pass is noisier on its own (mitigated by fwhm_calib_window below).
+fwhm_calib_window = 5; % fwhm_diameter_correction only. Moving-median smoothing window (in
+                 % PASSES, not frames) applied to each pass's own ratio before
+                 % interpolating a per-frame correction factor between passes -- a single
+                 % pass is only fwhm_calib_samples points, noisy enough on its own that
+                 % using it unsmoothed would inject that noise into every frame's corrected
+                 % diameter. 1 = no smoothing (use each pass's raw ratio as-is). Frames
+                 % before the first / after the last calibration pass hold that pass's
+                 % value rather than extrapolating a trend past where it was measured.
+                 % Raised from an initial 3: confirmed on real data (HV209_85) that window=3
+                 % wasn't enough to absorb a single noisy pass (ratio 0.808 vs ~0.83-0.89
+                 % neighbors, from ordinary 8-sample luck, not a real event in the input
+                 % stack -- checked directly) -- it still showed up as a visible bump in the
+                 % corrected trace. 5 (paired with fwhm_calib_samples raised to 12 below)
+                 % damps that both at the source (less noisy per-pass median) and across
+                 % time (more passes smoothed together).
+fwhm_calib_samples = 12; % fwhm_diameter_correction only. Cross-section samples per
+                 % calibration pass, spread across the middle 70% of the centerline
+                 % (skips the near-tip/near-base ends where a clean single-peaked profile
+                 % is less reliable). Raised from an initial 8 for the same reason as
+                 % fwhm_calib_window above -- more samples per pass means any one bad
+                 % cross-section has less influence on that pass's own median.
 tip_method = 'skeleton'; % How to find the tip each frame (fluorescence-only pipeline).
                  %   'skeleton' - thin the mask, prune spurious branches (branch_removal.m),
                  %                seed an ellipse fit from the surviving endpoint. Default,
