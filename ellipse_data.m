@@ -1,4 +1,20 @@
-function [tip_final,center,phi,axes,tip_check] = ellipse_data(tip_new)
+function [tip_final,center,phi,axes,tip_check] = ellipse_data(tip_new, prev_tip)
+
+% prev_tip (optional): previous frame's tip position [row col]. When given,
+% used to choose between the ellipse's two extreme points instead of the
+% dsum1/dsum2 "which extreme has more of the local point cloud on its far
+% side" heuristic below -- that heuristic silently assumes the local point
+% cloud has one dominant tip-shaped feature. It breaks when the tip has
+% flattened against a wall and a second, competing curvature feature (a
+% nascent side outgrowth) sits in the same local window: which extreme
+% "wins" on point-mass then flips with tiny frame-to-frame mask changes,
+% since both are real local features, not signal vs. noise. Real growth is
+% sub-pixel per frame at these frame rates (see max_tip_jump_um derivation
+% in main_track_movies.m), so the true tip is essentially always the
+% candidate closer to last frame's tip -- a direct, physically-grounded
+% criterion, unlike dsum's indirect proxy. Falls back to the dsum
+% heuristic when prev_tip isn't available (first frame only).
+if nargin < 2, prev_tip = []; end
 
 if isempty(tip_new) || size(tip_new,2) < 2 || size(tip_new,1) < 5
     tip_final = [0 0]; center = [0 0]; phi = 0; axes = [0 0]; tip_check = [0 0];
@@ -26,14 +42,21 @@ end
 
         dsum1 = sum(diste1);
         dsum2 = sum(diste2);
-    
-        if (dsum1 < dsum2)
-            tip_check  = [xe1 ye1];
-            [pt pos] = min(diste1);
+
+        [~, pos1] = min(diste1); cand1 = tip_new(pos1,:);
+        [~, pos2] = min(diste2); cand2 = tip_new(pos2,:);
+
+        if ~isempty(prev_tip)
+            use1 = pdist2(cand1, prev_tip) <= pdist2(cand2, prev_tip);
         else
-            tip_check  = [xe2 ye2];
-            [pt pos] = min(diste2);
-        end   
+            use1 = dsum1 < dsum2;
+        end
+
+        if use1
+            tip_check = [xe1 ye1]; pos = pos1;
+        else
+            tip_check = [xe2 ye2]; pos = pos2;
+        end
         tip_final = tip_new(pos,:);
     else
         tip_check = [0 0];

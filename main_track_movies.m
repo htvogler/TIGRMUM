@@ -818,7 +818,21 @@ for count = smp:-1:stp
         rad = rad + 1;
     end
 
-    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef);
+    % Cap the ellipse-fit search radius at 2*diamo (roughly two tube-widths)
+    % instead of letting it silently grow to the whole image diagonal: a
+    % flattened tip (e.g. pressed against a PDMS wall) gives ellipse_data a
+    % near-collinear point cloud that fails the isreal(axes) check, so the
+    % old unbounded loop kept expanding until it happened to reach whatever
+    % curved feature was fittable next -- often a nascent side outgrowth
+    % well past the actual tip, which is why tip_final was seen wiggling
+    % between the flat wall-contact region and that outgrowth frame to
+    % frame. Falls back to last frame's tip (more trustworthy than the raw
+    % seed, which is what triggered the failed fit in the first place) when
+    % available; diamo_est covers the very first frame, before diamo itself
+    % is frozen.
+    fb_pt = [];
+    if exist('tip_final_last', 'var'), fb_pt = tip_final_last; end
+    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo_est, fb_pt);
     % locate_tip/edge_quant measures diam at a single column (maxy-1, the
     % tube's crossing into the crop) -- that one column can read
     % artificially low on a frame-specific segmentation quirk (a marginal
@@ -941,6 +955,10 @@ for count = smp:-1:stp
         if (pdist2(Qef,Sbf) > weight*diamo) close_dist = 1; end
         if (weight == 0) kill_angle = 0;
         else kill_angle = 75;
+        end
+        if debug_mode
+            fprintf('  weight F%d: seed-to-branchpt=%.1fpx vs weight*diamo=%.1fpx (weight=%.2f) -> close_dist=%d\n', ...
+                count, pdist2(Qef,Sbf), weight*diamo, weight, close_dist);
         end
         [S2,Sef,S2area] = branch_removal(S,Sbf,Sel,kill_angle,close_dist);
     end
@@ -1338,10 +1356,27 @@ for count = smp:-1:stp
     right_anchor = [ra_row, right_col];
     if weak_signal, right_anchor_row_last = ra_row; end
 
-    % Weight: inversely proportional to distance from tube boundary
+    % Weight: inversely proportional to distance from tube boundary, SQUARED
+    % -- 1/(D+1) alone saturates within a few px of the wall (1/6 at D=5,
+    % 1/11 at D=10: barely any further improvement deeper in), so across a
+    % WIDE region (e.g. a tip bulb) the cost landscape goes nearly flat
+    % once you're a bit off the wall. A flat landscape gives the greedy
+    % descent below no real incentive to hug the true medial axis: a
+    % shorter, merely-adequate path across the bulb can cost about the same
+    % as the longer, properly-centered one, so it takes a diagonal
+    % "shortcut" straight across instead of curving through the centre --
+    % confirmed on HV209_116 frame 832, where the traced centerline cuts
+    % straight from the shank to the tip instead of following the bulb's
+    % actual medial axis, badly skewing the Half1/Half2 ROI split. The same
+    % near-flatness can also stall the descent outright (frame 1: several
+    % near-tied neighbours with no strictly-lower direction, so the walk
+    % breaks early and the centerline never reaches the true tip). Squaring
+    % makes the cost fall off much faster near the wall and stay
+    % meaningfully non-flat further in, giving a sharper single-minimum
+    % ridge along the medial axis instead of a broad plateau.
     D_tube = bwdist(~U);
     W_tube = Inf(size(U));
-    W_tube(U) = 1 ./ (D_tube(U) + 1);
+    W_tube(U) = 1 ./ (D_tube(U) + 1).^2;
 
     % Geodesic cost from right_anchor (low cost = centre of tube)
     GD = graydist(W_tube, right_anchor(2), right_anchor(1));
@@ -1372,7 +1407,17 @@ for count = smp:-1:stp
         nbhd = GD(r0:r1, c0:c1);
         nbhd(visited(r0:r1, c0:c1)) = Inf;
         [min_val, idx] = min(nbhd(:));
-        if min_val >= GD(r,c), break; end
+        % GD is a true geodesic distance field from right_anchor, so barring
+        % floating-point ties there's always a strictly-lower unvisited
+        % neighbour except at the anchor itself -- a plain min_val>=GD(r,c)
+        % stops dead on the FIRST tied neighbour instead of stepping through
+        % it, which can freeze the walk just a few steps from the tip in a
+        % wide region (bwdist gives locally-repeated integer-ish distances
+        % there -- confirmed on HV209_116 frame 1: the traced centerline
+        % stalls inside the tip bulb and never reaches the true tip).
+        % Tolerate exact ties (>, not >=); the visited mask still guarantees
+        % termination.
+        if min_val > GD(r,c), break; end
         [dr, dc] = ind2sub(size(nbhd), idx);
         r = r0+dr-1; c = c0+dc-1;
         n_path = n_path + 1;
@@ -1381,6 +1426,10 @@ for count = smp:-1:stp
     end
     path = path(1:n_path,:);
     yctk = path(:,1); xctk = path(:,2);
+    if debug_mode
+        fprintf('  centerline F%d: n_path=%d start=[%d %d] end=[%d %d] right_anchor=[%d %d] GD_end=%.3f GD_start=%.3f\n', ...
+            count, n_path, path(1,1), path(1,2), path(end,1), path(end,2), right_anchor(1), right_anchor(2), GD(path(end,1),path(end,2)), GD(path(1,1),path(1,2)));
+    end
 
     % Cumulative arc length along path (0 at tip, max at base)
     path_dist = [0; cumsum(sqrt(sum(diff(path).^2, 2)))];
@@ -1630,12 +1679,33 @@ for count = smp:-1:stp
                 count,arc_start_px,arc_stop_px,k_start,k_stop,startc1,stopc1,startc2,stopc2);
         end
 
+        % tip_boundpos/tip_end1/tip_end2/cap_lo/cap_hi: computed once, up
+        % front, and reused for BOTH the outer F polygon just below and the
+        % roi1/roi2 stitch further down (see tip_cap_stitch). The outer
+        % polygon used to patch its own tip-ward gap with the raw
+        % boundb(postotal2(1):postotal1(2),:) range instead -- the same
+        % range the roi1/roi2 fix below already identified as wrong
+        % (postotal1(2)/postotal2(1) are just the first elements past an
+        % unrelated bisection point, not anchored to the tip at all). Since
+        % F1/F2 = F .* roi1/roi2, a wrong/mismatched patch on the OUTER F
+        % silently clips roi1/roi2 regardless of how correct they are --
+        % confirmed on HV209_116 frame 1: F1/F2 still showed a notched,
+        % disconnected edge after fixing roi1/roi2's own stitch, because F
+        % itself was still cut along the old wrong range.
+        if (starti < tip_excl_dist)
+            tip_boundpos = dsearchn(boundb, tip_final(count,:));
+            [~, near1] = min(abs(postotal1 - tip_boundpos)); tip_end1 = postotal1(near1);
+            [~, near2] = min(abs(postotal2 - tip_boundpos)); tip_end2 = postotal2(near2);
+            cap_lo = min([tip_boundpos, tip_end1, tip_end2]);
+            cap_hi = max([tip_boundpos, tip_end1, tip_end2]);
+        end
+
         % Create masks for rectangles and circles, and include whether they are
         % normal, split or stationary
         if (ROItype ~= 2 | count == smp)
             if (circle == 0)
                 roi = vertcat(total1(ordered_range(startc1,stopc1),:), total2(flip(ordered_range(startc2,stopc2)),:));
-                if (starti < tip_excl_dist) roi = vertcat(boundb(postotal2(1):postotal1(2),:),roi); end
+                if (starti < tip_excl_dist) roi = vertcat(boundb(cap_lo:cap_hi,:),roi); end
                 F = poly2mask(roi(:,2),roi(:,1),Esize(1),Esize(2));
             else
                 mask = zeros(Esize(1),Esize(2));
@@ -1670,21 +1740,9 @@ for count = smp:-1:stp
                     % Verified on HV197_4_19 frames 2000-2043: valid frames went
                     % from 42/44 to 44/44 after the tip_boundpos change (kept);
                     % this closes the remaining gap in what it was anchored to.
-                    tip_boundpos = dsearchn(boundb, tip_final(count,:));
-                    [~, near1] = min(abs(postotal1 - tip_boundpos));
-                    tip_end1 = postotal1(near1);
-                    if tip_end1 >= tip_boundpos
-                        stitch1 = boundb(tip_boundpos:tip_end1,:);
-                    else
-                        stitch1 = boundb(tip_boundpos:-1:tip_end1,:);
-                    end
-                    [~, near2] = min(abs(postotal2 - tip_boundpos));
-                    tip_end2 = postotal2(near2);
-                    if tip_end2 <= tip_boundpos
-                        stitch2 = boundb(tip_boundpos:-1:tip_end2,:);
-                    else
-                        stitch2 = boundb(tip_boundpos:tip_end2,:);
-                    end
+                    % tip_boundpos/tip_end1/tip_end2 already computed above,
+                    % up front (shared with the outer F polygon's own patch).
+                    [stitch1, stitch2] = tip_cap_stitch(boundb, tip_boundpos, tip_end1, tip_end2, xc, yc, dx, dy);
                     roi1 = vertcat(stitch1,roi1,boundb(tip_boundpos,:));
                     roi2 = vertcat(stitch2,roi2,boundb(tip_boundpos,:));
                 end
@@ -2696,6 +2754,51 @@ edge2 = total2(:,1) - nfitc.p1.*total2(:,2) - nfitc.p2;
 c2 = nearest_crossing_to_sample(edge2, total2, al2, sample_pt, window);
 end
 
+function [stitch1, stitch2] = tip_cap_stitch(boundb, tip_boundpos, tip_end1, tip_end2, xc, yc, dx, dy)
+% Splits the near-tip boundary arc (the tube's true rounded/blunt tip cap,
+% spanning tip_end1 to tip_end2 -- excluded from total1/total2 by the
+% diamo*0.75 tip-exclusion radius, so it needs stitching back in whenever
+% starti falls inside that radius) by which side of the tube's own local
+% axis each point falls on, using the tip-most centerline tangent
+% (xc(1)/yc(1)/dx(1)/dy(1)) -- NOT by raw boundb index order split at the
+% single point tip_boundpos (the previous approach), which only produces
+% an even split when tip_boundpos happens to sit exactly at the cap's
+% true bilateral center. For a wide/blunt tip (e.g. flattened against a
+% wall), a small offset there sends most of the round cap's arc to one
+% side, badly skewing Half1/Half2 signal comparisons even though the tip
+% position itself is fine and nothing else about the frame looks wrong.
+% Confirmed on HV209_116 frame 832 (a wall-flattened tip): the old split
+% put nearly the whole cap on one side, visibly non-perpendicular to the
+% traced centerline in growth.mp4/roi_debug.avi.
+%
+% IMPORTANT: cap_pts is filtered by side as a single CONTIGUOUS run per
+% side, not a per-point boolean split -- boundb is a pixelated, staircase
+% digital contour, so the raw cross-product sign can flip back and forth
+% for a few points right around the true crossing instead of changing
+% exactly once. A per-point filter (side>=0 / side<0) fragments those
+% flickers into multiple separate runs, which poly2mask then renders as a
+% notched, disconnected ROI edge that doesn't follow the tube outline at
+% all -- confirmed on HV209_116 frame 1 after the first version of this
+% fix. Finding the single point closest to the dividing axis and splitting
+% the already-ordered cap_pts there instead keeps each side one genuine
+% contiguous arc, like the boundb-index split this replaces did.
+cap_lo = min([tip_boundpos, tip_end1, tip_end2]);
+cap_hi = max([tip_boundpos, tip_end1, tip_end2]);
+cap_pts = boundb(cap_lo:cap_hi, :);
+
+Tx = dx(1); Ty = dy(1); Cx = xc(1); Cy = yc(1); % tip-ward tangent + tip point, (col,row)
+side = Ty.*(cap_pts(:,2)-Cx) - Tx.*(cap_pts(:,1)-Cy); % cross(T, P-C): which side of the tube's axis
+[~, split_idx] = min(abs(side)); % single contiguous split, closest point to the axis
+part_a = cap_pts(1:split_idx, :);
+part_b = cap_pts(split_idx+1:end, :);
+
+if tip_end1 == cap_lo
+    stitch1 = part_a; stitch2 = part_b;
+else
+    stitch1 = part_b; stitch2 = part_a;
+end
+end
+
 function r = ordered_range(a, b)
 % Builds an index range from a to b, ascending or descending as needed --
 % used instead of a plain `a:b` wherever a and b are two INDEPENDENTLY
@@ -3167,7 +3270,9 @@ function [tip_out, diam_out, maxy_out, boundb_out, Qef_out, Qel_out, Qec_out, ..
             rad = rad + 1;
         end
 
-        [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef);
+        % Same capped-search fix as the primary path above (see its comment) --
+        % diamo and tip_final_last are both already this function's own params.
+        [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, tip_final_last);
         diam = robust_diam(U, size(U,2) - 1, diam, count, debug_mode);
         tip_ellipsepos = dsearchn(boundb,tip_ellipse);
         tip_ellipsef = boundb(tip_ellipsepos,:);
@@ -3346,7 +3451,9 @@ function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_
         rad = rad + 1;
     end
 
-    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef);
+    % Same capped-search fix as the reverse pass (see main loop's comment) --
+    % diamo and prev_tip are both already this function's own params.
+    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, prev_tip);
     % Same robust-diam overwrite as the reverse pass (see main loop) -- keeps
     % the tolerance check below comparing like-for-like instead of a robust
     % diamo reference against one noisy single-column per-frame sample.
@@ -3547,9 +3654,10 @@ function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_
     end
     right_anchor = [ra_row, right_col];
 
+    % Squared, same reasoning as the reverse pass's own copy of this block.
     D_tube = bwdist(~U);
     W_tube = Inf(size(U));
-    W_tube(U) = 1 ./ (D_tube(U) + 1);
+    W_tube(U) = 1 ./ (D_tube(U) + 1).^2;
     GD = graydist(W_tube, right_anchor(2), right_anchor(1));
     GD(~U) = Inf;
 
@@ -3574,7 +3682,17 @@ function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_
         nbhd = GD(r0:r1, c0:c1);
         nbhd(visited(r0:r1, c0:c1)) = Inf;
         [min_val, idx] = min(nbhd(:));
-        if min_val >= GD(r,c), break; end
+        % GD is a true geodesic distance field from right_anchor, so barring
+        % floating-point ties there's always a strictly-lower unvisited
+        % neighbour except at the anchor itself -- a plain min_val>=GD(r,c)
+        % stops dead on the FIRST tied neighbour instead of stepping through
+        % it, which can freeze the walk just a few steps from the tip in a
+        % wide region (bwdist gives locally-repeated integer-ish distances
+        % there -- confirmed on HV209_116 frame 1: the traced centerline
+        % stalls inside the tip bulb and never reaches the true tip).
+        % Tolerate exact ties (>, not >=); the visited mask still guarantees
+        % termination.
+        if min_val > GD(r,c), break; end
         [dr, dc] = ind2sub(size(nbhd), idx);
         r = r0+dr-1; c = c0+dc-1;
         n_path = n_path + 1;
@@ -3583,6 +3701,10 @@ function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_
     end
     path = path(1:n_path,:);
     yctk = path(:,1); xctk = path(:,2);
+    if debug_mode
+        fprintf('  centerline F%d: n_path=%d start=[%d %d] end=[%d %d] right_anchor=[%d %d] GD_end=%.3f GD_start=%.3f\n', ...
+            count, n_path, path(1,1), path(1,2), path(end,1), path(end,2), right_anchor(1), right_anchor(2), GD(path(end,1),path(end,2)), GD(path(1,1),path(1,2)));
+    end
     path_dist = [0; cumsum(sqrt(sum(diff(path).^2, 2)))];
 
     nline = 1:100; norder = floor(nline*path_dist(end)/100);
@@ -3686,9 +3808,20 @@ function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_
         % comment) for why startc1/stopc1/startc2/stopc2 are NOT swapped into
         % numeric order here.
 
+        % See the reverse pass's own copy of this block for why this is
+        % computed once, up front, and reused for both the outer F polygon
+        % just below and the roi1/roi2 stitch further down.
+        if (starti < tip_excl_dist)
+            tip_boundpos = dsearchn(boundb, tip_row);
+            [~, near1] = min(abs(postotal1 - tip_boundpos)); tip_end1 = postotal1(near1);
+            [~, near2] = min(abs(postotal2 - tip_boundpos)); tip_end2 = postotal2(near2);
+            cap_lo = min([tip_boundpos, tip_end1, tip_end2]);
+            cap_hi = max([tip_boundpos, tip_end1, tip_end2]);
+        end
+
         if (circle == 0)
             roi = vertcat(total1(ordered_range(startc1,stopc1),:), total2(flip(ordered_range(startc2,stopc2)),:));
-            if (starti < tip_excl_dist), roi = vertcat(boundb(postotal2(1):postotal1(2),:),roi); end
+            if (starti < tip_excl_dist), roi = vertcat(boundb(cap_lo:cap_hi,:),roi); end
             F = poly2mask(roi(:,2),roi(:,1),Esize(1),Esize(2));
         else
             maskc = zeros(Esize(1),Esize(2));
@@ -3705,25 +3838,9 @@ function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_
             roi1 = vertcat(total1(ordered_range(startc1,stopc1),:), [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
             roi2 = vertcat(total2(ordered_range(startc2,stopc2),:), [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
             if (starti < tip_excl_dist)
-                % See the reverse pass's own copy of this block for why the
-                % stitch anchors to whichever postotal1/postotal2 element is
-                % actually closest (by boundb index) to tip_boundpos, not
-                % postotal1(2)/postotal2(1).
-                tip_boundpos = dsearchn(boundb, tip_row);
-                [~, near1] = min(abs(postotal1 - tip_boundpos));
-                tip_end1 = postotal1(near1);
-                if tip_end1 >= tip_boundpos
-                    stitch1 = boundb(tip_boundpos:tip_end1,:);
-                else
-                    stitch1 = boundb(tip_boundpos:-1:tip_end1,:);
-                end
-                [~, near2] = min(abs(postotal2 - tip_boundpos));
-                tip_end2 = postotal2(near2);
-                if tip_end2 <= tip_boundpos
-                    stitch2 = boundb(tip_boundpos:-1:tip_end2,:);
-                else
-                    stitch2 = boundb(tip_boundpos:tip_end2,:);
-                end
+                % tip_boundpos/tip_end1/tip_end2 already computed above, up
+                % front (shared with the outer F polygon's own patch).
+                [stitch1, stitch2] = tip_cap_stitch(boundb, tip_boundpos, tip_end1, tip_end2, xc, yc, dx, dy);
                 roi1 = vertcat(stitch1,roi1,boundb(tip_boundpos,:));
                 roi2 = vertcat(stitch2,roi2,boundb(tip_boundpos,:));
             end

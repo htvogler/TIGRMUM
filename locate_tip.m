@@ -1,4 +1,22 @@
-function [boundb, tip_final, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(H, tol, major)
+function [boundb, tip_final, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(H, tol, major, toln_cap, fallback_pt)
+
+% toln_cap: ceiling on how far the tolerance-growth loop below is allowed
+% to search for a fittable point cloud, in px (default: unbounded, i.e.
+% the previous behaviour -- the loop can grow all the way to the image
+% diagonal). Pass e.g. 2*diamo so the ellipse fit stays anchored to the
+% tip's own local cross-section instead of silently sliding into a
+% whole-mask-scale search.
+%
+% fallback_pt: point returned (instead of `major`, the raw seed) if even
+% toln_cap isn't enough to get a valid fit. Pass e.g. tip_final_last (the
+% previous frame's tip) when available -- more trustworthy than the seed
+% itself in exactly the cases that trigger this fallback (the seed sits on
+% an ambiguous/flattened local region, which is why the fit kept failing).
+%
+% Both optional, defaulting to the original behaviour, so existing callers
+% (tip_track_ratio.m) are unaffected.
+if nargin < 4 || isempty(toln_cap), toln_cap = norm(size(H)); end
+if nargin < 5 || isempty(fallback_pt), fallback_pt = major(1,:); end
 
 % Extract image boundary (longest boundary)
 I = bwboundaries(H,'holes');
@@ -40,16 +58,16 @@ end
 boundc = circshift(bound,-ybound(1));
 
 toln = tol*1.25; tip_final = [0 0];
-toln_max = norm(size(H));
+toln_max = toln_cap;
 while (nnz(tip_final) == 0)
     tip_new = [];
     for i = 1:length(bound)
         dist_val = pdist2(boundc(i,:),major(1,:));
         if (dist_val < toln) tip_new = [tip_new; boundc(i,:)]; end
     end
-    [tip_final,center,phin,axes,tip_check] = ellipse_data(tip_new);
+    [tip_final,center,phin,axes,tip_check] = ellipse_data(tip_new, fallback_pt);
     if toln > toln_max
-        tip_final = major(1,:);
+        tip_final = fallback_pt;
         break;
     end
     toln = toln + 5;

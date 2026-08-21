@@ -73,7 +73,25 @@ while(length(Qbr) > 0)
                 if (Q2ci(1) == Q3di(1)) Q3min = Q3di(2); end
             end
         end
-        
+
+        % Safety override: never discard the arm that's actually the
+        % LARGEST of the three by true (unclipped) size. Q3area above is
+        % deliberately clipped to a 20px disk around the branch point, to
+        % keep the angle comparison local/fair -- but that clipping throws
+        % away exactly the signal (true arm length) that would otherwise
+        % make a long continuous tube obviously distinguishable from a
+        % short spurious stub. Confirmed on HV209_116 frame 2297: the
+        % angle heuristic picked the ~700px main shaft as the "odd one
+        % out" relative to a ~15px stub and a ~25px side-arm (all three
+        % look comparable within just the local 20px disk), discarded the
+        % real tube, and left only the stub+side-arm reconnected as S2 --
+        % see diag_2297_11_Q2_debranched.png / _15_S2_debranched.png.
+        Q2area3 = Q2area(1:3);
+        [~, Q2_largest] = max(Q2area3);
+        if Q3min == Q2_largest
+            [~, Q3min] = min(Q2area3);
+        end
+
         if (angdiff > 0)
             [tmp, Q2ai] = sort(Q2area);
             Qarea = bwarea(Q2label(Q2label == Q2ai(1)))/bwarea(Q2label(Q2label == Q2ai(2)));
