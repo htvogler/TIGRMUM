@@ -304,3 +304,38 @@ ringwalk_fallback_to_skeleton = 0; % ringwalk only (tip_method='ringwalk'). 0 (d
                  % Adds a 'Tip_skeleton_fallback_used' column to the output CSV (1 if this row's
                  % tip came from the fallback, whether or not it ultimately passed the jump check,
                  % 0 otherwise) so recovered frames are auditable, not silently substituted.
+
+% Manual tip seed for the anchor frame (both tip_method='ringwalk' and 'skeleton')
+% Optional escape hatch for the ONE frame everything else depends on: the anchor frame
+% (count==smp, processed first since the main loop runs smp:-1:stp) has no prior-frame
+% history to disambiguate a wrong branch/candidate, and because the whole backward walk
+% (and ringwalk_seed_from_tip's own seeding) is seeded from here, a bad automated pick on
+% this single frame can misdirect the entire stack. Only ever touches the anchor frame --
+% once ring_walk_tip/skeleton locks onto the correct starting point, their own existing
+% continuity-based candidate selection carries it forward normally for every other frame,
+% no per-frame input needed. Two ways to supply the human-confirmed coordinate:
+manual_tip_seed_interactive = 0; % 1 = pop up the anchor frame's own raw display image --
+                 % straight from L (the h5 TIGRMUM already has open as its required input,
+                 % unlike FRET-IBRA's *_back_bleach.tif, which is facultative and not always
+                 % produced) -- with the current mask boundary overlaid for context, and
+                 % capture a click (ginput) as the seed coordinate. Needs a live interactive
+                 % MATLAB session: ginput cannot work under `matlab -batch`, so a stack using
+                 % this must be run from a normal desktop/Command Window session, not the
+                 % usual batch invocation. Takes priority over manual_tip_seed_row/col below
+                 % when both are set. 0 (default) = don't prompt, use manual_tip_seed_row/col
+                 % (or fully automatic if those are also empty).
+manual_tip_seed_row = []; % Non-interactive alternative to manual_tip_seed_interactive: a
+                 % pre-supplied coordinate (e.g. read off a pixel position some other way).
+                 % MUST be in the CROPPED stack's own coordinate space -- the same [row, col]
+                 % convention as Tip_row_px/Tip_col_px in the output CSV (matching
+                 % diag_<N>_01_O_raw.png), NOT the original uncropped acquisition frame or an
+                 % external viewer's own crop (e.g. Fiji opened on a differently-cropped tif).
+                 % Leave empty ([], default) for fully automatic behaviour, unchanged.
+manual_tip_seed_col = []; % See manual_tip_seed_row.
+manual_tip_seed_radius_factor = 0.25; % manual_tip_seed_interactive/row/col only: how far (in
+                 % units of diamo_est) the algorithm's own anchor-frame Qef may sit from the
+                 % seed coordinate before being overridden -- default diamo/4. Below this
+                 % radius the algorithm's pick is trusted as-is (it already agrees); beyond
+                 % it, Qef is replaced with the seed coordinate snapped onto the nearest real
+                 % mask pixel (same snap_to_mask helper the ringwalk seeding path uses), not
+                 % anything ring_walk_tip/branch_removal picked.

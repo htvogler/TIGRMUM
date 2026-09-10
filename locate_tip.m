@@ -1,4 +1,4 @@
-function [boundb, tip_final, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(H, tol, major, toln_cap, fallback_pt)
+function [boundb, tip_final, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(H, tol, major, toln_cap, fallback_pt, max_jump_px)
 
 % toln_cap: ceiling on how far the tolerance-growth loop below is allowed
 % to search for a fittable point cloud, in px (default: unbounded, i.e.
@@ -17,6 +17,8 @@ function [boundb, tip_final, tip_new, tip_check, diam, maxy, center, phin, axes,
 % (tip_track_ratio.m) are unaffected.
 if nargin < 4 || isempty(toln_cap), toln_cap = norm(size(H)); end
 if nargin < 5 || isempty(fallback_pt), fallback_pt = major(1,:); end
+if nargin < 6 || isempty(max_jump_px), max_jump_px = Inf; end
+% max_jump_px: passed straight through to ellipse_data.m -- see its own doc.
 
 % Extract image boundary (longest boundary)
 I = bwboundaries(H,'holes');
@@ -65,7 +67,7 @@ while (nnz(tip_final) == 0)
         dist_val = pdist2(boundc(i,:),major(1,:));
         if (dist_val < toln) tip_new = [tip_new; boundc(i,:)]; end
     end
-    [tip_final,center,phin,axes,tip_check] = ellipse_data(tip_new, fallback_pt);
+    [tip_final,center,phin,axes,tip_check] = ellipse_data(tip_new, fallback_pt, max_jump_px);
     if toln > toln_max
         tip_final = fallback_pt;
         break;

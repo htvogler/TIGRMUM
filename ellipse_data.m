@@ -1,4 +1,4 @@
-function [tip_final,center,phi,axes,tip_check] = ellipse_data(tip_new, prev_tip)
+function [tip_final,center,phi,axes,tip_check] = ellipse_data(tip_new, prev_tip, max_jump_px)
 
 % prev_tip (optional): previous frame's tip position [row col]. When given,
 % used to choose between the ellipse's two extreme points instead of the
@@ -14,7 +14,25 @@ function [tip_final,center,phi,axes,tip_check] = ellipse_data(tip_new, prev_tip)
 % candidate closer to last frame's tip -- a direct, physically-grounded
 % criterion, unlike dsum's indirect proxy. Falls back to the dsum
 % heuristic when prev_tip isn't available (first frame only).
+%
+% max_jump_px (optional, default Inf): sanity bound on the "closer to
+% prev_tip" pick above -- picking the LESS-wrong of two candidates is still
+% wrong when BOTH are implausibly far from prev_tip, which happens when the
+% caller's local search window (toln in locate_tip.m) grows past a failed
+% small-radius attempt and overshoots the tip bulb into an adjacent
+% feature (the shank curving away, a nearby bend) instead of shrinking back
+% around it. Confirmed on HV209_62 F3279: Qef sat right at the true tip,
+% but a degenerate first-radius fit forced growth to a radius that swept up
+% into the bend, and the resulting ellipse's two extremes (one up near the
+% bend, one merely closer to the tip) were 20px and 15px from the real
+% previous tip respectively -- "closer" chose a candidate that was still a
+% full tube-diameter away from anywhere real. When the chosen candidate
+% exceeds max_jump_px, don't trust either ellipse extreme -- fall back to
+% the real boundary pixel already in tip_new nearest prev_tip directly,
+% which is a strictly more conservative continuity pick than either raw
+% ellipse extreme.
 if nargin < 2, prev_tip = []; end
+if nargin < 3 || isempty(max_jump_px), max_jump_px = Inf; end
 
 if isempty(tip_new) || size(tip_new,2) < 2 || size(tip_new,1) < 5
     tip_final = [0 0]; center = [0 0]; phi = 0; axes = [0 0]; tip_check = [0 0];
@@ -58,6 +76,13 @@ end
             tip_check = [xe2 ye2]; pos = pos2;
         end
         tip_final = tip_new(pos,:);
+
+        % Sanity bound on the pick above -- see max_jump_px's own doc.
+        if ~isempty(prev_tip) && pdist2(tip_final, prev_tip) > max_jump_px
+            [~, pos_near] = min(pdist2(tip_new, prev_tip));
+            tip_final = tip_new(pos_near,:);
+            tip_check = tip_final;
+        end
     else
         tip_check = [0 0];
         tip_final = [0 0];

@@ -24,6 +24,21 @@ if max_tip_jump_um <= 0
 elseif exist('debug_mode', 'var') && debug_mode
     fprintf('max_tip_jump_um: explicit override = %.2fum (frame-rate derivation skipped)\n', max_tip_jump_um);
 end
+% ellipse_data.m's own within-frame candidate sanity check (see its
+% max_jump_px doc) needs a MUCH tighter bound than max_tip_jump_um above --
+% that one is deliberately generous (real growth + jitter + safety factor,
+% ~31px here) since it's rejecting genuinely implausible frame-to-frame
+% displacement. This one is answering a different question: "is this
+% ellipse candidate still the SAME local tip feature, or did the search
+% window's point cloud spill onto an adjacent feature (a bend, a nascent
+% outgrowth)?" -- confirmed on HV209_62 F3279 that a spilled-onto-the-bend
+% candidate can be 15px off while still passing comfortably under the
+% ~31px growth-based threshold. diamo itself (the tube's own width) is the
+% right scale for "still plausibly the same local bulge" -- computed
+% per-frame from diamo_est/diamo where each locate_tip call site already
+% has it (diamo_est/diamo aren't known yet this early in the script, so
+% this can't be hoisted up here the way max_tip_jump_um is).
+ellipse_candidate_max_jump_factor = 0.5; % half a tube diameter
 
 % ringwalk tip-seeding defaults (see run_config.example.m for full docs) --
 % defensively defaulted here for the same reason as above: existing
@@ -33,6 +48,28 @@ if ~exist('ringwalk_seed_max_steps', 'var'), ringwalk_seed_max_steps = 30; end
 if ~exist('ringwalk_reanchor_interval', 'var'), ringwalk_reanchor_interval = 50; end
 if ~exist('ringwalk_seed_offset_factor', 'var'), ringwalk_seed_offset_factor = 2.5; end
 if ~exist('ringwalk_fallback_to_skeleton', 'var'), ringwalk_fallback_to_skeleton = 0; end
+
+% Manual tip seed for the anchor frame (count==smp, no prior history) --
+% see run_config.example.m for full docs. Defensively defaulted here for
+% the same reason as above.
+if ~exist('manual_tip_seed_row', 'var'), manual_tip_seed_row = []; end
+if ~exist('manual_tip_seed_col', 'var'), manual_tip_seed_col = []; end
+if ~exist('manual_tip_seed_radius_factor', 'var'), manual_tip_seed_radius_factor = 0.25; end
+if ~exist('manual_tip_seed_interactive', 'var'), manual_tip_seed_interactive = 0; end
+
+% Widens the per-run diagnostic PNG dump (normally only count==smp and
+% count==smp-1, see DIAGNOSTIC BLOCK 1/2's own comments) to every frame in
+% [lo hi] inclusive, in addition to smp/smp-1. Empty (default) = unchanged
+% behaviour. For diagnosing a real multi-frame drift (e.g. "why does the
+% tip wander frame-by-frame downstream of a known-good anchor"), set lo/hi
+% to the range of interest and smp to the TRUE stack end -- ringwalk's own
+% seeding is history-dependent (ringwalk_seed_from_tip), so only a
+% continuous run from the real anchor reproduces the actual per-frame
+% seeding that produced the drift; re-anchoring smp at some frame N+1 to
+% dump just frame N (the single-frame technique in DIAGNOSTIC BLOCK 1's own
+% comment) does NOT reproduce this, since it fabricates a fresh cold start
+% partway through instead of a continuation.
+if ~exist('debug_frame_range', 'var'), debug_frame_range = []; end
 
 % FWHM diameter calibration defaults (see fwhm_diameter_correction in
 % run_config.example.m) -- defensively defaulted here for the same reason
@@ -208,6 +245,7 @@ if (tip_plot == 1) && (video_intensity ~= 2)
                       % on the mostly-black background of these small frames
     open(V);
     hdum = figure('visible','off');
+    set(hdum, 'Units', 'pixels', 'Position', [100 100 1120 840]); % must match render_growth_frame's fixed size exactly
     imagesc(zeros(size(M,1), size(M,2)));
     fdum = getframe(gcf);
     V_frame_size = size(fdum.cdata);
@@ -417,6 +455,10 @@ intensityB2_F2 = NaN(1, smp);
 warning('off', 'MATLAB:nearlySingularMatrix');
 for count = smp:-1:stp
     disp(['Image Analysis:' num2str(count)]);
+    % Widens all three DIAGNOSTIC BLOCKs below beyond just smp/smp-1 -- see
+    % debug_frame_range's own doc near the top of this file.
+    dump_diag = debug_mode && (count == smp || count == smp - 1 || ...
+        (~isempty(debug_frame_range) && count >= debug_frame_range(1) && count <= debug_frame_range(2)));
     try
     O = M(:,:,count);
 
@@ -605,7 +647,7 @@ for count = smp:-1:stp
     % case has its own failure modes (no continuity to disambiguate a branch
     % choice) that smp-1 can't show. To debug some other frame N, set
     % smp = N+1 (dumps N via the smp-1 branch).
-    if debug_mode && (count == smp || count == smp - 1)
+    if dump_diag
         dp = fullfile(outpath, sprintf('diag_%d', count));
         imwrite(mat2gray(double(O)),            [dp '_01_O_raw.png']);
         imwrite(mat2gray(double(L(:,:,count))), [dp '_02_L_display.png']);
@@ -790,6 +832,194 @@ for count = smp:-1:stp
         end
     end
 
+    % Manual tip seed override (anchor frame only, count==smp): optional
+    % escape hatch for exactly the failure this whole mechanism exists to
+    % catch -- the cold-start frame has no prior history to disambiguate a
+    % wrong branch/candidate, and since everything downstream (the whole
+    % backward walk, ringwalk_seed_from_tip's own seeding) is seeded from
+    % here, a bad automated pick on THIS one frame can misdirect the entire
+    % stack. Two ways to supply the human-confirmed coordinate:
+    %  (a) manual_tip_seed_interactive=1: pop up THIS frame's own raw display
+    %      image (straight from L, i.e. the h5 TIGRMUM already has open --
+    %      always present, unlike FRET-IBRA's optional *_back_bleach.tif) with
+    %      the current mask boundary overlaid for context, and capture a
+    %      click via ginput. Needs a live interactive MATLAB session -- ginput
+    %      cannot work under `matlab -batch`, so a stack using this must be
+    %      run normally (desktop/Command Window), not via the usual batch
+    %      invocation.
+    %  (b) manual_tip_seed_row/col: pre-supplied coordinates (e.g. read off a
+    %      pixel position some other way) -- MUST be in the CROPPED stack's
+    %      own coordinate space, i.e. the same [row, col] convention as
+    %      Tip_row_px/Tip_col_px in the output CSV (matching diag_<N>_01_O_raw.png,
+    %      not the original uncropped acquisition frame or any external
+    %      viewer's own crop).
+    % Either way, only step in when the algorithm's own Qef disagrees by more
+    % than manual_tip_seed_radius_factor*diamo_est -- if it already agrees,
+    % leave Qef untouched (both methods' own internal candidate scoring still
+    % ran normally either way). When overriding, trust the human coordinate
+    % directly rather than anything ring_walk_tip/branch_removal picked,
+    % snapped onto the nearest real mask pixel (same snap_to_mask helper the
+    % ringwalk seeding path already uses) so Qef always lands on real signal
+    % even if the click/coordinate is a pixel or two off the mask.
+    manual_pt = [];
+    manual_tip_seed_applied = false;
+    manual_tip_seed_final_pt = [];
+    if count == smp && manual_tip_seed_interactive
+        % L (raw display stack) is never rotated in the main loop, unlike
+        % O/U (and everything derived from them, including this frame's mask
+        % boundary below) -- those go through the same type-conditional
+        % imrotate right after find_orient (see O's own rotation a few
+        % hundred lines up) so the tube consistently enters from the right,
+        % TIGRMUM's internal crop convention. Showing L as-is would display
+        % the tube entering from whatever direction it actually was acquired
+        % in while overlaying a mask boundary computed in the ROTATED frame
+        % -- two different orientations superimposed, useless for clicking.
+        % Apply the identical rotation to a local copy before displaying so
+        % the raw image and the mask agree, matching what Qef/manual_pt/
+        % Tip_row_px all mean.
+        Lclick = L(:,:,count);
+        if (type == 1) Lclick = imrotate(Lclick,-90);
+        elseif (type == 3) Lclick = imrotate(Lclick,90);
+        elseif (type == 4) Lclick = imrotate(Lclick,180);
+        end
+
+        % Pre-size the figure/axes to the target zoom directly, rather than
+        % asking imshow for a magnification and hoping it honors it --
+        % imshow's 'InitialMagnification' silently falls back to whatever
+        % fits the current figure/screen whenever its own fit logic decides
+        % to (confirmed not reliably giving 300% in practice). Building a
+        % figure whose pixel size already IS image_size*zoom, with no
+        % menu/toolbar stealing pixels, and filling it edge-to-edge with the
+        % axes, makes the zoom exact by construction instead of a request
+        % imshow is free to override. Clamped to the screen so an unusually
+        % large frame can't ask for an off-screen window.
+        seed_zoom = 3;
+        [img_h, img_w] = size(Lclick);
+        screen_sz = get(0, 'ScreenSize'); % [x y width height], px
+        max_fig_w = screen_sz(3) - 100; max_fig_h = screen_sz(4) - 150;
+        fig_w = img_w * seed_zoom; fig_h = img_h * seed_zoom;
+        if fig_w > max_fig_w || fig_h > max_fig_h
+            seed_zoom = min(max_fig_w/img_w, max_fig_h/img_h);
+            fig_w = img_w * seed_zoom; fig_h = img_h * seed_zoom;
+            if debug_mode
+                fprintf('  manual_tip_seed F%d: 300%% does not fit on screen -- using %.0f%% instead\n', count, seed_zoom*100);
+            end
+        end
+        fig_seed = figure('Name', sprintf('Click the true tip -- Frame %d', count), ...
+            'Units', 'pixels', 'Position', [100 100 fig_w fig_h], ...
+            'MenuBar', 'none', 'ToolBar', 'none', 'NumberTitle', 'off', ...
+            'CloseRequestFcn', @seed_close_cb);
+        movegui(fig_seed, 'center');
+        ax_seed = axes('Parent', fig_seed, 'Units', 'normalized', 'Position', [0 0 1 1]);
+        imshow(mat2gray(double(Lclick)), 'Parent', ax_seed, 'Border', 'tight');
+        hold(ax_seed, 'on');
+        Ub_contour = bwboundaries(U);
+        for kb = 1:numel(Ub_contour)
+            plot(ax_seed, Ub_contour{kb}(:,2), Ub_contour{kb}(:,1), 'y-', 'LineWidth', 1, 'HitTest', 'off');
+        end
+        title(ax_seed, sprintf('Frame %d (yellow = current mask)', count), 'Color', 'w');
+        text(ax_seed, 0.02, 0.05, 'Click to select tip -- press Enter to confirm', ...
+            'Units', 'normalized', 'Color', 'w', 'FontSize', 11, 'FontWeight', 'bold', ...
+            'BackgroundColor', [0 0 0 0.5], 'VerticalAlignment', 'top', 'HitTest', 'off');
+
+        % The OS 'crosshair'/custom pointer shape renders black on this
+        % platform regardless of the PointerShapeCData values passed (a
+        % known MATLAB/macOS figure-rendering limitation, not something
+        % fixable by tweaking the CData -- confirmed after the white-value
+        % (2) CData approach still rendered black). Side-step it entirely:
+        % hide the system cursor with a fully transparent bitmap and draw
+        % our OWN white crosshair as two line objects that we control
+        % directly, updated on every mouse move.
+        blank_cdata = NaN(16, 16);
+        set(fig_seed, 'Pointer', 'custom', 'PointerShapeCData', blank_cdata, 'PointerShapeHotSpot', [8 8]);
+        axis(ax_seed, 'manual'); % lock limits so the crosshair lines don't rescale the view
+        xl = xlim(ax_seed); yl = ylim(ax_seed);
+        hline = line(ax_seed, xl, [mean(yl) mean(yl)], 'Color', 'w', 'LineWidth', 1, 'HitTest', 'off');
+        vline = line(ax_seed, [mean(xl) mean(xl)], yl, 'Color', 'w', 'LineWidth', 1, 'HitTest', 'off');
+
+        % Custom click/confirm loop replaces ginput entirely -- ginput owns
+        % the figure's WindowButtonMotionFcn internally while it blocks, so
+        % a crosshair driven by our own WindowButtonMotionFcn (needed for
+        % the line-based crosshair above) can't coexist with it. State lives
+        % in the figure's appdata so the callbacks (plain function handles,
+        % not closures) can read/write it across separate invocations.
+        % Repeated clicking allowed (each replaces the marker/candidate, not
+        % yet committed); Enter confirms whatever was last clicked; closing
+        % the window falls back to automatic (see seed_close_cb).
+        setappdata(fig_seed, 'manual_pt', []);
+        setappdata(fig_seed, 'marker_h', []);
+        setappdata(fig_seed, 'confirmed', false);
+        set(fig_seed, 'WindowButtonMotionFcn', {@seed_motion_cb, ax_seed, hline, vline});
+        set(fig_seed, 'WindowButtonDownFcn', {@seed_click_cb, ax_seed});
+        set(fig_seed, 'KeyPressFcn', @seed_key_cb);
+        uiwait(fig_seed);
+
+        if ishghandle(fig_seed)
+            manual_pt = getappdata(fig_seed, 'manual_pt');
+            if ~getappdata(fig_seed, 'confirmed'), manual_pt = []; end
+            delete(fig_seed);
+        end
+        if debug_mode
+            if isempty(manual_pt)
+                fprintf('  manual_tip_seed F%d: interactive window closed with no confirmed click -- falling back to automatic\n', count);
+            else
+                fprintf('  manual_tip_seed F%d: interactive click confirmed at [%d,%d]\n', count, manual_pt(1), manual_pt(2));
+            end
+        end
+    elseif count == smp && ~isempty(manual_tip_seed_row) && ~isempty(manual_tip_seed_col)
+        manual_pt = [manual_tip_seed_row, manual_tip_seed_col];
+    end
+
+    if ~isempty(manual_pt)
+        % Always trust the human-confirmed point outright -- this is a
+        % deliberate correction, not a suggestion to weigh against the
+        % algorithm's own judgment. manual_tip_seed_radius_factor bounds how
+        % far the SNAP may search from the raw point, not whether the
+        % override happens at all -- an earlier version incorrectly gated
+        % the whole override behind "is the algorithm's own Qef already
+        % close enough," which silently discarded the human's click whenever
+        % the algorithm's own (possibly still wrong) pick happened to land
+        % within that radius purely by chance.
+        %
+        % Snap to the nearest BOUNDARY pixel, not the nearest interior mask
+        % pixel: tip_final is a point on boundb (the traced mask contour,
+        % same object locate_tip's tip_ellipsef is drawn from) on every
+        % other frame, so a manually-set tip must land on that same contour
+        % to stay consistent with everything downstream that treats "the
+        % tip" as a border point (dsearchn against boundb, arc-length
+        % centerline anchoring, ROI/cap construction). A plain find(U) hit
+        % is a real mask pixel but very likely interior, not on the PT
+        % border -- confirmed wrong by inspection, not just in theory.
+        radius_px = manual_tip_seed_radius_factor * diamo_est;
+        Ub_bounds = bwboundaries(U);
+        if ~isempty(Ub_bounds)
+            Ub_pts = cell2mat(Ub_bounds); % vertcat all boundary points, [row col]
+            d = hypot(double(Ub_pts(:,1))-manual_pt(1), double(Ub_pts(:,2))-manual_pt(2));
+            [dmin, k] = min(d);
+        else
+            dmin = Inf;
+        end
+        if isfinite(dmin) && dmin <= radius_px
+            snap_r = Ub_pts(k,1); snap_c = Ub_pts(k,2);
+            if debug_mode
+                fprintf('  manual_tip_seed F%d: overriding algorithm Qef=[%d,%d] with human point [%d,%d] -> border pt [%d,%d] (%.1fpx away)\n', ...
+                    count, Qef(1), Qef(2), manual_pt(1), manual_pt(2), snap_r, snap_c, dmin);
+            end
+            Qef = [snap_r, snap_c];
+            manual_tip_seed_applied = true;
+            manual_tip_seed_final_pt = [snap_r, snap_c];
+        elseif debug_mode
+            fprintf('  manual_tip_seed F%d: no mask border found within %.1fpx of manual point [%d,%d] (nearest was %.1fpx) -- keeping algorithm Qef=[%d,%d]\n', ...
+                count, radius_px, manual_pt(1), manual_pt(2), dmin, Qef(1), Qef(2));
+        end
+    end
+
+    if dump_diag
+        prev_tip_str = 'none';
+        if exist('tip_final_last', 'var'), prev_tip_str = mat2str(tip_final_last); end
+        fprintf('  Qef F%d: [%d,%d] (seed for locate_tip; tip_final_last=%s)\n', count, Qef(1), Qef(2), prev_tip_str);
+    end
+
     % Finding the radius for ellipse fitting
     tols = 0; rad=1;
     while (tols == 0)
@@ -832,7 +1062,8 @@ for count = smp:-1:stp
     % is frozen.
     fb_pt = [];
     if exist('tip_final_last', 'var'), fb_pt = tip_final_last; end
-    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo_est, fb_pt);
+    max_jump_px = ellipse_candidate_max_jump_factor * diamo_est; % see its own doc near the top of this file
+    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo_est, fb_pt, max_jump_px);
     % locate_tip/edge_quant measures diam at a single column (maxy-1, the
     % tube's crossing into the crop) -- that one column can read
     % artificially low on a frame-specific segmentation quirk (a marginal
@@ -1017,7 +1248,26 @@ for count = smp:-1:stp
         % an otherwise-identical ellipsepos flipped this to the fallback
         % vote and shifted the tracked tip by ~5px on a single frame).
         tip_range_tol = 2;
-        if (tip_ellipsepos>min(tip_choice)-tip_range_tol && tip_ellipsepos<max(tip_choice)+tip_range_tol)
+        topo_ok = (tip_ellipsepos>min(tip_choice)-tip_range_tol && tip_ellipsepos<max(tip_choice)+tip_range_tol);
+        % Passing the topological range check alone is NOT sufficient:
+        % tip_choice (the valid range) is derived from the SAME per-frame
+        % branch-pruning as Qef, so a seed that jitters onto a slightly
+        % wrong branch point produces a range that shifts right along with
+        % it -- the ellipse candidate can look self-consistently "in range"
+        % while still being a real jump away from continuity. Confirmed on
+        % HV209_62 F3214 (skeleton method): Qef jittered ~10px between
+        % frames (branch-pruning noise), ellipsepos passed by a margin of
+        % just 1, and the accepted tip_final ended up ~9px from
+        % tip_final_last -- nothing in this branch had compared it against
+        % continuity at all, unlike the branch below. Require it to also be
+        % at least as close to last frame's tip as the independent,
+        % non-ellipse-fit tip_skel candidate (no arbitrary distance
+        % threshold needed -- a direct relative comparison, same
+        % continuity-wins philosophy as ellipse_data.m's own pole choice);
+        % if skel is closer, distrust "in range" and fall through to the
+        % same vote already used when the topological check fails outright.
+        continuity_ok = ~last_flag || pdist2(tip_ellipsef,tip_final_last) <= pdist2(tip_skel,tip_final_last);
+        if topo_ok && continuity_ok
             tip_final(count,:) = tip_ellipsef;
             if debug_mode
                 fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d in [%d,%d] margin=%d -> ellipsef\n', ...
@@ -1037,15 +1287,16 @@ for count = smp:-1:stp
             if debug_mode
                 srclabel = 'skel'; if (tip_finalpos==1), srclabel = 'mid'; end
                 overshoot = min(tip_ellipsepos-min(tip_choice), max(tip_choice)-tip_ellipsepos);
+                reason = 'topo'; if (topo_ok && ~continuity_ok), reason = 'continuity'; end
                 if (last_flag)
-                    fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d NOT in [%d,%d] overshoot=%d last_flag=%d -> %s (ellipsedist=[%.1f %.1f] finaldist=[%.1f %.1f] blend=[%.1f %.1f] tip_mid=[%d %d] tip_skel=[%d %d] tip_final_last=[%d %d])\n', ...
-                        count, ~isempty(Sbl), choice, tip_ellipsepos, min(tip_choice), max(tip_choice), overshoot, last_flag, srclabel, ...
+                    fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d [%d,%d] overshoot=%d reason=%s last_flag=%d -> %s (ellipsedist=[%.1f %.1f] finaldist=[%.1f %.1f] blend=[%.1f %.1f] tip_mid=[%d %d] tip_skel=[%d %d] tip_final_last=[%d %d])\n', ...
+                        count, ~isempty(Sbl), choice, tip_ellipsepos, min(tip_choice), max(tip_choice), overshoot, reason, last_flag, srclabel, ...
                         tip_ellipsedist(1), tip_ellipsedist(2), tip_finaldist(1), tip_finaldist(2), ...
                         (1-0.33)*tip_finaldist(1)+0.33*tip_ellipsedist(1), (1-0.33)*tip_finaldist(2)+0.33*tip_ellipsedist(2), ...
                         tip_mid(1), tip_mid(2), tip_skel(1), tip_skel(2), tip_final_last(1), tip_final_last(2));
                 else
-                    fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d NOT in [%d,%d] overshoot=%d last_flag=%d -> %s (ellipsedist=[%.1f %.1f])\n', ...
-                        count, ~isempty(Sbl), choice, tip_ellipsepos, min(tip_choice), max(tip_choice), overshoot, last_flag, srclabel, tip_ellipsedist(1), tip_ellipsedist(2));
+                    fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d [%d,%d] overshoot=%d reason=%s last_flag=%d -> %s (ellipsedist=[%.1f %.1f])\n', ...
+                        count, ~isempty(Sbl), choice, tip_ellipsepos, min(tip_choice), max(tip_choice), overshoot, reason, last_flag, srclabel, tip_ellipsedist(1), tip_ellipsedist(2));
                 end
             end
         end
@@ -1061,6 +1312,26 @@ for count = smp:-1:stp
                 count, ~isempty(Sbl), last_flag, srclabel);
         end
     end
+    end
+
+    if manual_tip_seed_applied
+        % locate_tip's ellipse-fit refinement (tip_ellipsef, above) treats
+        % Qef as only a SEED -- it searches the local boundary within a
+        % toln-growing radius (up to 2*diamo_est) and returns whatever point
+        % its own ellipse fit converges on, which is free to land well away
+        % from the seed itself. Overriding Qef alone is therefore not enough
+        % to make the human's click stick: confirmed on HV209_62 F3282,
+        % where overriding Qef to the clicked [111,28] still let ellipse-fit
+        % walk the final tip to [103,14], ~16px (most of a tube diameter)
+        % away, silently discarding the correction. Force the final tip
+        % position directly instead -- this is the one frame this whole
+        % mechanism exists to fix, so the human's identification of the tip
+        % should be authoritative, not merely a suggestion to a local search.
+        if debug_mode
+            fprintf('  manual_tip_seed F%d: final tip forced to human point [%d,%d] (automatic tip-finding had produced [%d,%d])\n', ...
+                count, manual_tip_seed_final_pt(1), manual_tip_seed_final_pt(2), tip_final(count,1), tip_final(count,2));
+        end
+        tip_final(count,:) = manual_tip_seed_final_pt;
     end
 
     % Tip-position sanity check: a real tube tip cannot jump implausibly far
@@ -1278,7 +1549,7 @@ for count = smp:-1:stp
     end
 
     % ---- DIAGNOSTIC BLOCK 2: skeleton + geometry (frames smp and smp-1, see BLOCK 1) ----
-    if debug_mode && (count == smp || count == smp - 1)
+    if dump_diag
         dp  = fullfile(outpath, sprintf('diag_%d', count));
         sz1 = size(U,1); sz2 = size(U,2);
 
@@ -1329,6 +1600,45 @@ for count = smp:-1:stp
         if ~isempty(total2)
             tr=max(1,min(sz1,total2(:,1))); tc=max(1,min(sz2,total2(:,2)));
             for pi=1:size(total2,1), Bch(tr(pi),tc(pi))=255; end
+        end
+        % locate_tip.m's ellipse fit (center/axes/phin) and the seed it was
+        % fit around (Qef) -- computed for BOTH tip_method values (see the
+        % single unconditional locate_tip call above), but previously only
+        % ever drawn in the skeleton-only _12 image above, so a ringwalk run
+        % (this run's tip_method) never showed how tip_ellipsef relates to
+        % Qef at all. Magenta for Qef (unused elsewhere in this image),
+        % white for the ellipse (matches the _12 image's convention).
+        if ~isempty(Qef)
+            re_q=max(1,Qef(1,1)-4):min(sz1,Qef(1,1)+4);
+            ce_q=max(1,Qef(1,2)-4):min(sz2,Qef(1,2)+4);
+            Rch(re_q,ce_q)=255; Gch(re_q,ce_q)=0; Bch(re_q,ce_q)=255;
+        end
+        if isreal(axes) && all(axes > 0)
+            tvals = linspace(0, 2*pi, 200);
+            er = axes(1)*cos(tvals)*cos(phin) - axes(2)*sin(tvals)*sin(phin) + center(1);
+            ec = axes(1)*cos(tvals)*sin(phin) + axes(2)*sin(tvals)*cos(phin) + center(2);
+            er = round(er); ec = round(ec);
+            valid = er>=1 & er<=sz1 & ec>=1 & ec<=sz2;
+            idx = sub2ind([sz1 sz2], er(valid), ec(valid));
+            Rch(idx) = 255; Gch(idx) = 255; Bch(idx) = 255;
+        end
+        % tip_skel/tip_mid: the skeleton method's own independent,
+        % non-ellipse-fit candidates (only ever populated when tip_method=
+        % 'skeleton' hit the branched path this frame; empty/stale-cleared
+        % otherwise -- see the per-iteration reset near the top of the
+        % loop). Cyan for tip_skel, orange for tip_mid -- distinct from
+        % boundary(yellow)/Qef(magenta)/ellipse(white)/tip_final(red) so
+        % all the candidates a frame actually voted between are visible at
+        % once, not just the winner.
+        if exist('tip_skel', 'var') && ~isempty(tip_skel)
+            re_sk=max(1,tip_skel(1)-3):min(sz1,tip_skel(1)+3);
+            ce_sk=max(1,tip_skel(2)-3):min(sz2,tip_skel(2)+3);
+            Rch(re_sk,ce_sk)=0; Gch(re_sk,ce_sk)=255; Bch(re_sk,ce_sk)=255;
+        end
+        if exist('tip_mid', 'var') && ~isempty(tip_mid)
+            re_md=max(1,tip_mid(1)-3):min(sz1,tip_mid(1)+3);
+            ce_md=max(1,tip_mid(2)-3):min(sz2,tip_mid(2)+3);
+            Rch(re_md,ce_md)=255; Gch(re_md,ce_md)=165; Bch(re_md,ce_md)=0;
         end
         re=max(1,tip_final(count,1)-3):min(sz1,tip_final(count,1)+3);
         ce=max(1,tip_final(count,2)-3):min(sz2,tip_final(count,2)+3);
@@ -1435,7 +1745,7 @@ for count = smp:-1:stp
     path_dist = [0; cumsum(sqrt(sum(diff(path).^2, 2)))];
 
     % DEBUG: save overlay for frames smp and smp-1 (see DIAGNOSTIC BLOCK 1 above)
-    if debug_mode && (count == smp || count == smp - 1)
+    if dump_diag
         dbg = zeros(size(U,1), size(U,2), 3);
         dbg(:,:,3) = double(U) * 0.4;   % tube mask: dark blue
         if strcmp(tip_method, 'skeleton')
@@ -1660,8 +1970,14 @@ for count = smp:-1:stp
         % ROI start/stop boundary points, via the same construction as the
         % diameter cross-section search (see roi_boundary_crossing) instead
         % of closest_bound.m's own separate, cruder tangent estimate.
-        [startc1, startc2] = roi_boundary_crossing(k_start, xc, yc, dx, dy, total1, al1, total2, al2, crossing_window);
-        [stopc1,  stopc2]  = roi_boundary_crossing(k_stop,  xc, yc, dx, dy, total1, al1, total2, al2, crossing_window);
+        % k_start's crossing search is anchored tip-side (see
+        % nearest_crossing_to_sample's tip_anchor doc) -- k_stop is an
+        % interior crossing with no such prior, so it keeps the default
+        % Euclidean anchor. Constrained to land past k_start's own crossing
+        % on each side (min_arclen) -- see nearest_crossing_to_sample's
+        % min_arclen doc for the hairpin-collapse this guards against.
+        [startc1, startc2] = roi_boundary_crossing(k_start, xc, yc, dx, dy, total1, al1, total2, al2, crossing_window, true);
+        [stopc1,  stopc2]  = roi_boundary_crossing(k_stop,  xc, yc, dx, dy, total1, al1, total2, al2, crossing_window, false, al1(startc1), al2(startc2));
 
         % startc1/stopc1 and startc2/stopc2 are deliberately NOT swapped into
         % numeric order here (an earlier version of this code did, and it was
@@ -1679,9 +1995,10 @@ for count = smp:-1:stp
                 count,arc_start_px,arc_stop_px,k_start,k_stop,startc1,stopc1,startc2,stopc2);
         end
 
-        % tip_boundpos/tip_end1/tip_end2/cap_lo/cap_hi: computed once, up
-        % front, and reused for BOTH the outer F polygon just below and the
-        % roi1/roi2 stitch further down (see tip_cap_stitch). The outer
+        % tip_boundpos/tip_end1/tip_end2/cap_pts: computed once, up front,
+        % and reused for BOTH the outer F polygon just below and the
+        % roi1/roi2 stitch further down (see cap_boundary_arc/tip_cap_stitch).
+        % The outer
         % polygon used to patch its own tip-ward gap with the raw
         % boundb(postotal2(1):postotal1(2),:) range instead -- the same
         % range the roi1/roi2 fix below already identified as wrong
@@ -1696,8 +2013,7 @@ for count = smp:-1:stp
             tip_boundpos = dsearchn(boundb, tip_final(count,:));
             [~, near1] = min(abs(postotal1 - tip_boundpos)); tip_end1 = postotal1(near1);
             [~, near2] = min(abs(postotal2 - tip_boundpos)); tip_end2 = postotal2(near2);
-            cap_lo = min([tip_boundpos, tip_end1, tip_end2]);
-            cap_hi = max([tip_boundpos, tip_end1, tip_end2]);
+            [cap_pts, end1_at_start] = cap_boundary_arc(boundb, tip_boundpos, tip_end1, tip_end2);
         end
 
         % Create masks for rectangles and circles, and include whether they are
@@ -1705,7 +2021,7 @@ for count = smp:-1:stp
         if (ROItype ~= 2 | count == smp)
             if (circle == 0)
                 roi = vertcat(total1(ordered_range(startc1,stopc1),:), total2(flip(ordered_range(startc2,stopc2)),:));
-                if (starti < tip_excl_dist) roi = vertcat(boundb(cap_lo:cap_hi,:),roi); end
+                if (starti < tip_excl_dist) roi = vertcat(cap_pts,roi); end
                 F = poly2mask(roi(:,2),roi(:,1),Esize(1),Esize(2));
             else
                 mask = zeros(Esize(1),Esize(2));
@@ -1740,9 +2056,9 @@ for count = smp:-1:stp
                     % Verified on HV197_4_19 frames 2000-2043: valid frames went
                     % from 42/44 to 44/44 after the tip_boundpos change (kept);
                     % this closes the remaining gap in what it was anchored to.
-                    % tip_boundpos/tip_end1/tip_end2 already computed above,
-                    % up front (shared with the outer F polygon's own patch).
-                    [stitch1, stitch2] = tip_cap_stitch(boundb, tip_boundpos, tip_end1, tip_end2, xc, yc, dx, dy);
+                    % cap_pts/end1_at_start already computed above, up front
+                    % (shared with the outer F polygon's own patch).
+                    [stitch1, stitch2] = tip_cap_stitch(cap_pts, end1_at_start, xc, yc, dx, dy);
                     roi1 = vertcat(stitch1,roi1,boundb(tip_boundpos,:));
                     roi2 = vertcat(stitch2,roi2,boundb(tip_boundpos,:));
                 end
@@ -2517,6 +2833,42 @@ if (workspace) save([outpath '/' fname '_result.mat']); end
 % pixels), so the caller can skip seeding for this frame and fall back to a
 % full base-anchored walk instead.
 % ============================================================================
+% ============================================================================
+% Callbacks for the manual tip-seed interactive figure (see
+% manual_tip_seed_interactive in the main loop). Plain function handles
+% rather than closures/nested functions: state (the current candidate
+% point, its marker handle, whether Enter confirmed it) lives in the
+% figure's own appdata so each callback invocation reads/writes the same
+% shared state without needing to capture mutable variables by reference.
+% ============================================================================
+function seed_motion_cb(~, ~, ax, hline, vline)
+    cp = get(ax, 'CurrentPoint');
+    set(hline, 'YData', [cp(1,2) cp(1,2)]);
+    set(vline, 'XData', [cp(1,1) cp(1,1)]);
+end
+
+function seed_click_cb(src, ~, ax)
+    cp = get(ax, 'CurrentPoint');
+    gx = cp(1,1); gy = cp(1,2);
+    setappdata(src, 'manual_pt', [round(gy), round(gx)]);
+    old_marker = getappdata(src, 'marker_h');
+    if ~isempty(old_marker) && isvalid(old_marker), delete(old_marker); end
+    new_marker = plot(ax, gx, gy, 'gs', 'MarkerSize', 16, 'LineWidth', 2.5, 'HitTest', 'off');
+    setappdata(src, 'marker_h', new_marker);
+end
+
+function seed_key_cb(src, evt)
+    if strcmp(evt.Key, 'return') && ~isempty(getappdata(src, 'manual_pt'))
+        setappdata(src, 'confirmed', true);
+        uiresume(src);
+    end
+end
+
+function seed_close_cb(src, ~)
+    setappdata(src, 'confirmed', false);
+    uiresume(src);
+end
+
 function dir_vec = local_tip_tangent(U, seed, diamo_est)
     dir_vec = [];
     [rows, cols] = size(U);
@@ -2642,11 +2994,49 @@ function [r, c, snapped] = snap_to_mask(U, pt, diamo_est)
     snapped = true;
 end
 
-function idx = nearest_crossing_to_sample(edge_vals, side_pts, side_arclen, sample_pt, window_radius)
+function idx = nearest_crossing_to_sample(edge_vals, side_pts, side_arclen, sample_pt, window_radius, tip_anchor, min_arclen)
 % Used by the per-sample diameter cross-section search (both the reverse
 % pass and find_tip_and_measure's own copy): finds where the fitted
 % normal line actually crosses this boundary side, then picks whichever
 % crossing is physically nearest (Euclidean) to the centerline sample.
+%
+% tip_anchor (optional, default false): when true, anchors step 1 (below)
+% to side_pts' own first point (side_arclen==0) instead of the raw
+% Euclidean-nearest point. Needed specifically for the tip-ward crossing
+% search (roi_boundary_crossing's k_start call): side_pts (total1/total2)
+% already excludes anything within the tip-exclusion radius, so its own
+% first point IS essentially the true answer here -- but on a tightly
+% hooked/curled tip (confirmed on HV209_116), the hook can curl back close
+% enough to itself that some OTHER, far-along-the-boundary point ends up
+% raw-Euclidean-closer to the tip-adjacent sample than side_pts' own start
+% is. That's exactly the "hairpin" failure mode the step-1 comment below
+% already warns about -- the tip-ward call is where it actually triggers
+% on real data (frame 1: startc2 landed at index 16 instead of ~1,
+% because Euclidean anchoring latched onto a distant, wrong point on the
+% hook). Arc-length-zero is a direct, structural answer here, not a
+% Euclidean guess, so it can't fall into that trap. Left as an opt-in
+% flag rather than the new default: interior (k_stop-style) crossings have
+% no such prior and are exactly the case the Euclidean anchor is meant
+% for.
+if nargin < 6, tip_anchor = false; end
+if nargin < 7 || isempty(min_arclen), min_arclen = -Inf; end
+%
+% min_arclen (optional, default -Inf i.e. no constraint): excludes any
+% candidate at or before this arc-length. Used by roi_boundary_crossing's
+% k_stop call, constrained to al(startc) -- the stop crossing must lie
+% FURTHER from the tip than the already-found start crossing on the same
+% side, since arc_stop_px > arc_start_px always by construction. Guards
+% the exact "hairpin" failure the tip_anchor doc above describes, but for
+% the k_stop (non-tip_anchor, Euclidean-anchored) call specifically: on a
+% tightly hooked tip, the boundary point nearest the tip (arclen~0) can
+% ALSO be the raw-Euclidean-nearest point to a k_stop sample that's still
+% close to the tip, collapsing stopc to the exact same index as startc --
+% confirmed on HV209_116 frame 494 (c1:1->1, a zero-length side1 arc that
+% collapsed Half1's ROI to a handful of pixels while every neighboring
+% frame got a normal 10-40 point span). Restricting candidates to
+% side_arclen > min_arclen directly rules that out: whatever the nearest
+% point look like in raw Euclidean space, it cannot be at or before a
+% point already claimed as the start crossing.
 %
 % Two things this is NOT, and why:
 %
@@ -2697,9 +3087,24 @@ function idx = nearest_crossing_to_sample(edge_vals, side_pts, side_arclen, samp
 % code anyway) -- kept as a low-cost safety margin, not because it's been
 % observed to trigger on real data.
 d_to_sample = hypot(side_pts(:,1) - sample_pt(1), side_pts(:,2) - sample_pt(2));
-[~, anchor] = min(d_to_sample);
-in_window = abs(side_arclen - side_arclen(anchor)) <= window_radius;
+past_min = side_arclen > min_arclen;
+if ~any(past_min), past_min = true(size(side_arclen)); end % constraint unsatisfiable
+                 % (e.g. min_arclen >= every point on this side) -- ignore it
+                 % rather than search an empty set; better to fall back to
+                 % the old (possibly hairpin-prone) behavior than error out.
+if tip_anchor
+    [~, anchor] = min(side_arclen); % side_pts' own first point -- see tip_anchor doc above
+else
+    d_masked = d_to_sample; d_masked(~past_min) = Inf;
+    [~, anchor] = min(d_masked);
+end
+in_window = (abs(side_arclen - side_arclen(anchor)) <= window_radius) & past_min;
 window_idx = find(in_window); % contiguous, since side_arclen is monotonic
+if isempty(window_idx) % window landed entirely before min_arclen -- relax the
+                 % arc-length constraint rather than return nothing
+    in_window = abs(side_arclen - side_arclen(anchor)) <= window_radius;
+    window_idx = find(in_window);
+end
 
 a = abs(edge_vals(window_idx));
 nloc = numel(a);
@@ -2720,7 +3125,19 @@ end
 idx = cand(rel);
 end
 
-function [c1, c2] = roi_boundary_crossing(pos, xc, yc, dx, dy, total1, al1, total2, al2, window)
+function [c1, c2] = roi_boundary_crossing(pos, xc, yc, dx, dy, total1, al1, total2, al2, window, tip_anchor, min_al1, min_al2)
+% tip_anchor (optional, default false): passed straight through to
+% nearest_crossing_to_sample -- see its own doc for why the tip-ward
+% (k_start) call needs this and the interior (k_stop) one doesn't.
+% min_al1/min_al2 (optional, default -Inf i.e. unconstrained): passed
+% straight through as nearest_crossing_to_sample's min_arclen -- pass
+% al1(startc1)/al2(startc2) for the k_stop call so its crossing can never
+% land at or before the already-found start crossing on the same side. See
+% nearest_crossing_to_sample's own min_arclen doc for the failure this
+% guards (HV209_116 frame 494).
+if nargin < 11, tip_anchor = false; end
+if nargin < 13 || isempty(min_al1), min_al1 = -Inf; end
+if nargin < 14 || isempty(min_al2), min_al2 = -Inf; end
 % Finds where a "diameter line" at centerline sample `pos` crosses each
 % side -- literally the same construction the per-sample diameter
 % cross-section search uses (this file's own reverse-pass loop), just
@@ -2749,17 +3166,51 @@ function [c1, c2] = roi_boundary_crossing(pos, xc, yc, dx, dy, total1, al1, tota
 nfitc = fit(vertcat(xc(pos),(xc(pos) - dy(pos))),vertcat(yc(pos),(yc(pos) + dx(pos))),'poly1');
 sample_pt = [yc(pos), xc(pos)];
 edge1 = total1(:,1) - nfitc.p1.*total1(:,2) - nfitc.p2;
-c1 = nearest_crossing_to_sample(edge1, total1, al1, sample_pt, window);
+c1 = nearest_crossing_to_sample(edge1, total1, al1, sample_pt, window, tip_anchor, min_al1);
 edge2 = total2(:,1) - nfitc.p1.*total2(:,2) - nfitc.p2;
-c2 = nearest_crossing_to_sample(edge2, total2, al2, sample_pt, window);
+c2 = nearest_crossing_to_sample(edge2, total2, al2, sample_pt, window, tip_anchor, min_al2);
 end
 
-function [stitch1, stitch2] = tip_cap_stitch(boundb, tip_boundpos, tip_end1, tip_end2, xc, yc, dx, dy)
-% Splits the near-tip boundary arc (the tube's true rounded/blunt tip cap,
-% spanning tip_end1 to tip_end2 -- excluded from total1/total2 by the
-% diamo*0.75 tip-exclusion radius, so it needs stitching back in whenever
-% starti falls inside that radius) by which side of the tube's own local
-% axis each point falls on, using the tip-most centerline tangent
+function [cap_pts, end1_at_start] = cap_boundary_arc(boundb, tip_boundpos, tip_end1, tip_end2)
+% Extracts the near-tip boundary arc bounded by tip_end1/tip_end2 (with
+% tip_boundpos always inside it) -- the tube's true rounded/blunt tip cap,
+% excluded from total1/total2 by the diamo*0.75 tip-exclusion radius.
+% boundb is a CLOSED loop, so the arc between two indices can be walked
+% two ways; picks whichever of boundb(cap_lo:cap_hi,:) or its wrap-around
+% complement boundb([cap_hi:end,1:cap_lo],:) is SHORTER. A plain
+% boundb(cap_lo:cap_hi,:) silently picks the wrong (long) one whenever
+% tip_boundpos/tip_end1/tip_end2 straddle boundb's own index-1/end seam --
+% which happens whenever the tip actually used for tip_final(count,:) (the
+% post-voting/post-jump-recovery decision) drifts away from the internal
+% ellipse-fit tip that locate_tip.m centered boundb on. Confirmed on
+% HV203_4_21 (a zigzag-tube dataset, threshold_method=triangle): the near-
+% tip gap should only span ~1.5*diamo (~20-30px), but the raw index slice
+% was instead pulling in 100+ points -- visible as a ballooned, rounded
+% "blob" ROI cap in growth.mp4 instead of the tube's true tapered tip, and
+% as a degenerate (occasionally empty) roi1/roi2 downstream. The true
+% near-tip arc is never more than a few tube-widths, i.e. always much
+% shorter than half of boundb, so "shorter of the two arcs" is a safe,
+% general disambiguator -- no dataset-specific threshold needed.
+%
+% end1_at_start: true if cap_pts(1,:) is the tip_end1 side, so callers can
+% tell the two ends apart without relying on cap_lo/cap_hi identity (which
+% the wrap-around case inverts).
+L = size(boundb, 1);
+cap_lo = min([tip_boundpos, tip_end1, tip_end2]);
+cap_hi = max([tip_boundpos, tip_end1, tip_end2]);
+if (cap_hi - cap_lo) <= L - (cap_hi - cap_lo)
+    cap_pts = boundb(cap_lo:cap_hi, :);
+    end1_at_start = (tip_end1 == cap_lo);
+else
+    cap_pts = boundb([cap_hi:L, 1:cap_lo], :);
+    end1_at_start = (tip_end1 == cap_hi);
+end
+end
+
+function [stitch1, stitch2] = tip_cap_stitch(cap_pts, end1_at_start, xc, yc, dx, dy)
+% Splits the near-tip boundary arc (see cap_boundary_arc, which supplies
+% cap_pts/end1_at_start) by which side of the tube's own local axis each
+% point falls on, using the tip-most centerline tangent
 % (xc(1)/yc(1)/dx(1)/dy(1)) -- NOT by raw boundb index order split at the
 % single point tip_boundpos (the previous approach), which only produces
 % an even split when tip_boundpos happens to sit exactly at the cap's
@@ -2782,17 +3233,13 @@ function [stitch1, stitch2] = tip_cap_stitch(boundb, tip_boundpos, tip_end1, tip
 % fix. Finding the single point closest to the dividing axis and splitting
 % the already-ordered cap_pts there instead keeps each side one genuine
 % contiguous arc, like the boundb-index split this replaces did.
-cap_lo = min([tip_boundpos, tip_end1, tip_end2]);
-cap_hi = max([tip_boundpos, tip_end1, tip_end2]);
-cap_pts = boundb(cap_lo:cap_hi, :);
-
 Tx = dx(1); Ty = dy(1); Cx = xc(1); Cy = yc(1); % tip-ward tangent + tip point, (col,row)
 side = Ty.*(cap_pts(:,2)-Cx) - Tx.*(cap_pts(:,1)-Cy); % cross(T, P-C): which side of the tube's axis
 [~, split_idx] = min(abs(side)); % single contiguous split, closest point to the axis
 part_a = cap_pts(1:split_idx, :);
 part_b = cap_pts(split_idx+1:end, :);
 
-if tip_end1 == cap_lo
+if end1_at_start
     stitch1 = part_a; stitch2 = part_b;
 else
     stitch1 = part_b; stitch2 = part_a;
@@ -2979,6 +3426,18 @@ function img = render_growth_frame(U, tip_row, yctk, xctk, F1, F2, ROItype, show
         image2 = image2 + double(F1*60 + F2*80);
     end
     h = figure('visible', 'off');
+    % Fixed, explicit pixel size -- getframe() otherwise captures whatever
+    % MATLAB's default headless figure size happens to resolve to, which is
+    % NOT deterministic: it depends on the invoking environment's display/
+    % HiDPI backing-scale context (confirmed: a plain -nodisplay -batch call
+    % gives a 512x384 canvas on a virtual 1024x768 "screen", but the same
+    % code run under a Retina-scaled session previously produced 1120x840 --
+    % exactly 2x MATLAB's classic 560x420 default figure size). Same code,
+    % different growth.mp4 resolution/crispness purely from environment, not
+    % from anything this pipeline actually computed differently. Pin it so
+    % every run produces the same output regardless of how MATLAB was
+    % launched.
+    set(h, 'Units', 'pixels', 'Position', [100 100 1120 840]);
     imagesc(image2);
     clim([0 200]);
     % Time and Frame are two SEPARATE text() calls, not one concatenated
@@ -3272,7 +3731,9 @@ function [tip_out, diam_out, maxy_out, boundb_out, Qef_out, Qel_out, Qec_out, ..
 
         % Same capped-search fix as the primary path above (see its comment) --
         % diamo and tip_final_last are both already this function's own params.
-        [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, tip_final_last);
+        % max_jump_px: half a tube diameter -- see ellipse_candidate_max_jump_factor's doc near the top of this file.
+        max_jump_px = 0.5 * diamo;
+        [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, tip_final_last, max_jump_px);
         diam = robust_diam(U, size(U,2) - 1, diam, count, debug_mode);
         tip_ellipsepos = dsearchn(boundb,tip_ellipse);
         tip_ellipsef = boundb(tip_ellipsepos,:);
@@ -3341,7 +3802,11 @@ function [tip_out, diam_out, maxy_out, boundb_out, Qef_out, Qel_out, Qec_out, ..
             tip_mid = boundb(tip_midpos,:);
 
             tip_range_tol = 2;
-            if (tip_ellipsepos>min(tip_choice)-tip_range_tol && tip_ellipsepos<max(tip_choice)+tip_range_tol)
+            % Same continuity cross-check as the primary path -- see its
+            % comment (main loop, ~line 1250).
+            topo_ok = (tip_ellipsepos>min(tip_choice)-tip_range_tol && tip_ellipsepos<max(tip_choice)+tip_range_tol);
+            continuity_ok = ~last_flag || pdist2(tip_ellipsef,tip_final_last) <= pdist2(tip_skel,tip_final_last);
+            if topo_ok && continuity_ok
                 tip_final_fb = tip_ellipsef;
                 if debug_mode
                     fprintf('  [fallback] tip F%d: branched choice=%d ellipsepos=%d in range -> ellipsef\n', count, choice, tip_ellipsepos);
@@ -3453,7 +3918,9 @@ function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_
 
     % Same capped-search fix as the reverse pass (see main loop's comment) --
     % diamo and prev_tip are both already this function's own params.
-    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, prev_tip);
+    % max_jump_px: half a tube diameter -- see ellipse_candidate_max_jump_factor's doc near the top of this file.
+    max_jump_px = 0.5 * diamo;
+    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, prev_tip, max_jump_px);
     % Same robust-diam overwrite as the reverse pass (see main loop) -- keeps
     % the tolerance check below comparing like-for-like instead of a robust
     % diamo reference against one noisy single-column per-frame sample.
@@ -3530,7 +3997,11 @@ function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_
         tip_mid = boundb(tip_midpos,:);
 
         tip_range_tol = 2;
-        if (tip_ellipsepos>min(tip_choice)-tip_range_tol && tip_ellipsepos<max(tip_choice)+tip_range_tol)
+        % Same continuity cross-check as the primary path -- see its
+        % comment (main loop, ~line 1250).
+        topo_ok = (tip_ellipsepos>min(tip_choice)-tip_range_tol && tip_ellipsepos<max(tip_choice)+tip_range_tol);
+        continuity_ok = ~last_flag || pdist2(tip_ellipsef,prev_tip) <= pdist2(tip_skel,prev_tip);
+        if topo_ok && continuity_ok
             tip_row = tip_ellipsef;
         else
             tip_ellipsedist = [pdist2(tip_ellipsef,tip_mid) pdist2(tip_ellipsef,tip_skel)];
@@ -3802,8 +4273,14 @@ function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_
         % See the reverse pass's own copy of this block for why this uses
         % roi_boundary_crossing (the diameter-line construction) instead of
         % closest_bound.m.
-        [startc1, startc2] = roi_boundary_crossing(k_start, xc, yc, dx, dy, total1, al1, total2, al2, crossing_window);
-        [stopc1,  stopc2]  = roi_boundary_crossing(k_stop,  xc, yc, dx, dy, total1, al1, total2, al2, crossing_window);
+        % k_start's crossing search is anchored tip-side (see
+        % nearest_crossing_to_sample's tip_anchor doc) -- k_stop is an
+        % interior crossing with no such prior, so it keeps the default
+        % Euclidean anchor. Constrained to land past k_start's own crossing
+        % on each side (min_arclen) -- see nearest_crossing_to_sample's
+        % min_arclen doc for the hairpin-collapse this guards against.
+        [startc1, startc2] = roi_boundary_crossing(k_start, xc, yc, dx, dy, total1, al1, total2, al2, crossing_window, true);
+        [stopc1,  stopc2]  = roi_boundary_crossing(k_stop,  xc, yc, dx, dy, total1, al1, total2, al2, crossing_window, false, al1(startc1), al2(startc2));
         % See the reverse pass's own copy of this block (and ordered_range's
         % comment) for why startc1/stopc1/startc2/stopc2 are NOT swapped into
         % numeric order here.
@@ -3815,13 +4292,12 @@ function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_
             tip_boundpos = dsearchn(boundb, tip_row);
             [~, near1] = min(abs(postotal1 - tip_boundpos)); tip_end1 = postotal1(near1);
             [~, near2] = min(abs(postotal2 - tip_boundpos)); tip_end2 = postotal2(near2);
-            cap_lo = min([tip_boundpos, tip_end1, tip_end2]);
-            cap_hi = max([tip_boundpos, tip_end1, tip_end2]);
+            [cap_pts, end1_at_start] = cap_boundary_arc(boundb, tip_boundpos, tip_end1, tip_end2);
         end
 
         if (circle == 0)
             roi = vertcat(total1(ordered_range(startc1,stopc1),:), total2(flip(ordered_range(startc2,stopc2)),:));
-            if (starti < tip_excl_dist), roi = vertcat(boundb(cap_lo:cap_hi,:),roi); end
+            if (starti < tip_excl_dist), roi = vertcat(cap_pts,roi); end
             F = poly2mask(roi(:,2),roi(:,1),Esize(1),Esize(2));
         else
             maskc = zeros(Esize(1),Esize(2));
@@ -3838,9 +4314,9 @@ function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_
             roi1 = vertcat(total1(ordered_range(startc1,stopc1),:), [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
             roi2 = vertcat(total2(ordered_range(startc2,stopc2),:), [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
             if (starti < tip_excl_dist)
-                % tip_boundpos/tip_end1/tip_end2 already computed above, up
-                % front (shared with the outer F polygon's own patch).
-                [stitch1, stitch2] = tip_cap_stitch(boundb, tip_boundpos, tip_end1, tip_end2, xc, yc, dx, dy);
+                % cap_pts/end1_at_start already computed above, up front
+                % (shared with the outer F polygon's own patch).
+                [stitch1, stitch2] = tip_cap_stitch(cap_pts, end1_at_start, xc, yc, dx, dy);
                 roi1 = vertcat(stitch1,roi1,boundb(tip_boundpos,:));
                 roi2 = vertcat(stitch2,roi2,boundb(tip_boundpos,:));
             end
