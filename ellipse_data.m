@@ -46,7 +46,7 @@ end
     x = tip_news(:,1);
     y = tip_news(:,2);
     
-    a = ellipse_fit(x,y);
+    a = ellipse_fit_ransac(x,y);
     center = ellipse_center(a);
     axes = ellipse_axis_length(a); 
     [phi n] = ellipse_angle_of_rotation2(a,axes);
@@ -86,6 +86,80 @@ end
     else
         tip_check = [0 0];
         tip_final = [0 0];
+    end
+end
+
+function a = ellipse_fit_ransac(x, y)
+    % Robust replacement for a single least-squares conic fit over the
+    % whole local point cloud. That naive fit assumes the cloud has one
+    % dominant curved feature -- it breaks down when the search radius
+    % (toln in locate_tip.m) has grown past a nearby branch point and the
+    % cloud is really two arcs (the true tip AND a bulge/side branch): the
+    % single fit averages both into a smeared, wrongly-oriented ellipse
+    % (confirmed on HV200_4_5 F5200, where Sbf sat only 6.4px from Qef --
+    % closer than half the tube's own diameter, so no capture-radius choice
+    % could isolate one arc from the other; see this session's analysis).
+    % RANSAC sidesteps that: repeatedly fit a conic to a small random
+    % subset, count how many of ALL the points agree with that fit within a
+    % pixel tolerance, keep whichever fit has the most agreement, then
+    % refit once more using only that agreeing (inlier) set. A contaminated
+    % cloud has two competing arcs, each internally consistent -- RANSAC
+    % naturally locks onto whichever one is larger/more consistent instead
+    % of averaging both, which a single global least-squares fit cannot do.
+    n_iter = 150;
+    sample_size = 8;
+    inlier_tol = 1.5; % px
+
+    n = numel(x);
+    if n < sample_size
+        a = ellipse_fit(x, y); % too few points for RANSAC -- plain fit
+        return;
+    end
+
+    best_inliers = [];
+    best_count = -1;
+
+    for iter = 1:n_iter
+        idx = randperm(n, sample_size);
+        try
+            a_cand = ellipse_fit(x(idx), y(idx));
+        catch
+            continue;
+        end
+        cen = ellipse_center(a_cand);
+        axs = ellipse_axis_length(a_cand);
+        if ~isreal(axs) || any(axs <= 0) || any(~isfinite(axs))
+            continue;
+        end
+        phi_cand = ellipse_angle_of_rotation2(a_cand, axs);
+
+        d = point_to_ellipse_dist(x, y, cen, axs, phi_cand);
+        inliers = find(d < inlier_tol);
+        if numel(inliers) > best_count
+            best_count = numel(inliers);
+            best_inliers = inliers;
+        end
+    end
+
+    if best_count < 5
+        a = ellipse_fit(x, y); % RANSAC found nothing usable -- plain fit
+        return;
+    end
+
+    a = ellipse_fit(x(best_inliers), y(best_inliers));
+end
+
+function d = point_to_ellipse_dist(x, y, cen, axs, phi)
+    % Approximate point-to-ellipse distance via a discretized boundary --
+    % cheap and good enough at this point-cloud scale (tens to low
+    % hundreds of points), avoiding an iterative exact-distance solve.
+    theta = linspace(0, 2*pi, 72);
+    xl = axs(1)*cos(theta); yl = axs(2)*sin(theta);
+    bx = cen(1) + xl*cos(phi) - yl*sin(phi);
+    by = cen(2) + xl*sin(phi) + yl*cos(phi);
+    d = zeros(size(x));
+    for i = 1:numel(x)
+        d(i) = min(hypot(x(i)-bx, y(i)-by));
     end
 end
 
