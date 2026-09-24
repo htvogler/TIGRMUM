@@ -57,6 +57,14 @@ if ~exist('manual_tip_seed_col', 'var'), manual_tip_seed_col = []; end
 if ~exist('manual_tip_seed_radius_factor', 'var'), manual_tip_seed_radius_factor = 0.25; end
 if ~exist('manual_tip_seed_interactive', 'var'), manual_tip_seed_interactive = 0; end
 
+% Which conic fit locate_tip.m/ellipse_data.m uses -- see ellipse_data.m's
+% own doc. 'ransac' (default) is robust to a nearby branch contaminating
+% the local point cloud; 'legacy' is the original single least-squares fit,
+% which can suit a developing flattened/"club" tip shape better on some
+% stacks by accident (confirmed needed on HV210_3 this session). Per-stack,
+% not a global tuning knob -- no single method dominates on every stack.
+if ~exist('ellipse_fit_method', 'var'), ellipse_fit_method = 'ransac'; end
+
 % Widens the per-run diagnostic PNG dump (normally only count==smp and
 % count==smp-1, see DIAGNOSTIC BLOCK 1/2's own comments) to every frame in
 % [lo hi] inclusive, in addition to smp/smp-1. Empty (default) = unchanged
@@ -1063,7 +1071,7 @@ for count = smp:-1:stp
     fb_pt = [];
     if exist('tip_final_last', 'var'), fb_pt = tip_final_last; end
     max_jump_px = ellipse_candidate_max_jump_factor * diamo_est; % see its own doc near the top of this file
-    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo_est, fb_pt, max_jump_px);
+    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo_est, fb_pt, max_jump_px, ellipse_fit_method);
     % locate_tip/edge_quant measures diam at a single column (maxy-1, the
     % tube's crossing into the crop) -- that one column can read
     % artificially low on a frame-specific segmentation quirk (a marginal
@@ -1397,7 +1405,7 @@ for count = smp:-1:stp
             if strcmp(tip_method, 'ringwalk') && ringwalk_fallback_to_skeleton
                 [fb_tip, fb_diam, fb_maxy, fb_boundb, fb_Qef, fb_Qel, fb_Qec, ...
                  fb_tip_ellipse, fb_center, fb_phin, fb_axes, fb_stats, fb_edges, fb_ok] = ...
-                    skeleton_tip_fallback(U, weight, diamo, tip_final_last, last_flag, count, debug_mode);
+                    skeleton_tip_fallback(U, weight, diamo, tip_final_last, last_flag, count, debug_mode, ellipse_fit_method);
                 if fb_ok && ~isempty(fb_tip)
                     cand = [cand; fb_tip]; cand_label{end+1} = 'skeleton_fallback';
                 end
@@ -2349,7 +2357,7 @@ if weak_signal && exist('U_smp', 'var')
 
             [tip_row, diamf_val, intens, ok, yctk_rep, xctk_rep, F1_rep, F2_rep, U_smooth_rep] = find_tip_and_measure(count, U_rep, prev_tip_fwd, ...
                 weight, diamo, tip_method, pixelsize, ROItype, split, circle, starti, stopi, ...
-                diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um);
+                diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um, ellipse_fit_method);
 
             if ok
                 tip_final(count,:) = tip_row;
@@ -3670,7 +3678,7 @@ end
 % must never crash a run that would otherwise have just NaN'd one frame.
 function [tip_out, diam_out, maxy_out, boundb_out, Qef_out, Qel_out, Qec_out, ...
           tip_ellipse_out, center_out, phin_out, axes_out, stats_out, edges_out, ok] = ...
-    skeleton_tip_fallback(U, weight, diamo, tip_final_last, last_flag, count, debug_mode)
+    skeleton_tip_fallback(U, weight, diamo, tip_final_last, last_flag, count, debug_mode, ellipse_fit_method)
 
     tip_out = []; diam_out = []; maxy_out = []; boundb_out = []; Qef_out = [];
     Qel_out = []; Qec_out = []; tip_ellipse_out = []; center_out = []; phin_out = [];
@@ -3733,7 +3741,7 @@ function [tip_out, diam_out, maxy_out, boundb_out, Qef_out, Qel_out, Qec_out, ..
         % diamo and tip_final_last are both already this function's own params.
         % max_jump_px: half a tube diameter -- see ellipse_candidate_max_jump_factor's doc near the top of this file.
         max_jump_px = 0.5 * diamo;
-        [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, tip_final_last, max_jump_px);
+        [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, tip_final_last, max_jump_px, ellipse_fit_method);
         diam = robust_diam(U, size(U,2) - 1, diam, count, debug_mode);
         tip_ellipsepos = dsearchn(boundb,tip_ellipse);
         tip_ellipsef = boundb(tip_ellipsepos,:);
@@ -3852,7 +3860,9 @@ end
 
 function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_smooth_out] = find_tip_and_measure(count, U, prev_tip, ...
         weight, diamo, tip_method, pixelsize, ROItype, split, circle, starti, stopi, ...
-        diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um)
+        diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um, ellipse_fit_method)
+
+if nargin < 21 || isempty(ellipse_fit_method), ellipse_fit_method = 'ransac'; end
 
     ok = true;
     last_flag = ~isempty(prev_tip);
@@ -3920,7 +3930,7 @@ function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_
     % diamo and prev_tip are both already this function's own params.
     % max_jump_px: half a tube diameter -- see ellipse_candidate_max_jump_factor's doc near the top of this file.
     max_jump_px = 0.5 * diamo;
-    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, prev_tip, max_jump_px);
+    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, prev_tip, max_jump_px, ellipse_fit_method);
     % Same robust-diam overwrite as the reverse pass (see main loop) -- keeps
     % the tolerance check below comparing like-for-like instead of a robust
     % diamo reference against one noisy single-column per-frame sample.

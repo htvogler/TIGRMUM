@@ -339,3 +339,16 @@ manual_tip_seed_radius_factor = 0.25; % manual_tip_seed_interactive/row/col only
                  % it, Qef is replaced with the seed coordinate snapped onto the nearest real
                  % mask pixel (same snap_to_mask helper the ringwalk seeding path uses), not
                  % anything ring_walk_tip/branch_removal picked.
+
+% Which conic fit locate_tip.m/ellipse_data.m uses for the local tip ellipse.
+ellipse_fit_method = 'ransac'; % 'ransac' (default): robust to a nearby branch point
+                 % contaminating the local point cloud -- repeatedly fits to random subsets,
+                 % keeps the fit most of the cloud agrees with. Fixes the failure mode where a
+                 % single least-squares fit over a branch-adjacent cloud smears into a wrongly-
+                 % oriented compromise ellipse. 'legacy': the original single least-squares fit
+                 % over the whole cloud -- can suit a developing flattened/"club" tip shape
+                 % better BY ACCIDENT on some stacks, since smearing in enough of the shank
+                 % pulls the orientation back toward the tube's own axis instead of across the
+                 % flattened cap (confirmed needed on HV210_3, 2026-09-18). No single method
+                 % dominates on every stack -- this is a per-stack choice, not a global default
+                 % to tune; try 'legacy' if RANSAC underperforms the old behaviour on a stack.

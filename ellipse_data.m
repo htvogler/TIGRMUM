@@ -1,4 +1,19 @@
-function [tip_final,center,phi,axes,tip_check] = ellipse_data(tip_new, prev_tip, max_jump_px)
+function [tip_final,center,phi,axes,tip_check] = ellipse_data(tip_new, prev_tip, max_jump_px, fit_method)
+
+% fit_method (optional, default 'ransac'): which conic fit ellipse_fit_ransac
+% wraps around. 'ransac' picks the largest self-consistent arc in the local
+% point cloud, robust when a nearby branch contaminates it (see
+% ellipse_fit_ransac's own doc) -- the right default for most stacks. Some
+% stacks develop a wide, flattened ("club") cap where the true tip-local
+% point cloud itself is genuinely wider than deep; RANSAC still fits THAT
+% shape correctly, but the naive single least-squares fit ('legacy') can
+% end up better suited on some of these by accident, smearing in enough of
+% the shank to pull the orientation back toward the tube's own axis instead
+% of across the flattened cap. No single method dominates on every stack
+% (confirmed on HV210_3/HV209_10_right/HV_197_4_320 this session) -- pass
+% 'legacy' per-stack via run_config's ellipse_fit_method when RANSAC
+% underperforms the old naive fit on a particular stack.
+if nargin < 4 || isempty(fit_method), fit_method = 'ransac'; end
 
 % prev_tip (optional): previous frame's tip position [row col]. When given,
 % used to choose between the ellipse's two extreme points instead of the
@@ -46,7 +61,11 @@ end
     x = tip_news(:,1);
     y = tip_news(:,2);
     
-    a = ellipse_fit_ransac(x,y);
+    if strcmp(fit_method, 'legacy')
+        a = ellipse_fit(x,y);
+    else
+        a = ellipse_fit_ransac(x,y);
+    end
     center = ellipse_center(a);
     axes = ellipse_axis_length(a); 
     [phi n] = ellipse_angle_of_rotation2(a,axes);
