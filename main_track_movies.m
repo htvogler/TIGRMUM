@@ -3762,8 +3762,10 @@ function img = render_growth_frame(U, tip_row, yctk, xctk, F1, F2, ROItype, show
     % position never depends on Time's width.
     timestr = strcat('Time(s): ',num2str(((count-1)*frame_rate)));
     framestr = strcat('Frame: ',num2str(count));
-    text(10,10,timestr,'color','white')
-    text(size(image2,2)-10,10,framestr,'color','white','HorizontalAlignment','right')
+    % FontSize 36 bold: the figure is pinned to 1120x840 px above, where MATLAB's
+    % default 10 pt text (and 16 pt, tried first) is still tiny in the finished growth.mp4.
+    text(10,10,timestr,'color','white','FontSize',36,'FontWeight','bold')
+    text(size(image2,2)-10,10,framestr,'color','white','FontSize',36,'FontWeight','bold','HorizontalAlignment','right')
     set(gca,'xtick',[]); set(gca,'xticklabel',[]); set(gca,'ytick',[]); set(gca,'yticklabel',[]);
     frame = getframe(gcf);
     img = frame.cdata;
