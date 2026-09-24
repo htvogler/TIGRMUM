@@ -397,3 +397,10 @@ ellipse_first_off_ratio = 1.25; % long/short axis ratio is at least min_ratio (s
                  % Near-round ellipses (ratio ~1, hooked/rounded tips) have no well-defined long axis and made the
                  % tip flicker on HV209_62; there the older nearest-to-previous-tip vote is used. Measured ratios:
                  % HV200_4_5 1.33-1.9, HV209_62 hook 1.02-1.4. Set both to 0 for always-ellipse-first.
+
+jitter_smooth = 0; % Jitter-zone smoothing pass at the end of the run (0 = off). Zones = stretches where the finished tip track
+                 % flickers: >= jitter_zone_min_moves moves of >= jitter_zone_move_px px within any jitter_zone_span
+                 % consecutive frames, padded by jitter_zone_pad frames. Tips in a zone become the median of the raw tips in a
+                 % centered window of jitter_smooth_window frames, snapped to the mask border; centerline, ROI, diameter,
+                 % intensities and video frames of those frames are recomputed. Kymograph lines / arc length are NOT updated.
+jitter_smooth_window = 7; jitter_zone_move_px = 3; jitter_zone_min_moves = 3; jitter_zone_span = 11; jitter_zone_pad = 3;

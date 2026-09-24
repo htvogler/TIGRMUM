@@ -144,6 +144,19 @@ if ~exist('vote_ellipse_first', 'var'), vote_ellipse_first = 1; end
 if ~exist('ellipse_first_min_ratio', 'var'), ellipse_first_min_ratio = 1.30; end
 if ~exist('ellipse_first_off_ratio', 'var'), ellipse_first_off_ratio = 1.25; end
 ellipse_first_state = []; % empty until the first frame with a valid ratio decides it
+% Jitter-zone smoothing (2026-09-25, default OFF): a pass at the END of the run, before the videos are written.
+% Zones = stretches where the finished tip track flickers: at least jitter_zone_min_moves moves of >=
+% jitter_zone_move_px px within any jitter_zone_span consecutive frames, padded by jitter_zone_pad frames each
+% side. In a zone every frame's tip becomes the MEDIAN of the raw tips in a centered window of
+% jitter_smooth_window frames (both sides, so nothing is lost at the start of a zone), snapped to that frame's
+% own mask border; centerline, ROI halves, diameter, intensities and video frames of those frames are then
+% recomputed from the new tip. NOT updated: the per-frame kymograph lines / arc length.
+if ~exist('jitter_smooth', 'var'), jitter_smooth = 0; end
+if ~exist('jitter_smooth_window', 'var'), jitter_smooth_window = 7; end
+if ~exist('jitter_zone_move_px', 'var'), jitter_zone_move_px = 3; end
+if ~exist('jitter_zone_min_moves', 'var'), jitter_zone_min_moves = 3; end
+if ~exist('jitter_zone_span', 'var'), jitter_zone_span = 11; end
+if ~exist('jitter_zone_pad', 'var'), jitter_zone_pad = 3; end
 stationary_streak = 0; % consecutive accepted frames within eps of tip_final_last (pos+diam)
 
 % ringwalk tip-seeding defaults (see run_config.example.m for full docs) --
@@ -537,6 +550,7 @@ needs_repair = false(smp, 1);
 % Only populated for flagged frames -- cheap even on long stacks, since
 % most frames aren't flagged.
 U_cache = cell(smp, 1);
+U_all_cache = cell(smp, 1); % masks of every frame, only filled when jitter_smooth is on
 if ~exist('V_frame_size','var'), V_frame_size = []; end
 Vroi_frame_size = [];
 % Buffered (not streamed) video frames: growth.mp4/roi_debug.avi content is
@@ -1753,6 +1767,9 @@ for count = smp:-1:stp
     if weak_signal && (needs_repair(count) || frame_failed(count))
         U_cache{count} = U;
     end
+    if jitter_smooth
+        U_all_cache{count} = U;
+    end
 
     % Update tip_final for the next frame. tip_final_last only ever advances
     % to a GOOD (non-frame_failed) tip -- see frames_since_last_good's
@@ -2752,6 +2769,98 @@ if weak_signal && exist('U_smp', 'var')
     if debug_mode
         fprintf('Forward repair pass: %d/%d flagged frames repaired\n', n_repaired, n_attempted);
     end
+end
+
+% Jitter-zone smoothing pass (jitter_smooth) -- see its doc near the top of this script. Runs on the finished
+% track, after the reverse pass and the weak_signal repair pass, before the buffered videos are flushed.
+if jitter_smooth
+    js_frames = (stp:smp)';
+    js_tip = tip_final(js_frames,:);
+    js_ff = frame_failed(js_frames); js_ff = js_ff(:);
+    js_valid = all(isfinite(js_tip), 2) & ~js_ff;
+    js_n = numel(js_frames);
+    js_step = [0; hypot(diff(js_tip(:,1)), diff(js_tip(:,2)))];
+    js_big = double(js_step >= jitter_zone_move_px & js_valid & [false; js_valid(1:end-1)]);
+    js_zone = movsum(js_big, jitter_zone_span) >= jitter_zone_min_moves;
+    js_zone = (movmax(double(js_zone), 2*jitter_zone_pad+1) > 0) & js_valid;
+    js_half = floor(jitter_smooth_window / 2);
+    js_changed = 0; js_redone = 0;
+    for js_k = find(js_zone)'
+        count = js_frames(js_k);
+        Uk = U_all_cache{count};
+        if isempty(Uk), continue; end
+        js_idx = max(1, js_k-js_half):min(js_n, js_k+js_half); js_idx = js_idx(js_valid(js_idx));
+        js_med = median(js_tip(js_idx,:), 1); % median of the RAW tips (js_tip is a snapshot), not of already smoothed ones
+        js_b = bwboundaries(Uk); [~, js_ib] = max(cellfun(@(b) size(b,1), js_b)); js_b = js_b{js_ib};
+        [~, js_nn] = min(pdist2(js_b, js_med)); js_new = js_b(js_nn,:);
+        if pdist2(js_new, js_tip(js_k,:)) < 0.5, continue; end % already there
+        js_changed = js_changed + 1;
+        try
+            O = M(:,:,count);
+            if (type == 1) O = imrotate(O,-90);
+            elseif (type == 3) O = imrotate(O,90);
+            elseif (type == 4) O = imrotate(O,180);
+            end
+            if (type == 1)
+                BT1r = imrotate(BT1(:,:,count),-90);
+                if ~isempty(BT2), BT2r = imrotate(BT2(:,:,count),-90); else, BT2r = []; end
+            elseif (type == 3)
+                BT1r = imrotate(BT1(:,:,count),90);
+                if ~isempty(BT2), BT2r = imrotate(BT2(:,:,count),90); else, BT2r = []; end
+            elseif (type == 4)
+                BT1r = imrotate(BT1(:,:,count),180);
+                if ~isempty(BT2), BT2r = imrotate(BT2(:,:,count),180); else, BT2r = []; end
+            else
+                BT1r = BT1(:,:,count);
+                if ~isempty(BT2), BT2r = BT2(:,:,count); else, BT2r = []; end
+            end
+            old_intens = struct('Fpixelnum', Fpixelnum(count), 'intensityM', intensityM(count), ...
+                'intensityM_F', intensityM_F(count), 'intensityB1_F', intensityB1_F(count), ...
+                'intensityB2_F', intensityB2_F(count), 'F1pixelnum', F1pixelnum(count), ...
+                'F2pixelnum', F2pixelnum(count), 'intensityM_F1', intensityM_F1(count), ...
+                'intensityB1_F1', intensityB1_F1(count), 'intensityB2_F1', intensityB2_F1(count), ...
+                'intensityM_F2', intensityM_F2(count), 'intensityB1_F2', intensityB1_F2(count), ...
+                'intensityB2_F2', intensityB2_F2(count));
+            [tip_row, diamf_val, intens, ok, yctk_j, xctk_j, F1_j, F2_j, U_smooth_j] = find_tip_and_measure(count, Uk, js_new, ...
+                weight, diamo, tip_method, pixelsize, ROItype, split, circle, starti, stopi, ...
+                diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um, ellipse_fit_method, ellipse_candidate_max_jump_factor, js_new);
+            if ok
+                tip_final(count,:) = tip_row;
+                diamf_avg(count) = diamf_val;
+                intensityM(count) = intens.intensityM;
+                intensityM_F(count) = intens.intensityM_F;
+                Fpixelnum(count) = intens.Fpixelnum;
+                intensityB1_F(count) = intens.intensityB1_F;
+                intensityB2_F(count) = intens.intensityB2_F;
+                intensityM_F1(count) = intens.intensityM_F1;
+                intensityM_F2(count) = intens.intensityM_F2;
+                F1pixelnum(count) = intens.F1pixelnum;
+                F2pixelnum(count) = intens.F2pixelnum;
+                intensityB1_F1(count) = intens.intensityB1_F1;
+                intensityB2_F1(count) = intens.intensityB2_F1;
+                intensityB1_F2(count) = intens.intensityB1_F2;
+                intensityB2_F2(count) = intens.intensityB2_F2;
+                js_redone = js_redone + 1;
+                if weak_signal, U_js_r = U_smooth_j; else, U_js_r = Uk; end
+                if tip_plot
+                    growth_buf{count} = render_growth_frame(U_js_r, tip_row, yctk_j, xctk_j, F1_j, F2_j, ROItype, true, count, frame_rate);
+                end
+                if roi_debug_video
+                    roi_buf{count} = render_roi_debug_frame(O, U_js_r, yctk_j, xctk_j, F1_j, F2_j, ROItype, true, up_factor, Cmax, count, frame_rate);
+                end
+                if debug_mode
+                    fprintf('  [jitter] F%d: tip [%d %d] -> [%d %d] (median of %d raw tips)\n', count, js_tip(js_k,1), js_tip(js_k,2), tip_row(1), tip_row(2), numel(js_idx));
+                end
+            elseif debug_mode
+                fprintf('  [jitter] F%d: recompute failed -- left as found\n', count);
+            end
+        catch ME_js
+            if debug_mode
+                fprintf('  [jitter] F%d: recompute threw -- %s -- left as found\n', count, ME_js.message);
+            end
+        end
+    end
+    fprintf('Jitter smoothing: %d zone frames, %d with a changed tip, %d recomputed\n', nnz(js_zone), js_changed, js_redone);
 end
 
 % Flush the buffered video frames to disk now, in TRUE CHRONOLOGICAL order
@@ -4209,10 +4318,11 @@ end
 
 function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_smooth_out] = find_tip_and_measure(count, U, prev_tip, ...
         weight, diamo, tip_method, pixelsize, ROItype, split, circle, starti, stopi, ...
-        diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um, ellipse_fit_method, ellipse_candidate_max_jump_factor)
+        diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um, ellipse_fit_method, ellipse_candidate_max_jump_factor, forced_tip)
 
 if nargin < 21 || isempty(ellipse_fit_method), ellipse_fit_method = 'ransac'; end
 if nargin < 22 || isempty(ellipse_candidate_max_jump_factor), ellipse_candidate_max_jump_factor = Inf; end
+if nargin < 23, forced_tip = []; end % jitter-zone smoothing: use this tip (snapped to the border) instead of the one found here
 
     ok = true;
     last_flag = ~isempty(prev_tip);
@@ -4383,6 +4493,10 @@ if nargin < 22 || isempty(ellipse_candidate_max_jump_factor), ellipse_candidate_
         if (tip_finaldistpos == 1) tip_row = tip_ellipsef; else tip_row = tip_skel; end
     end
 
+    if ~isempty(forced_tip)
+        [~, kf_forced] = min(pdist2(boundb, forced_tip));
+        tip_row = boundb(kf_forced,:);
+    end
     if debug_mode
         fprintf('  [repair] tip F%d -> [%d %d]\n', count, tip_row(1), tip_row(2));
     end
@@ -4390,7 +4504,7 @@ if nargin < 22 || isempty(ellipse_candidate_max_jump_factor), ellipse_candidate_
     % Tip-jump sanity check against the real previous-in-time frame -- same
     % physical bound as the reverse pass's own check, just now checked
     % against the correct chronological neighbour.
-    if last_flag && pixelsize > 0
+    if last_flag && pixelsize > 0 && isempty(forced_tip)
         tip_jump_um = pdist2(tip_row, prev_tip) * pixelsize;
         if tip_jump_um > max_tip_jump_um
             ok = false;
