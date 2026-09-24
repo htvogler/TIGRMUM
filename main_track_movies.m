@@ -125,16 +125,16 @@ if ~exist('nudge_max_cand_dist_factor', 'var'), nudge_max_cand_dist_factor = 0.2
 % reduce the offset always pass, so the tip can come back. The offset leaks by
 % side_memory_decay per accepted frame so a real turn is not blocked forever.
 % Inf = off.
-if ~exist('side_offset_max_factor', 'var'), side_offset_max_factor = 0.25; end
+if ~exist('side_offset_max_factor', 'var'), side_offset_max_factor = Inf; end % OFF by default: on HV200_4_5 (F5001-F3300 ablation) it caused a 28 px lag together with the continuity vote and never helped
 if ~exist('side_memory_decay', 'var'), side_memory_decay = 0.99; end
 side_acc = 0; side_axis_prev = [];
-% Ellipse-first vote (2026-09-24, experimental, default OFF = continuity-first vote): with a trusted
-% previous tip, the vote normally picks whichever of ellipsef/skel/mid is nearest to it. On
+% Ellipse-first vote (2026-09-24, default ON; 0 = the older continuity-first vote): the older vote
+% picked whichever of ellipsef/skel/mid is nearest to the previous tip. On
 % HV200_4_5 (F3680 onward) that lets the mid candidate, which drifts along with the tip, take over
 % from the ellipse pole and walk the tip ~28 px base-ward. With vote_ellipse_first = 1 the ellipse
 % candidate is the vote pick, and skel/mid only come in through the guard recovery pool when the
 % ellipse candidate fails a guard.
-if ~exist('vote_ellipse_first', 'var'), vote_ellipse_first = 0; end
+if ~exist('vote_ellipse_first', 'var'), vote_ellipse_first = 1; end
 stationary_streak = 0; % consecutive accepted frames within eps of tip_final_last (pos+diam)
 
 % ringwalk tip-seeding defaults (see run_config.example.m for full docs) --

@@ -380,15 +380,14 @@ nudge_max_cand_dist_factor = 0.25; % Freeze breaker (stationary_nudge_um > 0): o
                  % the tip HOLDS -- a genuine growth pause looks exactly like a freeze, and the only
                  % candidate left after the freeze breaker refuses the near ones can be far away on
                  % another part of the tube end (HV209_62 F1883: the corner, 0.4 D away). Inf = no limit.
-side_offset_max_factor = 0.25; % Side memory: cumulative sideways drift of the tip relative to the tube's
+side_offset_max_factor = Inf; % Side memory (OFF by default -- on HV200_4_5 it caused a 28 px lag behind the tube end and never helped; ellipse-first vote made it moot): cumulative sideways drift of the tip relative to the tube's
                  % local axis may not exceed this fraction of the tube diameter (steps that reduce the
                  % offset always pass). Stops a slow slide from the middle of the tube end onto a corner
                  % in several small steps, which the per-frame limits cannot see. Inf = off.
 side_memory_decay = 0.99; % Per accepted frame leak of the remembered sideways offset, so a genuine turn is
                  % not blocked forever (0.99 = half-life about 70 frames).
 
-vote_ellipse_first = 0; % Experimental. 0 (default) = continuity-first vote: the candidate (ellipse pole, skeleton
-                 % end, border midpoint) nearest to the previous tip wins. 1 = the ellipse candidate always wins
-                 % the vote; skeleton/border candidates only enter via the guard recovery pool when the ellipse
+vote_ellipse_first = 1; % 1 (default) = the ellipse candidate always wins the vote; 0 = older continuity-first vote:
+                 % the candidate (ellipse pole, skeleton end, border midpoint) nearest to the previous tip wins. With 1, skeleton/border candidates only enter via the guard recovery pool when the ellipse
                  % candidate fails a guard. Motivation: on HV200_4_5 the drifting border-midpoint candidate takes
                  % over from the ellipse pole and walks the tip base-ward.
