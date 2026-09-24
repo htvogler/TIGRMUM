@@ -135,6 +135,15 @@ side_acc = 0; side_axis_prev = [];
 % candidate is the vote pick, and skel/mid only come in through the guard recovery pool when the
 % ellipse candidate fails a guard.
 if ~exist('vote_ellipse_first', 'var'), vote_ellipse_first = 1; end
+% Ellipse gate (2026-09-24): ellipse-first is only used while the ellipse is clearly elongated (long/short axis
+% ratio). A near-round ellipse (hooked/rounded tips, HV209_62) has no well-defined long axis and made the tip
+% flicker; there the older nearest-to-previous-tip vote is used instead. Hysteresis: switch ellipse-first ON at
+% ratio >= ellipse_first_min_ratio, back OFF below ellipse_first_off_ratio. Ratios measured 2026-09-24:
+% HV200_4_5 frames 1.33-1.9 (5th-95th pct), HV209_62 hook frames 1.02-1.4 (median 1.13).
+% Set both to 0 for "always ellipse-first".
+if ~exist('ellipse_first_min_ratio', 'var'), ellipse_first_min_ratio = 1.30; end
+if ~exist('ellipse_first_off_ratio', 'var'), ellipse_first_off_ratio = 1.25; end
+ellipse_first_state = []; % empty until the first frame with a valid ratio decides it
 stationary_streak = 0; % consecutive accepted frames within eps of tip_final_last (pos+diam)
 
 % ringwalk tip-seeding defaults (see run_config.example.m for full docs) --
@@ -1384,7 +1393,22 @@ for count = smp:-1:stp
             if ~isempty(tip_mid),  cand_branch = [cand_branch; tip_mid];  cand_branch_label{end+1} = 'mid';  end
             cand_branch_dist = pdist2(cand_branch, tip_final_last);
             [~, branch_best_idx] = min(cand_branch_dist);
-            if vote_ellipse_first, branch_best_idx = 1; end % cand_branch(1,:) is ellipsef -- see vote_ellipse_first's doc
+            if vote_ellipse_first
+                if numel(axes) >= 2 && min(axes) > 0
+                    gate_ratio = max(axes) / min(axes);
+                    if isempty(ellipse_first_state)
+                        ellipse_first_state = gate_ratio >= ellipse_first_min_ratio;
+                    elseif ~ellipse_first_state && gate_ratio >= ellipse_first_min_ratio
+                        ellipse_first_state = true;
+                    elseif ellipse_first_state && gate_ratio < ellipse_first_off_ratio
+                        ellipse_first_state = false;
+                    end
+                else
+                    gate_ratio = NaN;
+                end
+                if isempty(ellipse_first_state) || ellipse_first_state, branch_best_idx = 1; end % cand_branch(1,:) is ellipsef -- see vote_ellipse_first's doc
+                if debug_mode, fprintf('  GATE F%d: ellipse ratio=%.2f ellipse_first_active=%d\n', count, gate_ratio, ~isempty(ellipse_first_state) && ellipse_first_state); end
+            end
             tip_final(count,:) = cand_branch(branch_best_idx,:);
             if debug_mode
                 fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d -> %s (closest to tip_final_last=[%d %d]; dist ellipsef=%.1f skel=%.1f mid=%.1f)\n', ...

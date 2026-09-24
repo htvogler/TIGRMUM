@@ -391,3 +391,9 @@ vote_ellipse_first = 1; % 1 (default) = the ellipse candidate always wins the vo
                  % the candidate (ellipse pole, skeleton end, border midpoint) nearest to the previous tip wins. With 1, skeleton/border candidates only enter via the guard recovery pool when the ellipse
                  % candidate fails a guard. Motivation: on HV200_4_5 the drifting border-midpoint candidate takes
                  % over from the ellipse pole and walks the tip base-ward.
+
+ellipse_first_min_ratio = 1.30; % Ellipse gate for vote_ellipse_first: ellipse-first is used only while the ellipse's
+ellipse_first_off_ratio = 1.25; % long/short axis ratio is at least min_ratio (switches OFF again below off_ratio, hysteresis).
+                 % Near-round ellipses (ratio ~1, hooked/rounded tips) have no well-defined long axis and made the
+                 % tip flicker on HV209_62; there the older nearest-to-previous-tip vote is used. Measured ratios:
+                 % HV200_4_5 1.33-1.9, HV209_62 hook 1.02-1.4. Set both to 0 for always-ellipse-first.
