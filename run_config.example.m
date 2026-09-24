@@ -352,3 +352,25 @@ ellipse_fit_method = 'ransac'; % 'ransac' (default): robust to a nearby branch p
                  % flattened cap (confirmed needed on HV210_3, 2026-09-18). No single method
                  % dominates on every stack -- this is a per-stack choice, not a global default
                  % to tune; try 'legacy' if RANSAC underperforms the old behaviour on a stack.
+
+% Tip-acceptance guards (see main_track_movies.m for the full derivation).
+% The values below are the defaults; they reproduce the HV209_62 run-3 settings.
+stationary_nudge_um = 1.0; % Freeze breaker: after stationary_lock_n_frames frames with the tip
+                 % frozen (position < stationary_pos_eps_px and diameter < stationary_diam_eps_px),
+                 % candidates within that radius are refused. Instead of snapping to the nearest
+                 % remaining candidate (which could be several um away), the tip moves this far
+                 % ALONG THE MASK BORDER toward it. 0 = old behaviour (snap to the candidate).
+border_jitter_um = 1.5; % Border-drift limit: the accepted tip may move at most
+                 % border_jitter_um + (max_growth_rate_um_per_min/60)*growth_safety_factor*frame_rate
+                 % per frame (x frames since the last good tip), measured ALONG the mask border;
+                 % a larger move is cut short by walking along the contour toward the target.
+                 % Applies on every acceptance path. Inf = off.
+lateral_offset_max_factor = Inf; % Old lateral guard: max sideways offset from the travel axis as a
+                 % fraction of the tube diameter (e.g. 0.30). Inf = off (default): the drift limit
+                 % above bounds the step size, and the lateral guard only ever bounded the
+                 % sideways part.
+ellipse_candidate_max_jump_factor = Inf; % Sanity bound inside ellipse_data.m ("fallback"): an ellipse
+                 % candidate more than factor * tube diameter from the previous tip is replaced
+                 % by the border point nearest the previous tip. Inf = off (default). It froze the
+                 % tip whenever the true apex was > 0.5 D away (HV200_4_5 F3552). 0.5 = the old
+                 % bound; can help with tip_method = 'ringwalk' when the ellipse spills sideways.
