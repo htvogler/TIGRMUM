@@ -150,7 +150,8 @@ ellipse_first_state = []; % empty until the first frame with a valid ratio decid
 % side. In a zone every frame's tip becomes the MEDIAN of the raw tips in a centered window of
 % jitter_smooth_window frames (both sides, so nothing is lost at the start of a zone), snapped to that frame's
 % own mask border; centerline, ROI halves, diameter, intensities and video frames of those frames are then
-% recomputed from the new tip. NOT updated: the per-frame kymograph lines / arc length.
+% recomputed from the new tip. The anchor frame (smp, e.g. a manual seed) is never changed.
+% NOT updated: the per-frame kymograph lines / arc length.
 if ~exist('jitter_smooth', 'var'), jitter_smooth = 0; end
 if ~exist('jitter_smooth_window', 'var'), jitter_smooth_window = 7; end
 if ~exist('jitter_zone_move_px', 'var'), jitter_zone_move_px = 3; end
@@ -2783,6 +2784,7 @@ if jitter_smooth
     js_big = double(js_step >= jitter_zone_move_px & js_valid & [false; js_valid(1:end-1)]);
     js_zone = movsum(js_big, jitter_zone_span) >= jitter_zone_min_moves;
     js_zone = (movmax(double(js_zone), 2*jitter_zone_pad+1) > 0) & js_valid;
+    js_zone(js_frames == smp) = false; % the anchor frame (manual seed, or the tip found there) is never moved; its raw tip still counts in its neighbours' medians
     js_half = floor(jitter_smooth_window / 2);
     js_changed = 0; js_redone = 0;
     for js_k = find(js_zone)'
