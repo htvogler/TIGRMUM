@@ -1169,6 +1169,12 @@ for count = smp:-1:stp
     if exist('tip_final_last', 'var'), fb_pt = tip_final_last; end
     max_jump_px = ellipse_candidate_max_jump_factor * diamo_est; % see its own doc near the top of this file
     [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo_est, fb_pt, max_jump_px, ellipse_fit_method);
+    if debug_mode
+        % Ellipse shape per frame (for choosing a gate on the ellipse-first vote): ratio = long / short axis, ~1 = round
+        % (long axis undefined, pole can flip), large = elongated. npts = border points that went into the fit.
+        if numel(axes) >= 2 && min(axes) > 0, ell_ratio = max(axes) / min(axes); else, ell_ratio = NaN; end
+        fprintf('  ELLIPSE F%d: axes=[%.1f %.1f] ratio=%.2f npts=%d phi=%.1fdeg\n', count, axes(1), axes(min(2,numel(axes))), ell_ratio, size(tip_new,1), phin*180/pi);
+    end
     % locate_tip/edge_quant measures diam at a single column (maxy-1, the
     % tube's crossing into the crop) -- that one column can read
     % artificially low on a frame-specific segmentation quirk (a marginal
