@@ -106,6 +106,28 @@ if isfinite(border_jitter_um)
     max_step_um = border_jitter_um + (max_growth_rate_um_per_min/60) * growth_safety_factor * frame_rate;
     fprintf('border drift limit: %.3fum per frame (border_jitter_um=%.2f + growth term)\n', max_step_um, border_jitter_um);
 end
+% Nudge target limit (2026-09-24, HV209_62 F1883): the freeze breaker refuses every
+% candidate within stationary_pos_eps_px of the frozen tip, so the only candidate
+% left can sit far away on ANOTHER part of the tube end (there: the corner, 7 px /
+% 0.4 D off, while ellipse and skeleton both agreed with the frozen tip). Nudging
+% toward it dragged the tip onto the wrong side. Now the freeze breaker only
+% releases toward a candidate within nudge_max_cand_dist_factor * diamo_est of the
+% frozen tip; if none is that close, the tip HOLDS (a genuine growth pause looks
+% exactly like a freeze). Only used while stationary_nudge_um > 0. Inf = no limit.
+if ~exist('nudge_max_cand_dist_factor', 'var'), nudge_max_cand_dist_factor = 0.25; end
+% Side memory (2026-09-24): cumulative sideways drift of the tip relative to the
+% tube's own local axis (local_tip_tangent, taken at the previous tip; oriented
+% for continuity between frames) is remembered and limited to
+% side_offset_max_factor * diamo_est. Per-frame limits (lateral guard, drift
+% limit) cannot stop a slow slide from the tube-end middle onto a corner in a few
+% small steps; this can. A step that pushes |accumulated offset| past the limit
+% is refused like any other guard failure (recovery pool, else hold); steps that
+% reduce the offset always pass, so the tip can come back. The offset leaks by
+% side_memory_decay per accepted frame so a real turn is not blocked forever.
+% Inf = off.
+if ~exist('side_offset_max_factor', 'var'), side_offset_max_factor = 0.25; end
+if ~exist('side_memory_decay', 'var'), side_memory_decay = 0.99; end
+side_acc = 0; side_axis_prev = [];
 stationary_streak = 0; % consecutive accepted frames within eps of tip_final_last (pos+diam)
 
 % ringwalk tip-seeding defaults (see run_config.example.m for full docs) --
@@ -1504,7 +1526,27 @@ for count = smp:-1:stp
         pos_delta_px = pdist2(tip_final(count,:), tip_final_last);
         stationary_fail = stationary_lock_active && (pos_delta_px < stationary_pos_eps_px);
 
-        if jump_fail || lateral_fail || stationary_fail
+        % Side memory -- see side_offset_max_factor's doc near the top of this script.
+        side_n = [];
+        if isfinite(side_offset_max_factor)
+            side_axis = local_tip_tangent(U, tip_final_last, diamo_est);
+            if ~isempty(side_axis)
+                if ~isempty(side_axis_prev) && dot(side_axis, side_axis_prev) < 0, side_axis = -side_axis; end
+                side_n = [-side_axis(2), side_axis(1)];
+                side_axis_prev = side_axis;
+            end
+        end
+        side_limit_px = side_offset_max_factor * diamo_est;
+        side_fail = false;
+        if ~isempty(side_n)
+            side_new = side_acc + dot(tip_final(count,:) - tip_final_last, side_n);
+            side_fail = abs(side_new) > side_limit_px && abs(side_new) > abs(side_acc);
+            if debug_mode
+                fprintf('  DIAG F%d: side_acc=%.2f side_new=%.2f limit=%.2f side_fail=%d\n', count, side_acc, side_new, side_limit_px, side_fail);
+            end
+        end
+
+        if jump_fail || lateral_fail || stationary_fail || side_fail
             % The chosen candidate fails at least one guard -- before giving
             % up, check whether one of the OTHER candidates this same frame
             % already produced (ellipsef/skel/mid, whichever this code path
@@ -1545,7 +1587,12 @@ for count = smp:-1:stp
             for cand_i = 1:n_cand
                 cand_ok(cand_i) = candidate_passes_tip_guard(cand(cand_i,:), tip_final_last, ...
                     axis_unit, max_tip_jump_um, frames_since_last_good, pixelsize, ...
-                    lateral_offset_max_factor, diamo_est, stationary_lock_active, stationary_pos_eps_px);
+                    lateral_offset_max_factor, diamo_est, stationary_lock_active, stationary_pos_eps_px, ...
+                    side_n, side_acc, side_limit_px);
+            end
+            % Nudge target limit -- see nudge_max_cand_dist_factor's doc near the top.
+            if stationary_nudge_um > 0 && stationary_fail && ~jump_fail && ~lateral_fail && ~side_fail
+                cand_ok(pdist2(cand, tip_final_last) > nudge_max_cand_dist_factor * diamo_est) = false;
             end
             if debug_mode
                 for cand_i = 1:n_cand
@@ -1569,10 +1616,11 @@ for count = smp:-1:stp
             if jump_fail, fail_reason{end+1} = 'jump'; end
             if lateral_fail, fail_reason{end+1} = 'lateral'; end
             if stationary_fail, fail_reason{end+1} = 'stationary_lock'; end
+            if side_fail, fail_reason{end+1} = 'side'; end
             fail_reason_str = strjoin(fail_reason, '+');
             if cand_ok(best_idx)
                 nudged = false;
-                if stationary_nudge_um > 0 && stationary_fail && ~jump_fail && ~lateral_fail
+                if stationary_nudge_um > 0 && stationary_fail && ~jump_fail && ~lateral_fail && ~side_fail
                     [tip_nudged, nudged_px] = step_along_contour(boundb, tip_final_last, cand(best_idx,:), ...
                         stationary_nudge_um / pixelsize, stationary_pos_eps_px + 0.5);
                     if nudged_px > 0
@@ -1656,6 +1704,11 @@ for count = smp:-1:stp
                     tip_final(count,:) = tip_capped;
                 end
             end
+        end
+
+        % Side memory upkeep: accumulate the sideways part of the accepted step.
+        if ~isempty(side_n) && ~frame_failed(count)
+            side_acc = side_memory_decay * side_acc + dot(tip_final(count,:) - tip_final_last, side_n);
         end
     end
 
@@ -4639,7 +4692,8 @@ end
 
 function ok = candidate_passes_tip_guard(pt, tip_final_last, axis_unit, ...
     max_tip_jump_um, frames_since_last_good, pixelsize, ...
-    lateral_offset_max_factor, diamo_est, stationary_lock_active, stationary_pos_eps_px)
+    lateral_offset_max_factor, diamo_est, stationary_lock_active, stationary_pos_eps_px, ...
+    side_n, side_acc, side_limit_px)
 % Unified acceptance test for a tip-position candidate, combining the three
 % independent guards (Euclidean jump budget, lateral-offset-from-axis, and
 % stationary-lock exclusion) into one predicate so the primary pick and
@@ -4655,8 +4709,16 @@ function ok = candidate_passes_tip_guard(pt, tip_final_last, axis_unit, ...
 % Empty when no usable axis exists (see the caller's own fallback chain),
 % in which case the lateral check is simply skipped for this candidate.
 
+if nargin < 13, side_n = []; side_acc = 0; side_limit_px = Inf; end
 jump_um = pdist2(pt, tip_final_last) * pixelsize;
 ok = jump_um <= max_tip_jump_um * frames_since_last_good;
+
+if ok && ~isempty(side_n)
+    % Side memory (see side_offset_max_factor's doc): cumulative sideways offset
+    % may not exceed the limit unless this step reduces it.
+    side_new = side_acc + dot(pt - tip_final_last, side_n);
+    ok = abs(side_new) <= side_limit_px || abs(side_new) <= abs(side_acc);
+end
 
 if ok && ~isempty(axis_unit)
     d_vec = pt - tip_final_last;

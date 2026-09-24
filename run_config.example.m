@@ -374,3 +374,15 @@ ellipse_candidate_max_jump_factor = Inf; % Sanity bound inside ellipse_data.m ("
                  % by the border point nearest the previous tip. Inf = off (default). It froze the
                  % tip whenever the true apex was > 0.5 D away (HV200_4_5 F3552). 0.5 = the old
                  % bound; can help with tip_method = 'ringwalk' when the ellipse spills sideways.
+
+nudge_max_cand_dist_factor = 0.25; % Freeze breaker (stationary_nudge_um > 0): only nudge toward a candidate
+                 % within this fraction of the tube diameter of the frozen tip. If none is that close,
+                 % the tip HOLDS -- a genuine growth pause looks exactly like a freeze, and the only
+                 % candidate left after the freeze breaker refuses the near ones can be far away on
+                 % another part of the tube end (HV209_62 F1883: the corner, 0.4 D away). Inf = no limit.
+side_offset_max_factor = 0.25; % Side memory: cumulative sideways drift of the tip relative to the tube's
+                 % local axis may not exceed this fraction of the tube diameter (steps that reduce the
+                 % offset always pass). Stops a slow slide from the middle of the tube end onto a corner
+                 % in several small steps, which the per-frame limits cannot see. Inf = off.
+side_memory_decay = 0.99; % Per accepted frame leak of the remembered sideways offset, so a genuine turn is
+                 % not blocked forever (0.99 = half-life about 70 frames).
