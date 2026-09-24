@@ -380,7 +380,7 @@ nudge_max_cand_dist_factor = 0.25; % Freeze breaker (stationary_nudge_um > 0): o
                  % the tip HOLDS -- a genuine growth pause looks exactly like a freeze, and the only
                  % candidate left after the freeze breaker refuses the near ones can be far away on
                  % another part of the tube end (HV209_62 F1883: the corner, 0.4 D away). Inf = no limit.
-side_offset_max_factor = Inf; % Side memory (OFF by default -- on HV200_4_5 it caused a 28 px lag behind the tube end and never helped; ellipse-first vote made it moot): cumulative sideways drift of the tip relative to the tube's
+side_offset_max_factor = 0.25; % Side memory (ON by default since 2026-09-25; Inf = off): cumulative sideways drift of the tip relative to the tube's
                  % local axis may not exceed this fraction of the tube diameter (steps that reduce the
                  % offset always pass). Stops a slow slide from the middle of the tube end onto a corner
                  % in several small steps, which the per-frame limits cannot see. Inf = off.

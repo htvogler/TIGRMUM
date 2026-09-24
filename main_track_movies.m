@@ -125,7 +125,7 @@ if ~exist('nudge_max_cand_dist_factor', 'var'), nudge_max_cand_dist_factor = 0.2
 % reduce the offset always pass, so the tip can come back. The offset leaks by
 % side_memory_decay per accepted frame so a real turn is not blocked forever.
 % Inf = off.
-if ~exist('side_offset_max_factor', 'var'), side_offset_max_factor = Inf; end % OFF by default: on HV200_4_5 (F5001-F3300 ablation) it caused a 28 px lag together with the continuity vote and never helped
+if ~exist('side_offset_max_factor', 'var'), side_offset_max_factor = 0.25; end % ON by default since 2026-09-25: keeps the tip from sliding to the wrong side on HV209_62 (checked there with the gate); NOT yet checked on HV200_4_5 with the gate -- with the old vote it caused a 28 px lag there. Inf = off.
 if ~exist('side_memory_decay', 'var'), side_memory_decay = 0.99; end
 side_acc = 0; side_axis_prev = [];
 % Ellipse-first vote (2026-09-24, default ON; 0 = the older continuity-first vote): the older vote
