@@ -128,6 +128,13 @@ if ~exist('nudge_max_cand_dist_factor', 'var'), nudge_max_cand_dist_factor = 0.2
 if ~exist('side_offset_max_factor', 'var'), side_offset_max_factor = 0.25; end
 if ~exist('side_memory_decay', 'var'), side_memory_decay = 0.99; end
 side_acc = 0; side_axis_prev = [];
+% Ellipse-first vote (2026-09-24, experimental, default OFF = continuity-first vote): with a trusted
+% previous tip, the vote normally picks whichever of ellipsef/skel/mid is nearest to it. On
+% HV200_4_5 (F3680 onward) that lets the mid candidate, which drifts along with the tip, take over
+% from the ellipse pole and walk the tip ~28 px base-ward. With vote_ellipse_first = 1 the ellipse
+% candidate is the vote pick, and skel/mid only come in through the guard recovery pool when the
+% ellipse candidate fails a guard.
+if ~exist('vote_ellipse_first', 'var'), vote_ellipse_first = 0; end
 stationary_streak = 0; % consecutive accepted frames within eps of tip_final_last (pos+diam)
 
 % ringwalk tip-seeding defaults (see run_config.example.m for full docs) --
@@ -1371,6 +1378,7 @@ for count = smp:-1:stp
             if ~isempty(tip_mid),  cand_branch = [cand_branch; tip_mid];  cand_branch_label{end+1} = 'mid';  end
             cand_branch_dist = pdist2(cand_branch, tip_final_last);
             [~, branch_best_idx] = min(cand_branch_dist);
+            if vote_ellipse_first, branch_best_idx = 1; end % cand_branch(1,:) is ellipsef -- see vote_ellipse_first's doc
             tip_final(count,:) = cand_branch(branch_best_idx,:);
             if debug_mode
                 fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d -> %s (closest to tip_final_last=[%d %d]; dist ellipsef=%.1f skel=%.1f mid=%.1f)\n', ...
