@@ -38,7 +38,127 @@ end
 % per-frame from diamo_est/diamo where each locate_tip call site already
 % has it (diamo_est/diamo aren't known yet this early in the script, so
 % this can't be hoisted up here the way max_tip_jump_um is).
-ellipse_candidate_max_jump_factor = 0.5; % half a tube diameter
+% Default Inf = bound OFF: with the border-drift limit below active, the tip
+% cannot teleport, and this bound was found to freeze the tip whenever it sits
+% more than half a diameter from the true apex (HV200_4_5 F3552), because the
+% ellipse could then never pull it back. 0.5 = the old bound (half a tube
+% diameter); useful with tip_method='ringwalk' if the ellipse spills sideways.
+if ~exist('ellipse_candidate_max_jump_factor', 'var'), ellipse_candidate_max_jump_factor = Inf; end
+
+% Lateral-offset guard + stationary-lock guard (2026-09-16): max_tip_jump_um
+% above is a pure Euclidean distance budget, which has to be scaled by
+% frame_rate/growth_rate -- and that's exactly its blind spot. A real tip
+% can legitimately move a lot per frame at a low frame rate or fast growth
+% (that's what the budget is FOR), but how far it can move SIDEWAYS off the
+% tube's own established axis does not depend on either -- it's bounded by
+% the tube's physical diameter, a frame-rate-independent quantity. Confirmed
+% needed on HV200_4_5 (manual-seed anchor at F5201): the very next frame
+% (F5200) jumped only 11px/3.5um -- comfortably inside max_tip_jump_um's
+% ~31px budget -- onto a static, non-growing feature next to the real tube,
+% then tracked that same frozen point for ~1300 frames (diameter measured
+% bit-identical across dozens of consecutive frames), never registering as
+% a "jump" again because the frozen point doesn't move relative to ITSELF
+% either. Two independent, additive checks below (both must be satisfied,
+% alongside the existing max_tip_jump_um check, for a candidate to be
+% accepted without triggering the recovery-candidate-pool path):
+%  1. lateral_offset_max_factor: the component of (candidate - tip_final_last)
+%     PERPENDICULAR to the recently-established travel direction (from
+%     tip_final_last2 -> tip_final_last, i.e. real observed motion, not an
+%     assumed shape) must not exceed this fraction of diamo_est. Only
+%     evaluated when that direction is well-defined (the last two good
+%     frames were more than a pixel or so apart) -- skipped otherwise (cold
+%     start, or a stack that's itself been stationary so far), since with no
+%     established axis there's nothing meaningful to decompose against.
+%  2. stationary_lock_n_frames/stationary_pos_eps_px/stationary_diam_eps_px:
+%     if the tip's position AND diameter both stay within noise-floor
+%     tolerance for this many consecutive frames, treat the run as locked
+%     onto a static feature -- even though no single frame in the streak
+%     ever violated max_tip_jump_um or the lateral check on its own -- and
+%     refuse to accept ANY further candidate that's still within
+%     stationary_pos_eps_px of that same frozen point, forcing the recovery
+%     pool to either find a genuinely different point or flag/NaN the frame.
+%     Diameter bit-identical to many decimal places across consecutive
+%     frames (not just similar) was the actual observed signature on
+%     HV200_4_5 -- real per-frame segmentation noise doesn't reproduce that.
+if ~exist('lateral_offset_max_factor', 'var'), lateral_offset_max_factor = Inf; end
+if ~exist('stationary_lock_n_frames', 'var'), stationary_lock_n_frames = 5; end
+if ~exist('stationary_pos_eps_px', 'var'), stationary_pos_eps_px = 1.5; end
+if ~exist('stationary_diam_eps_px', 'var'), stationary_diam_eps_px = 0.05; end
+% Bounded-step alternatives to "jump to a candidate" (2026-09-21; defaults
+% below = the HV209_62 run-3 settings, see the commit message). Both walk along this frame's mask contour toward the
+% target instead of jumping to it (see step_along_contour).
+%  stationary_nudge_um: when the stationary lock is the ONLY reason a candidate
+%    was refused, move this far along the contour toward the nearest passing
+%    candidate instead of taking that candidate. Must exceed stationary_pos_eps_px
+%    (in um) or the lock would not release. 0 = off (old behaviour).
+%  max_step_um: hard cap on how far the accepted tip may move from the last good
+%    tip in one frame (x frames_since_last_good), in ANY direction and on every
+%    acceptance path, incl. first-choice tips. The lateral guard only bounds the
+%    sideways part; max_tip_jump_um (dominated by jitter_margin_um) is the only
+%    limit along the axis. Inf = off.
+if ~exist('stationary_nudge_um', 'var'), stationary_nudge_um = 1.0; end
+if ~exist('max_step_um', 'var'), max_step_um = Inf; end
+% Border-drift limit derived like the jump budget, but from the REAL tracking
+% noise instead of the 10um "teleport" floor: per-frame drift of the tip along
+% the mask border <= border_jitter_um + growth term. Overrides max_step_um.
+if ~exist('border_jitter_um', 'var'), border_jitter_um = 1.5; end
+if isfinite(border_jitter_um)
+    max_step_um = border_jitter_um + (max_growth_rate_um_per_min/60) * growth_safety_factor * frame_rate;
+    fprintf('border drift limit: %.3fum per frame (border_jitter_um=%.2f + growth term)\n', max_step_um, border_jitter_um);
+end
+% Nudge target limit (2026-09-24, HV209_62 F1883): the freeze breaker refuses every
+% candidate within stationary_pos_eps_px of the frozen tip, so the only candidate
+% left can sit far away on ANOTHER part of the tube end (there: the corner, 7 px /
+% 0.4 D off, while ellipse and skeleton both agreed with the frozen tip). Nudging
+% toward it dragged the tip onto the wrong side. Now the freeze breaker only
+% releases toward a candidate within nudge_max_cand_dist_factor * diamo_est of the
+% frozen tip; if none is that close, the tip HOLDS (a genuine growth pause looks
+% exactly like a freeze). Only used while stationary_nudge_um > 0. Inf = no limit.
+if ~exist('nudge_max_cand_dist_factor', 'var'), nudge_max_cand_dist_factor = 0.25; end
+% Side memory (2026-09-24): cumulative sideways drift of the tip relative to the
+% tube's own local axis (local_tip_tangent, taken at the previous tip; oriented
+% for continuity between frames) is remembered and limited to
+% side_offset_max_factor * diamo_est. Per-frame limits (lateral guard, drift
+% limit) cannot stop a slow slide from the tube-end middle onto a corner in a few
+% small steps; this can. A step that pushes |accumulated offset| past the limit
+% is refused like any other guard failure (recovery pool, else hold); steps that
+% reduce the offset always pass, so the tip can come back. The offset leaks by
+% side_memory_decay per accepted frame so a real turn is not blocked forever.
+% Inf = off.
+if ~exist('side_offset_max_factor', 'var'), side_offset_max_factor = 0.25; end % ON by default since 2026-09-25: keeps the tip from sliding to the wrong side on HV209_62 (checked there with the gate); NOT yet checked on HV200_4_5 with the gate -- with the old vote it caused a 28 px lag there. Inf = off.
+if ~exist('side_memory_decay', 'var'), side_memory_decay = 0.99; end
+side_acc = 0; side_axis_prev = [];
+% Ellipse-first vote (2026-09-24, default ON; 0 = the older continuity-first vote): the older vote
+% picked whichever of ellipsef/skel/mid is nearest to the previous tip. On
+% HV200_4_5 (F3680 onward) that lets the mid candidate, which drifts along with the tip, take over
+% from the ellipse pole and walk the tip ~28 px base-ward. With vote_ellipse_first = 1 the ellipse
+% candidate is the vote pick, and skel/mid only come in through the guard recovery pool when the
+% ellipse candidate fails a guard.
+if ~exist('vote_ellipse_first', 'var'), vote_ellipse_first = 1; end
+% Ellipse gate (2026-09-24): ellipse-first is only used while the ellipse is clearly elongated (long/short axis
+% ratio). A near-round ellipse (hooked/rounded tips, HV209_62) has no well-defined long axis and made the tip
+% flicker; there the older nearest-to-previous-tip vote is used instead. Hysteresis: switch ellipse-first ON at
+% ratio >= ellipse_first_min_ratio, back OFF below ellipse_first_off_ratio. Ratios measured 2026-09-24:
+% HV200_4_5 frames 1.33-1.9 (5th-95th pct), HV209_62 hook frames 1.02-1.4 (median 1.13).
+% Set both to 0 for "always ellipse-first".
+if ~exist('ellipse_first_min_ratio', 'var'), ellipse_first_min_ratio = 1.30; end
+if ~exist('ellipse_first_off_ratio', 'var'), ellipse_first_off_ratio = 1.25; end
+ellipse_first_state = []; % empty until the first frame with a valid ratio decides it
+% Jitter-zone smoothing (2026-09-25, default OFF): a pass at the END of the run, before the videos are written.
+% Zones = stretches where the finished tip track flickers: at least jitter_zone_min_moves moves of >=
+% jitter_zone_move_px px within any jitter_zone_span consecutive frames, padded by jitter_zone_pad frames each
+% side. In a zone every frame's tip becomes the MEDIAN of the raw tips in a centered window of
+% jitter_smooth_window frames (both sides, so nothing is lost at the start of a zone), snapped to that frame's
+% own mask border; centerline, ROI halves, diameter, intensities and video frames of those frames are then
+% recomputed from the new tip. The anchor frame (smp, e.g. a manual seed) is never changed.
+% NOT updated: the per-frame kymograph lines / arc length.
+if ~exist('jitter_smooth', 'var'), jitter_smooth = 0; end
+if ~exist('jitter_smooth_window', 'var'), jitter_smooth_window = 7; end
+if ~exist('jitter_zone_move_px', 'var'), jitter_zone_move_px = 3; end
+if ~exist('jitter_zone_min_moves', 'var'), jitter_zone_min_moves = 3; end
+if ~exist('jitter_zone_span', 'var'), jitter_zone_span = 11; end
+if ~exist('jitter_zone_pad', 'var'), jitter_zone_pad = 3; end
+stationary_streak = 0; % consecutive accepted frames within eps of tip_final_last (pos+diam)
 
 % ringwalk tip-seeding defaults (see run_config.example.m for full docs) --
 % defensively defaulted here for the same reason as above: existing
@@ -431,6 +551,7 @@ needs_repair = false(smp, 1);
 % Only populated for flagged frames -- cheap even on long stacks, since
 % most frames aren't flagged.
 U_cache = cell(smp, 1);
+U_all_cache = cell(smp, 1); % masks of every frame, only filled when jitter_smooth is on
 if ~exist('V_frame_size','var'), V_frame_size = []; end
 Vroi_frame_size = [];
 % Buffered (not streamed) video frames: growth.mp4/roi_debug.avi content is
@@ -1072,6 +1193,12 @@ for count = smp:-1:stp
     if exist('tip_final_last', 'var'), fb_pt = tip_final_last; end
     max_jump_px = ellipse_candidate_max_jump_factor * diamo_est; % see its own doc near the top of this file
     [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo_est, fb_pt, max_jump_px, ellipse_fit_method);
+    if debug_mode
+        % Ellipse shape per frame (for choosing a gate on the ellipse-first vote): ratio = long / short axis, ~1 = round
+        % (long axis undefined, pole can flip), large = elongated. npts = border points that went into the fit.
+        if numel(axes) >= 2 && min(axes) > 0, ell_ratio = max(axes) / min(axes); else, ell_ratio = NaN; end
+        fprintf('  ELLIPSE F%d: axes=[%.1f %.1f] ratio=%.2f npts=%d phi=%.1fdeg\n', count, axes(1), axes(min(2,numel(axes))), ell_ratio, size(tip_new,1), phin*180/pi);
+    end
     % locate_tip/edge_quant measures diam at a single column (maxy-1, the
     % tube's crossing into the crop) -- that one column can read
     % artificially low on a frame-specific segmentation quirk (a marginal
@@ -1218,11 +1345,18 @@ for count = smp:-1:stp
             [~, order] = sort(d_to_ellipse);
             Sef = Sef(order(1:2),:);
         end
-        % Voting to decide which branch to be chosen as closer to the tip
+        % Voting to decide which branch to be chosen as closer to the tip.
+        % When a continuity reference exists, trust it directly rather than
+        % blending in skel_ellipsepos -- the old (skel_lastpos+skel_ellipsepos+1)>4
+        % formula only returns 2 when BOTH signals agree on candidate 2; every
+        % other combination, including skel_lastpos=2/skel_ellipsepos=1,
+        % silently collapses to 1, discarding a correct continuity match
+        % whenever tip_ellipsef (unreliable right where a branch sits closer
+        % to Qef than half the tube's own width -- see F5200) disagrees.
         [tmp, skel_ellipsepos] = min(pdist2(Sef,tip_ellipsef));
         if (last_flag == 1)
             [tmp, skel_lastpos] = min(pdist2(Sef,tip_final_last));
-            if ((skel_lastpos+skel_ellipsepos+1) > 4) choice = 2; else choice = 1; end
+            choice = skel_lastpos;
         else
             choice = skel_ellipsepos;
         end
@@ -1248,63 +1382,81 @@ for count = smp:-1:stp
         tip_midpos = tip_anglepos+min(tip_choice)-1;
         tip_mid = boundb(tip_midpos,:);
 
-        test = [];
-        % Tolerance absorbs per-frame boundary-tracing noise: boundb is
-        % rebuilt from scratch each frame via bwboundaries, so the same
-        % index can land a few units off between frames even when the
-        % ellipse-fit tip itself hasn't moved (observed: a 1-unit miss on
-        % an otherwise-identical ellipsepos flipped this to the fallback
-        % vote and shifted the tracked tip by ~5px on a single frame).
-        tip_range_tol = 2;
-        topo_ok = (tip_ellipsepos>min(tip_choice)-tip_range_tol && tip_ellipsepos<max(tip_choice)+tip_range_tol);
-        % Passing the topological range check alone is NOT sufficient:
-        % tip_choice (the valid range) is derived from the SAME per-frame
-        % branch-pruning as Qef, so a seed that jitters onto a slightly
-        % wrong branch point produces a range that shifts right along with
-        % it -- the ellipse candidate can look self-consistently "in range"
-        % while still being a real jump away from continuity. Confirmed on
-        % HV209_62 F3214 (skeleton method): Qef jittered ~10px between
-        % frames (branch-pruning noise), ellipsepos passed by a margin of
-        % just 1, and the accepted tip_final ended up ~9px from
-        % tip_final_last -- nothing in this branch had compared it against
-        % continuity at all, unlike the branch below. Require it to also be
-        % at least as close to last frame's tip as the independent,
-        % non-ellipse-fit tip_skel candidate (no arbitrary distance
-        % threshold needed -- a direct relative comparison, same
-        % continuity-wins philosophy as ellipse_data.m's own pole choice);
-        % if skel is closer, distrust "in range" and fall through to the
-        % same vote already used when the topological check fails outright.
-        continuity_ok = ~last_flag || pdist2(tip_ellipsef,tip_final_last) <= pdist2(tip_skel,tip_final_last);
-        if topo_ok && continuity_ok
-            tip_final(count,:) = tip_ellipsef;
+        if last_flag
+            % Continuity-first branch choice (2026-09-16): with a trusted
+            % previous tip available, simply pick whichever of this frame's
+            % three candidates (ellipsef/skel/mid) is closest to it -- a
+            % direct, physically-grounded criterion. Replaces the previous
+            % topology-range-first logic (a tip_ellipsepos-in-range check,
+            % falling back to a distance vote only between skel/mid, with
+            % ellipsef only ever compared against skel, never against mid).
+            % That logic could still pick the wrong side of a PERSISTENT
+            % fork: confirmed on HV200_4_5 F5150-5162, a stretch where
+            % branchpt=1 held true for many consecutive frames (a real,
+            % sustained branch/bulge next to the tip, not per-frame noise)
+            % -- the topology range self-consistently "passed" most frames
+            % regardless of which branch it was actually tracking, so the
+            % accepted point flip-flopped between the true tip and the
+            % neighboring branch frame to frame, each individual flip small
+            % enough to look locally plausible. Comparing all three
+            % candidates against tip_final_last on equal footing, unweighted,
+            % is what topo_ok/continuity_ok's own doc already identified as
+            % the fix needed for the narrower HV209_62 F3214 case (skel vs
+            % ellipsef only); this generalizes it to all three candidates.
+            cand_branch = tip_ellipsef; cand_branch_label = {'ellipsef'};
+            if ~isempty(tip_skel), cand_branch = [cand_branch; tip_skel]; cand_branch_label{end+1} = 'skel'; end
+            if ~isempty(tip_mid),  cand_branch = [cand_branch; tip_mid];  cand_branch_label{end+1} = 'mid';  end
+            cand_branch_dist = pdist2(cand_branch, tip_final_last);
+            [~, branch_best_idx] = min(cand_branch_dist);
+            if vote_ellipse_first
+                if numel(axes) >= 2 && min(axes) > 0
+                    gate_ratio = max(axes) / min(axes);
+                    if isempty(ellipse_first_state)
+                        ellipse_first_state = gate_ratio >= ellipse_first_min_ratio;
+                    elseif ~ellipse_first_state && gate_ratio >= ellipse_first_min_ratio
+                        ellipse_first_state = true;
+                    elseif ellipse_first_state && gate_ratio < ellipse_first_off_ratio
+                        ellipse_first_state = false;
+                    end
+                else
+                    gate_ratio = NaN;
+                end
+                if isempty(ellipse_first_state) || ellipse_first_state, branch_best_idx = 1; end % cand_branch(1,:) is ellipsef -- see vote_ellipse_first's doc
+                if debug_mode, fprintf('  GATE F%d: ellipse ratio=%.2f ellipse_first_active=%d\n', count, gate_ratio, ~isempty(ellipse_first_state) && ellipse_first_state); end
+            end
+            tip_final(count,:) = cand_branch(branch_best_idx,:);
             if debug_mode
-                fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d in [%d,%d] margin=%d -> ellipsef\n', ...
-                    count, ~isempty(Sbl), choice, tip_ellipsepos, min(tip_choice), max(tip_choice), ...
-                    min(tip_ellipsepos-min(tip_choice), max(tip_choice)-tip_ellipsepos));
+                fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d -> %s (closest to tip_final_last=[%d %d]; dist ellipsef=%.1f skel=%.1f mid=%.1f)\n', ...
+                    count, ~isempty(Sbl), choice, tip_ellipsepos, cand_branch_label{branch_best_idx}, ...
+                    tip_final_last(1), tip_final_last(2), pdist2(tip_ellipsef,tip_final_last), ...
+                    pdist2(tip_skel,tip_final_last), pdist2(tip_mid,tip_final_last));
             end
         else
-            tip_ellipsedist = [pdist2(tip_ellipsef,tip_mid) pdist2(tip_ellipsef,tip_skel)];
-            if (last_flag)
-                tip_finaldist = [pdist2(tip_final_last,tip_mid) pdist2(tip_final_last,tip_skel)];
-                [tmp, tip_finalpos] = min([(1-0.33)*tip_finaldist(1)+0.33*tip_ellipsedist(1) (1-0.33)*tip_finaldist(2)+0.33*tip_ellipsedist(2)]);
+            % Cold start (no previous tip to lean on, e.g. the very anchor
+            % frame) -- continuity has nothing to compare against, so fall
+            % back to the topology-range check as the only available signal.
+            % Tolerance absorbs per-frame boundary-tracing noise: boundb is
+            % rebuilt from scratch each frame via bwboundaries, so the same
+            % index can land a few units off between frames even when the
+            % ellipse-fit tip itself hasn't moved.
+            tip_range_tol = 2;
+            topo_ok = (tip_ellipsepos>min(tip_choice)-tip_range_tol && tip_ellipsepos<max(tip_choice)+tip_range_tol);
+            if topo_ok
+                tip_final(count,:) = tip_ellipsef;
+                if debug_mode
+                    fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d in [%d,%d] margin=%d -> ellipsef\n', ...
+                        count, ~isempty(Sbl), choice, tip_ellipsepos, min(tip_choice), max(tip_choice), ...
+                        min(tip_ellipsepos-min(tip_choice), max(tip_choice)-tip_ellipsepos));
+                end
             else
-                [tmp, tip_finalpos] = min(tip_ellipsedist);
-            end
-            if (tip_finalpos == 1) tip_final(count,:) = tip_mid; else tip_final(count,:) = tip_skel; end
-            test = [test count];
-            if debug_mode
-                srclabel = 'skel'; if (tip_finalpos==1), srclabel = 'mid'; end
-                overshoot = min(tip_ellipsepos-min(tip_choice), max(tip_choice)-tip_ellipsepos);
-                reason = 'topo'; if (topo_ok && ~continuity_ok), reason = 'continuity'; end
-                if (last_flag)
-                    fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d [%d,%d] overshoot=%d reason=%s last_flag=%d -> %s (ellipsedist=[%.1f %.1f] finaldist=[%.1f %.1f] blend=[%.1f %.1f] tip_mid=[%d %d] tip_skel=[%d %d] tip_final_last=[%d %d])\n', ...
-                        count, ~isempty(Sbl), choice, tip_ellipsepos, min(tip_choice), max(tip_choice), overshoot, reason, last_flag, srclabel, ...
-                        tip_ellipsedist(1), tip_ellipsedist(2), tip_finaldist(1), tip_finaldist(2), ...
-                        (1-0.33)*tip_finaldist(1)+0.33*tip_ellipsedist(1), (1-0.33)*tip_finaldist(2)+0.33*tip_ellipsedist(2), ...
-                        tip_mid(1), tip_mid(2), tip_skel(1), tip_skel(2), tip_final_last(1), tip_final_last(2));
-                else
-                    fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d [%d,%d] overshoot=%d reason=%s last_flag=%d -> %s (ellipsedist=[%.1f %.1f])\n', ...
-                        count, ~isempty(Sbl), choice, tip_ellipsepos, min(tip_choice), max(tip_choice), overshoot, reason, last_flag, srclabel, tip_ellipsedist(1), tip_ellipsedist(2));
+                tip_ellipsedist = [pdist2(tip_ellipsef,tip_mid) pdist2(tip_ellipsef,tip_skel)];
+                [~, tip_finalpos] = min(tip_ellipsedist);
+                if (tip_finalpos == 1) tip_final(count,:) = tip_mid; else tip_final(count,:) = tip_skel; end
+                if debug_mode
+                    srclabel = 'skel'; if (tip_finalpos==1), srclabel = 'mid'; end
+                    overshoot = min(tip_ellipsepos-min(tip_choice), max(tip_choice)-tip_ellipsepos);
+                    fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d [%d,%d] overshoot=%d reason=topo last_flag=0 -> %s (ellipsedist=[%.1f %.1f])\n', ...
+                        count, ~isempty(Sbl), choice, tip_ellipsepos, min(tip_choice), max(tip_choice), overshoot, srclabel, tip_ellipsedist(1), tip_ellipsedist(2));
                 end
             end
         end
@@ -1375,22 +1527,95 @@ for count = smp:-1:stp
         % failed -- comparing against a stale reference must allow roughly
         % that many frames' worth of real growth, not a single frame's
         % budget (see frames_since_last_good's declaration comment).
-        if tip_jump_um > max_tip_jump_um * frames_since_last_good
-            % The chosen candidate is implausibly far -- before giving up,
-            % check whether one of the OTHER candidates this same frame
+        jump_fail = tip_jump_um > max_tip_jump_um * frames_since_last_good;
+
+        % Lateral-offset + stationary-lock guards -- see their shared doc
+        % block near the top of this script (next to lateral_offset_max_factor's
+        % own default). Computed here (not just inside the shared predicate
+        % below) so a failure specifically attributable to one of these two,
+        % as opposed to the plain jump check, is visible in debug output.
+        %
+        % axis_unit: prefer the 2-point displacement history
+        % (tip_final_last2 -> tip_final_last, real observed motion) when
+        % it's available and non-degenerate. Falls back to a purely
+        % single-frame geometric axis -- the tube's own local skeleton
+        % direction at tip_final_last, read straight from THIS frame's mask
+        % -- when it isn't. Needed specifically for the first frame after a
+        % fresh manual/anchor seed: only one good frame exists yet, so no
+        % displacement vector is even DEFINED (not just low-confidence) --
+        % confirmed this is exactly the failure point on HV200_4_5 (F5201
+        % manual seed -> F5200 wrong lock): with only the 2-point-history
+        % source, this guard was structurally unable to evaluate anything on
+        % that one critical transition, the only one that actually mattered.
+        axis_unit = [];
+        if exist('tip_final_last2', 'var') && ~isempty(tip_final_last2)
+            axis_vec = tip_final_last - tip_final_last2;
+            axis_norm = norm(axis_vec);
+            if axis_norm > 1.0 % px -- degenerate/near-stationary history, fall through below instead
+                axis_unit = axis_vec / axis_norm;
+            end
+        end
+        if isempty(axis_unit)
+            axis_unit = local_tip_tangent(U, tip_final_last, diamo_est);
+        end
+        lateral_axis_ok = ~isempty(axis_unit);
+        lateral_px = NaN;
+        if lateral_axis_ok
+            d_vec = tip_final(count,:) - tip_final_last;
+            long_comp = dot(d_vec, axis_unit);
+            lateral_px = norm(d_vec - long_comp * axis_unit);
+        end
+        lateral_fail = lateral_axis_ok && (lateral_px > lateral_offset_max_factor * diamo_est);
+        if debug_mode
+            if lateral_axis_ok
+                fprintf('  DIAG F%d: axis_ok=1 axis=[%.2f %.2f] lateral_px=%.2f lateral_max=%.2f diamo_est=%.2f\n', ...
+                    count, axis_unit(1), axis_unit(2), lateral_px, lateral_offset_max_factor*diamo_est, diamo_est);
+            else
+                fprintf('  DIAG F%d: axis_ok=0 (local_tip_tangent returned empty)\n', count);
+            end
+        end
+
+        stationary_lock_active = stationary_streak >= stationary_lock_n_frames;
+        pos_delta_px = pdist2(tip_final(count,:), tip_final_last);
+        stationary_fail = stationary_lock_active && (pos_delta_px < stationary_pos_eps_px);
+
+        % Side memory -- see side_offset_max_factor's doc near the top of this script.
+        side_n = [];
+        if isfinite(side_offset_max_factor)
+            side_axis = local_tip_tangent(U, tip_final_last, diamo_est);
+            if ~isempty(side_axis)
+                if ~isempty(side_axis_prev) && dot(side_axis, side_axis_prev) < 0, side_axis = -side_axis; end
+                side_n = [-side_axis(2), side_axis(1)];
+                side_axis_prev = side_axis;
+            end
+        end
+        side_limit_px = side_offset_max_factor * diamo_est;
+        side_fail = false;
+        if ~isempty(side_n)
+            side_new = side_acc + dot(tip_final(count,:) - tip_final_last, side_n);
+            side_fail = abs(side_new) > side_limit_px && abs(side_new) > abs(side_acc);
+            if debug_mode
+                fprintf('  DIAG F%d: side_acc=%.2f side_new=%.2f limit=%.2f side_fail=%d\n', count, side_acc, side_new, side_limit_px, side_fail);
+            end
+        end
+
+        if jump_fail || lateral_fail || stationary_fail || side_fail
+            % The chosen candidate fails at least one guard -- before giving
+            % up, check whether one of the OTHER candidates this same frame
             % already produced (ellipsef/skel/mid, whichever this code path
-            % computed) happens to land within range. This was previously a
-            % pure reject-after-the-fact test: it flagged the frame but left
-            % whatever far-off point the voting logic picked in tip_final,
-            % which then got drawn into the growth/roi_debug videos as if it
-            % were a real position (confirmed on HV198_1_16 frame 3314: a
-            % near-empty mask (diam~0px) produced a spurious ellipsef far
-            % from frame 3313's tip; the jump check correctly NaN'd the CSV
-            % but the video still showed the bad point, since video drawing
-            % was never gated on frame_failed -- see Tip plot section below,
-            % now fixed there too). Recovering a nearby alternate candidate
-            % when one exists directly reduces how often this situation can
-            % happen at all, rather than only cleaning up after it.
+            % computed) passes ALL of them. This was previously a pure
+            % reject-after-the-fact test on the jump check alone: it flagged
+            % the frame but left whatever far-off point the voting logic
+            % picked in tip_final, which then got drawn into the growth/
+            % roi_debug videos as if it were a real position (confirmed on
+            % HV198_1_16 frame 3314: a near-empty mask (diam~0px) produced a
+            % spurious ellipsef far from frame 3313's tip; the jump check
+            % correctly NaN'd the CSV but the video still showed the bad
+            % point, since video drawing was never gated on frame_failed --
+            % see Tip plot section below, now fixed there too). Recovering a
+            % nearby alternate candidate when one exists directly reduces
+            % how often this situation can happen at all, rather than only
+            % cleaning up after it.
             cand = tip_ellipsef; cand_label = {'ellipsef'};
             if ~isempty(tip_skel), cand = [cand; tip_skel]; cand_label{end+1} = 'skel'; end
             if ~isempty(tip_mid),  cand = [cand; tip_mid];  cand_label{end+1} = 'mid';  end
@@ -1405,12 +1630,34 @@ for count = smp:-1:stp
             if strcmp(tip_method, 'ringwalk') && ringwalk_fallback_to_skeleton
                 [fb_tip, fb_diam, fb_maxy, fb_boundb, fb_Qef, fb_Qel, fb_Qec, ...
                  fb_tip_ellipse, fb_center, fb_phin, fb_axes, fb_stats, fb_edges, fb_ok] = ...
-                    skeleton_tip_fallback(U, weight, diamo, tip_final_last, last_flag, count, debug_mode, ellipse_fit_method);
+                    skeleton_tip_fallback(U, weight, diamo, tip_final_last, last_flag, count, debug_mode, ellipse_fit_method, ellipse_candidate_max_jump_factor);
                 if fb_ok && ~isempty(fb_tip)
                     cand = [cand; fb_tip]; cand_label{end+1} = 'skeleton_fallback';
                 end
             end
+            n_cand = size(cand, 1);
+            cand_ok = false(n_cand, 1);
+            for cand_i = 1:n_cand
+                cand_ok(cand_i) = candidate_passes_tip_guard(cand(cand_i,:), tip_final_last, ...
+                    axis_unit, max_tip_jump_um, frames_since_last_good, pixelsize, ...
+                    lateral_offset_max_factor, diamo_est, stationary_lock_active, stationary_pos_eps_px, ...
+                    side_n, side_acc, side_limit_px);
+            end
+            % Nudge target limit -- see nudge_max_cand_dist_factor's doc near the top.
+            if stationary_nudge_um > 0 && stationary_fail && ~jump_fail && ~lateral_fail && ~side_fail
+                cand_ok(pdist2(cand, tip_final_last) > nudge_max_cand_dist_factor * diamo_est) = false;
+            end
+            if debug_mode
+                for cand_i = 1:n_cand
+                    fprintf('  DIAG F%d cand %s: [%.1f,%.1f] dist=%.2fpx ok=%d\n', ...
+                        count, cand_label{cand_i}, cand(cand_i,1), cand(cand_i,2), ...
+                        pdist2(cand(cand_i,:), tip_final_last), cand_ok(cand_i));
+                end
+            end
             cand_dist_px = pdist2(cand, tip_final_last);
+            if any(cand_ok)
+                cand_dist_px(~cand_ok) = Inf; % only pick among candidates that actually pass every guard
+            end
             [best_dist_px, best_idx] = min(cand_dist_px);
             if strcmp(cand_label{best_idx}, 'skeleton_fallback')
                 diam = fb_diam; maxy = fb_maxy; boundb = fb_boundb; Qef = fb_Qef;
@@ -1418,35 +1665,111 @@ for count = smp:-1:stp
                 center = fb_center; phin = fb_phin; axes = fb_axes; stats = fb_stats; edges = fb_edges;
                 tip_recovered_via_skeleton(count) = true;
             end
-            if best_dist_px * pixelsize <= max_tip_jump_um * frames_since_last_good
-                tip_final(count,:) = cand(best_idx,:);
-                if debug_mode
-                    if strcmp(cand_label{best_idx}, 'skeleton_fallback')
-                        fprintf('  tip F%d: original jump=%.2fum > %.1fum -- recovered via SKELETON FALLBACK (jump=%.2fum)\n', ...
-                            count, tip_jump_um, max_tip_jump_um * frames_since_last_good, best_dist_px*pixelsize);
-                    else
-                        fprintf('  tip F%d: original jump=%.2fum > %.1fum -- recovered via %s candidate (jump=%.2fum)\n', ...
-                            count, tip_jump_um, max_tip_jump_um * frames_since_last_good, cand_label{best_idx}, best_dist_px*pixelsize);
+            fail_reason = {};
+            if jump_fail, fail_reason{end+1} = 'jump'; end
+            if lateral_fail, fail_reason{end+1} = 'lateral'; end
+            if stationary_fail, fail_reason{end+1} = 'stationary_lock'; end
+            if side_fail, fail_reason{end+1} = 'side'; end
+            fail_reason_str = strjoin(fail_reason, '+');
+            if cand_ok(best_idx)
+                nudged = false;
+                if stationary_nudge_um > 0 && stationary_fail && ~jump_fail && ~lateral_fail && ~side_fail
+                    [tip_nudged, nudged_px] = step_along_contour(boundb, tip_final_last, cand(best_idx,:), ...
+                        stationary_nudge_um / pixelsize, stationary_pos_eps_px + 0.5);
+                    if nudged_px > 0
+                        tip_final(count,:) = tip_nudged;
+                        nudged = true;
+                        if debug_mode
+                            fprintf('  tip F%d: stationary lock released by a NUDGE of %.1fpx along the boundary toward %s (candidate %.1fpx away, not taken)\n', ...
+                                count, nudged_px, cand_label{best_idx}, best_dist_px);
+                        end
+                    end
+                end
+                if ~nudged
+                    tip_final(count,:) = cand(best_idx,:);
+                    if debug_mode
+                        fprintf('  tip F%d: primary failed [%s] (jump=%.2fum, lateral=%.2fpx, stationary_lock=%d) -- recovered via %s (jump=%.2fum)\n', ...
+                            count, fail_reason_str, tip_jump_um, lateral_px, stationary_lock_active, cand_label{best_idx}, best_dist_px*pixelsize);
                     end
                 end
             else
-                % No candidate this frame produced is plausible either.
-                % Still assign the closest one (downstream centerline/ROI
-                % code needs *some* numeric point to work with this
-                % iteration), but flag the frame so it's NaN'd in the CSV
-                % and the video skips drawing a marker for it.
-                tip_final(count,:) = cand(best_idx,:);
-                frame_failed(count) = true;
-                if debug_mode
-                    fprintf('  tip F%d: jump=%.2fum > max_tip_jump_um=%.1fum (frames_since_last_good=%d), no candidate within range (best=%.2fum via %s) -- flagged, results NaN''d\n', ...
-                        count, tip_jump_um, max_tip_jump_um * frames_since_last_good, frames_since_last_good, best_dist_px*pixelsize, cand_label{best_idx});
+                % No candidate this frame produced passes every guard.
+                % Hold at the previous good position instead of accepting a
+                % point we've just determined isn't trustworthy, or leaving
+                % a gap -- snap tip_final_last onto THIS frame's own mask
+                % boundary (same nearest-boundary-pixel snap manual_tip_seed
+                % already uses) so downstream code that expects tip_final to
+                % sit on boundb still gets a consistent point. Confirmed
+                % directly useful on HV200_4_5 F5200: the very NEXT frame
+                % (F5199) independently recovers the true position by
+                % comparing against this same held reference -- meaning the
+                % true tip itself is almost certainly also right there, so a
+                % held point is a better estimate than either a
+                % known-untrustworthy candidate or an outright gap. Treated
+                % as a normal good frame afterward (frame_failed stays
+                % false): it becomes the new tip_final_last so continuity
+                % for later frames is preserved through the hold, not reset.
+                Ub_bounds_hold = bwboundaries(U);
+                held_ok = false;
+                if ~isempty(Ub_bounds_hold)
+                    Ub_pts_hold = cell2mat(Ub_bounds_hold);
+                    d_hold = hypot(double(Ub_pts_hold(:,1))-tip_final_last(1), double(Ub_pts_hold(:,2))-tip_final_last(2));
+                    [dmin_hold, k_hold] = min(d_hold);
+                    % Generous radius (2 diameters) -- this only needs to
+                    % confirm the SAME local tube feature is still there
+                    % this frame, not a tight seed-click-accuracy bound like
+                    % manual_tip_seed_radius_factor uses.
+                    held_ok = dmin_hold <= 2 * diamo_est;
+                end
+                if held_ok
+                    tip_final(count,:) = [Ub_pts_hold(k_hold,1), Ub_pts_hold(k_hold,2)];
+                    if debug_mode
+                        fprintf('  tip F%d: failed [%s] (jump=%.2fum, lateral=%.2fpx, frames_since_last_good=%d, stationary_lock=%d), no candidate passes -- HELD at previous position, snapped to this frame''s boundary [%.0f,%.0f] (%.2fpx from tip_final_last)\n', ...
+                            count, fail_reason_str, tip_jump_um, lateral_px, frames_since_last_good, stationary_lock_active, tip_final(count,1), tip_final(count,2), dmin_hold);
+                    end
+                else
+                    % Even holding position isn't possible -- this frame's
+                    % mask doesn't reach anywhere near the last good tip at
+                    % all. Genuinely nothing trustworthy to report; fall
+                    % back to the old behavior (closest candidate, flagged).
+                    tip_final(count,:) = cand(best_idx,:);
+                    frame_failed(count) = true;
+                    if debug_mode
+                        fprintf('  tip F%d: failed [%s] (jump=%.2fum, lateral=%.2fpx, frames_since_last_good=%d, stationary_lock=%d), no candidate passes AND no boundary point near previous position either (best=%.2fum via %s) -- flagged, results NaN''d\n', ...
+                            count, fail_reason_str, tip_jump_um, lateral_px, frames_since_last_good, stationary_lock_active, best_dist_px*pixelsize, cand_label{best_idx});
+                    end
                 end
             end
+        end
+
+        % Per-frame step cap (see max_step_um's doc near the top). Applied to
+        % whatever tip_final ended up being, whichever path produced it.
+        if isfinite(max_step_um) && ~frame_failed(count)
+            cap_px = max_step_um / pixelsize * frames_since_last_good;
+            step_px_now = pdist2(tip_final(count,:), tip_final_last);
+            if step_px_now > cap_px
+                [tip_capped, capped_px] = step_along_contour(boundb, tip_final_last, tip_final(count,:), cap_px);
+                if capped_px > 0
+                    if debug_mode
+                        fprintf('  tip F%d: BORDER DRIFT LIMIT -- accepted tip was %.1fpx (%.2fum) from tip_final_last, limited to %.1fpx along the boundary\n', ...
+                            count, step_px_now, step_px_now*pixelsize, capped_px);
+                    end
+                    tip_final(count,:) = tip_capped;
+                end
+            end
+        end
+
+        % Side memory upkeep: accumulate the sideways part of the accepted step.
+        if ~isempty(side_n) && ~frame_failed(count)
+            side_acc = side_memory_decay * side_acc + dot(tip_final(count,:) - tip_final_last, side_n);
         end
     end
 
     if weak_signal && (needs_repair(count) || frame_failed(count))
         U_cache{count} = U;
+    end
+    if jitter_smooth
+        U_all_cache{count} = U;
     end
 
     % Update tip_final for the next frame. tip_final_last only ever advances
@@ -1458,10 +1781,33 @@ for count = smp:-1:stp
     % it, via (:,:) assignment which auto-creates on first use (a plain
     % read of a never-yet-assigned tip_final_last would error).
     if ~frame_failed(count) || ~exist('tip_final_last', 'var')
+        % tip_final_last2 upkeep for the lateral-offset guard above -- see
+        % its doc block near the top of this script. Must happen BEFORE
+        % tip_final_last itself is overwritten below, since tip_final_last2
+        % needs the OUTGOING value.
+        if exist('tip_final_last', 'var')
+            tip_final_last2 = tip_final_last;
+        else
+            tip_final_last2 = [];
+        end
+        % Position half of the stationary-lock check, captured here (still
+        % have the OLD tip_final_last to compare against) but NOT finalized
+        % into stationary_streak until diamf_avg(count) exists -- the
+        % median-of-cross-sections diameter computed much later in this
+        % same iteration (see "Diameter of tube" below), which is what
+        % actually showed the bit-identical-across-frames signature on
+        % HV200_4_5. locate_tip's own early, cruder `diam` (used here
+        % originally) is noisy frame to frame in a way diamf_avg isn't --
+        % confirmed that comparing against it meant this guard's diameter
+        % condition almost never held, so stationary_streak never actually
+        % accumulated despite position genuinely freezing for ~1300 frames.
+        stationary_pos_ok_this_frame = exist('tip_final_last', 'var') && ...
+            pdist2(tip_final(count,:), tip_final_last) < stationary_pos_eps_px;
         tip_final_last(:,:) = tip_final(count,:);
         frames_since_last_good = 1;
     else
         frames_since_last_good = frames_since_last_good + 1;
+        stationary_pos_ok_this_frame = false; % a failed frame can't extend the streak either
     end
     last_iter_failed = frame_failed(count); % see ringwalk seed-validity gate above
 
@@ -2165,6 +2511,23 @@ for count = smp:-1:stp
     diamf = diag(pdist2(xy1,xy2));
     diamf_avg(count) = median(diamf);
 
+    % Stationary-lock finalization (diameter half) -- see the guard's own
+    % doc block near the top of this script, and stationary_pos_ok_this_frame's
+    % comment (in the tip_final_last update, ~900 lines up) for why this is
+    % split into two touch points instead of computed in one place:
+    % diamf_avg(count) just above is the first point in this iteration
+    % where the smoothed, actually-bit-identical-on-a-stuck-lock diameter
+    % exists at all.
+    if ~frame_failed(count)
+        if exist('diamf_avg_last', 'var') && stationary_pos_ok_this_frame && ...
+                isfinite(diamf_avg(count)) && abs(diamf_avg(count) - diamf_avg_last) < stationary_diam_eps_px
+            stationary_streak = stationary_streak + 1;
+        else
+            stationary_streak = 0;
+        end
+        diamf_avg_last = diamf_avg(count);
+    end
+
     % Kymograph
     if (nkymo > 0)
         kymo_len = ceil(path_dist(end));
@@ -2357,7 +2720,7 @@ if weak_signal && exist('U_smp', 'var')
 
             [tip_row, diamf_val, intens, ok, yctk_rep, xctk_rep, F1_rep, F2_rep, U_smooth_rep] = find_tip_and_measure(count, U_rep, prev_tip_fwd, ...
                 weight, diamo, tip_method, pixelsize, ROItype, split, circle, starti, stopi, ...
-                diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um, ellipse_fit_method);
+                diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um, ellipse_fit_method, ellipse_candidate_max_jump_factor);
 
             if ok
                 tip_final(count,:) = tip_row;
@@ -2407,6 +2770,99 @@ if weak_signal && exist('U_smp', 'var')
     if debug_mode
         fprintf('Forward repair pass: %d/%d flagged frames repaired\n', n_repaired, n_attempted);
     end
+end
+
+% Jitter-zone smoothing pass (jitter_smooth) -- see its doc near the top of this script. Runs on the finished
+% track, after the reverse pass and the weak_signal repair pass, before the buffered videos are flushed.
+if jitter_smooth
+    js_frames = (stp:smp)';
+    js_tip = tip_final(js_frames,:);
+    js_ff = frame_failed(js_frames); js_ff = js_ff(:);
+    js_valid = all(isfinite(js_tip), 2) & ~js_ff;
+    js_n = numel(js_frames);
+    js_step = [0; hypot(diff(js_tip(:,1)), diff(js_tip(:,2)))];
+    js_big = double(js_step >= jitter_zone_move_px & js_valid & [false; js_valid(1:end-1)]);
+    js_zone = movsum(js_big, jitter_zone_span) >= jitter_zone_min_moves;
+    js_zone = (movmax(double(js_zone), 2*jitter_zone_pad+1) > 0) & js_valid;
+    js_zone(js_frames == smp) = false; % the anchor frame (manual seed, or the tip found there) is never moved; its raw tip still counts in its neighbours' medians
+    js_half = floor(jitter_smooth_window / 2);
+    js_changed = 0; js_redone = 0;
+    for js_k = find(js_zone)'
+        count = js_frames(js_k);
+        Uk = U_all_cache{count};
+        if isempty(Uk), continue; end
+        js_idx = max(1, js_k-js_half):min(js_n, js_k+js_half); js_idx = js_idx(js_valid(js_idx));
+        js_med = median(js_tip(js_idx,:), 1); % median of the RAW tips (js_tip is a snapshot), not of already smoothed ones
+        js_b = bwboundaries(Uk); [~, js_ib] = max(cellfun(@(b) size(b,1), js_b)); js_b = js_b{js_ib};
+        [~, js_nn] = min(pdist2(js_b, js_med)); js_new = js_b(js_nn,:);
+        if pdist2(js_new, js_tip(js_k,:)) < 0.5, continue; end % already there
+        js_changed = js_changed + 1;
+        try
+            O = M(:,:,count);
+            if (type == 1) O = imrotate(O,-90);
+            elseif (type == 3) O = imrotate(O,90);
+            elseif (type == 4) O = imrotate(O,180);
+            end
+            if (type == 1)
+                BT1r = imrotate(BT1(:,:,count),-90);
+                if ~isempty(BT2), BT2r = imrotate(BT2(:,:,count),-90); else, BT2r = []; end
+            elseif (type == 3)
+                BT1r = imrotate(BT1(:,:,count),90);
+                if ~isempty(BT2), BT2r = imrotate(BT2(:,:,count),90); else, BT2r = []; end
+            elseif (type == 4)
+                BT1r = imrotate(BT1(:,:,count),180);
+                if ~isempty(BT2), BT2r = imrotate(BT2(:,:,count),180); else, BT2r = []; end
+            else
+                BT1r = BT1(:,:,count);
+                if ~isempty(BT2), BT2r = BT2(:,:,count); else, BT2r = []; end
+            end
+            old_intens = struct('Fpixelnum', Fpixelnum(count), 'intensityM', intensityM(count), ...
+                'intensityM_F', intensityM_F(count), 'intensityB1_F', intensityB1_F(count), ...
+                'intensityB2_F', intensityB2_F(count), 'F1pixelnum', F1pixelnum(count), ...
+                'F2pixelnum', F2pixelnum(count), 'intensityM_F1', intensityM_F1(count), ...
+                'intensityB1_F1', intensityB1_F1(count), 'intensityB2_F1', intensityB2_F1(count), ...
+                'intensityM_F2', intensityM_F2(count), 'intensityB1_F2', intensityB1_F2(count), ...
+                'intensityB2_F2', intensityB2_F2(count));
+            [tip_row, diamf_val, intens, ok, yctk_j, xctk_j, F1_j, F2_j, U_smooth_j] = find_tip_and_measure(count, Uk, js_new, ...
+                weight, diamo, tip_method, pixelsize, ROItype, split, circle, starti, stopi, ...
+                diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um, ellipse_fit_method, ellipse_candidate_max_jump_factor, js_new);
+            if ok
+                tip_final(count,:) = tip_row;
+                diamf_avg(count) = diamf_val;
+                intensityM(count) = intens.intensityM;
+                intensityM_F(count) = intens.intensityM_F;
+                Fpixelnum(count) = intens.Fpixelnum;
+                intensityB1_F(count) = intens.intensityB1_F;
+                intensityB2_F(count) = intens.intensityB2_F;
+                intensityM_F1(count) = intens.intensityM_F1;
+                intensityM_F2(count) = intens.intensityM_F2;
+                F1pixelnum(count) = intens.F1pixelnum;
+                F2pixelnum(count) = intens.F2pixelnum;
+                intensityB1_F1(count) = intens.intensityB1_F1;
+                intensityB2_F1(count) = intens.intensityB2_F1;
+                intensityB1_F2(count) = intens.intensityB1_F2;
+                intensityB2_F2(count) = intens.intensityB2_F2;
+                js_redone = js_redone + 1;
+                if weak_signal, U_js_r = U_smooth_j; else, U_js_r = Uk; end
+                if tip_plot
+                    growth_buf{count} = render_growth_frame(U_js_r, tip_row, yctk_j, xctk_j, F1_j, F2_j, ROItype, true, count, frame_rate);
+                end
+                if roi_debug_video
+                    roi_buf{count} = render_roi_debug_frame(O, U_js_r, yctk_j, xctk_j, F1_j, F2_j, ROItype, true, up_factor, Cmax, count, frame_rate);
+                end
+                if debug_mode
+                    fprintf('  [jitter] F%d: tip [%d %d] -> [%d %d] (median of %d raw tips)\n', count, js_tip(js_k,1), js_tip(js_k,2), tip_row(1), tip_row(2), numel(js_idx));
+                end
+            elseif debug_mode
+                fprintf('  [jitter] F%d: recompute failed -- left as found\n', count);
+            end
+        catch ME_js
+            if debug_mode
+                fprintf('  [jitter] F%d: recompute threw -- %s -- left as found\n', count, ME_js.message);
+            end
+        end
+    end
+    fprintf('Jitter smoothing: %d zone frames, %d with a changed tip, %d recomputed\n', nnz(js_zone), js_changed, js_redone);
 end
 
 % Flush the buffered video frames to disk now, in TRUE CHRONOLOGICAL order
@@ -3455,8 +3911,10 @@ function img = render_growth_frame(U, tip_row, yctk, xctk, F1, F2, ROItype, show
     % position never depends on Time's width.
     timestr = strcat('Time(s): ',num2str(((count-1)*frame_rate)));
     framestr = strcat('Frame: ',num2str(count));
-    text(10,10,timestr,'color','white')
-    text(size(image2,2)-10,10,framestr,'color','white','HorizontalAlignment','right')
+    % FontSize 36 bold: the figure is pinned to 1120x840 px above, where MATLAB's
+    % default 10 pt text (and 16 pt, tried first) is still tiny in the finished growth.mp4.
+    text(10,10,timestr,'color','white','FontSize',36,'FontWeight','bold')
+    text(size(image2,2)-10,10,framestr,'color','white','FontSize',36,'FontWeight','bold','HorizontalAlignment','right')
     set(gca,'xtick',[]); set(gca,'xticklabel',[]); set(gca,'ytick',[]); set(gca,'yticklabel',[]);
     frame = getframe(gcf);
     img = frame.cdata;
@@ -3678,7 +4136,7 @@ end
 % must never crash a run that would otherwise have just NaN'd one frame.
 function [tip_out, diam_out, maxy_out, boundb_out, Qef_out, Qel_out, Qec_out, ...
           tip_ellipse_out, center_out, phin_out, axes_out, stats_out, edges_out, ok] = ...
-    skeleton_tip_fallback(U, weight, diamo, tip_final_last, last_flag, count, debug_mode, ellipse_fit_method)
+    skeleton_tip_fallback(U, weight, diamo, tip_final_last, last_flag, count, debug_mode, ellipse_fit_method, ellipse_candidate_max_jump_factor)
 
     tip_out = []; diam_out = []; maxy_out = []; boundb_out = []; Qef_out = [];
     Qel_out = []; Qec_out = []; tip_ellipse_out = []; center_out = []; phin_out = [];
@@ -3739,8 +4197,8 @@ function [tip_out, diam_out, maxy_out, boundb_out, Qef_out, Qel_out, Qec_out, ..
 
         % Same capped-search fix as the primary path above (see its comment) --
         % diamo and tip_final_last are both already this function's own params.
-        % max_jump_px: half a tube diameter -- see ellipse_candidate_max_jump_factor's doc near the top of this file.
-        max_jump_px = 0.5 * diamo;
+        % max_jump_px: see ellipse_candidate_max_jump_factor's doc near the top of this file.
+        max_jump_px = ellipse_candidate_max_jump_factor * diamo;
         [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, tip_final_last, max_jump_px, ellipse_fit_method);
         diam = robust_diam(U, size(U,2) - 1, diam, count, debug_mode);
         tip_ellipsepos = dsearchn(boundb,tip_ellipse);
@@ -3781,10 +4239,12 @@ function [tip_out, diam_out, maxy_out, boundb_out, Qef_out, Qel_out, Qec_out, ..
                 [~, order] = sort(d_to_ellipse);
                 Sef = Sef(order(1:2),:);
             end
+            % See the main loop's identical branch decision for why this
+            % trusts skel_lastpos directly instead of the old blended formula.
             [tmp, skel_ellipsepos] = min(pdist2(Sef,tip_ellipsef));
             if (last_flag == 1)
                 [tmp, skel_lastpos] = min(pdist2(Sef,tip_final_last));
-                if ((skel_lastpos+skel_ellipsepos+1) > 4) choice = 2; else choice = 1; end
+                choice = skel_lastpos;
             else
                 choice = skel_ellipsepos;
             end
@@ -3860,9 +4320,11 @@ end
 
 function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_smooth_out] = find_tip_and_measure(count, U, prev_tip, ...
         weight, diamo, tip_method, pixelsize, ROItype, split, circle, starti, stopi, ...
-        diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um, ellipse_fit_method)
+        diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um, ellipse_fit_method, ellipse_candidate_max_jump_factor, forced_tip)
 
 if nargin < 21 || isempty(ellipse_fit_method), ellipse_fit_method = 'ransac'; end
+if nargin < 22 || isempty(ellipse_candidate_max_jump_factor), ellipse_candidate_max_jump_factor = Inf; end
+if nargin < 23, forced_tip = []; end % jitter-zone smoothing: use this tip (snapped to the border) instead of the one found here
 
     ok = true;
     last_flag = ~isempty(prev_tip);
@@ -3928,8 +4390,8 @@ if nargin < 21 || isempty(ellipse_fit_method), ellipse_fit_method = 'ransac'; en
 
     % Same capped-search fix as the reverse pass (see main loop's comment) --
     % diamo and prev_tip are both already this function's own params.
-    % max_jump_px: half a tube diameter -- see ellipse_candidate_max_jump_factor's doc near the top of this file.
-    max_jump_px = 0.5 * diamo;
+    % max_jump_px: see ellipse_candidate_max_jump_factor's doc near the top of this file.
+    max_jump_px = ellipse_candidate_max_jump_factor * diamo;
     [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, prev_tip, max_jump_px, ellipse_fit_method);
     % Same robust-diam overwrite as the reverse pass (see main loop) -- keeps
     % the tolerance check below comparing like-for-like instead of a robust
@@ -3980,10 +4442,12 @@ if nargin < 21 || isempty(ellipse_fit_method), ellipse_fit_method = 'ransac'; en
             [~, order] = sort(d_to_ellipse);
             Sef = Sef(order(1:2),:);
         end
+        % See the main loop's identical branch decision for why this
+        % trusts skel_lastpos directly instead of the old blended formula.
         [tmp, skel_ellipsepos] = min(pdist2(Sef,tip_ellipsef));
         if (last_flag == 1)
             [tmp, skel_lastpos] = min(pdist2(Sef,prev_tip));
-            if ((skel_lastpos+skel_ellipsepos+1) > 4) choice = 2; else choice = 1; end
+            choice = skel_lastpos;
         else
             choice = skel_ellipsepos;
         end
@@ -4031,6 +4495,10 @@ if nargin < 21 || isempty(ellipse_fit_method), ellipse_fit_method = 'ransac'; en
         if (tip_finaldistpos == 1) tip_row = tip_ellipsef; else tip_row = tip_skel; end
     end
 
+    if ~isempty(forced_tip)
+        [~, kf_forced] = min(pdist2(boundb, forced_tip));
+        tip_row = boundb(kf_forced,:);
+    end
     if debug_mode
         fprintf('  [repair] tip F%d -> [%d %d]\n', count, tip_row(1), tip_row(2));
     end
@@ -4038,7 +4506,7 @@ if nargin < 21 || isempty(ellipse_fit_method), ellipse_fit_method = 'ransac'; en
     % Tip-jump sanity check against the real previous-in-time frame -- same
     % physical bound as the reverse pass's own check, just now checked
     % against the correct chronological neighbour.
-    if last_flag && pixelsize > 0
+    if last_flag && pixelsize > 0 && isempty(forced_tip)
         tip_jump_um = pdist2(tip_row, prev_tip) * pixelsize;
         if tip_jump_um > max_tip_jump_um
             ok = false;
@@ -4376,4 +4844,84 @@ if nargin < 21 || isempty(ellipse_fit_method), ellipse_fit_method = 'ransac'; en
     diamf = diag(pdist2(xy1,xy2)); % median, not mean -- see the reverse pass's own copy
     diamf_val = median(diamf);
     yctk_out = yctk; xctk_out = xctk;
+end
+
+function ok = candidate_passes_tip_guard(pt, tip_final_last, axis_unit, ...
+    max_tip_jump_um, frames_since_last_good, pixelsize, ...
+    lateral_offset_max_factor, diamo_est, stationary_lock_active, stationary_pos_eps_px, ...
+    side_n, side_acc, side_limit_px)
+% Unified acceptance test for a tip-position candidate, combining the three
+% independent guards (Euclidean jump budget, lateral-offset-from-axis, and
+% stationary-lock exclusion) into one predicate so the primary pick and
+% every recovery-pool candidate are held to exactly the same standard,
+% rather than the pool only ever being re-checked against the plain jump
+% budget. See the guards' shared doc block near max_tip_jump_um's own
+% derivation, and lateral_offset_max_factor's own default, near the top of
+% main_track_movies.m.
+%
+% axis_unit: precomputed once per frame by the caller (identical for every
+% candidate in the pool -- it depends only on tip_final_last/history/U, not
+% on which candidate is being tested), not recomputed per-candidate here.
+% Empty when no usable axis exists (see the caller's own fallback chain),
+% in which case the lateral check is simply skipped for this candidate.
+
+if nargin < 13, side_n = []; side_acc = 0; side_limit_px = Inf; end
+jump_um = pdist2(pt, tip_final_last) * pixelsize;
+ok = jump_um <= max_tip_jump_um * frames_since_last_good;
+
+if ok && ~isempty(side_n)
+    % Side memory (see side_offset_max_factor's doc): cumulative sideways offset
+    % may not exceed the limit unless this step reduces it.
+    side_new = side_acc + dot(pt - tip_final_last, side_n);
+    ok = abs(side_new) <= side_limit_px || abs(side_new) <= abs(side_acc);
+end
+
+if ok && ~isempty(axis_unit)
+    d_vec = pt - tip_final_last;
+    long_comp = dot(d_vec, axis_unit);
+    lateral_px = norm(d_vec - long_comp * axis_unit);
+    ok = lateral_px <= lateral_offset_max_factor * diamo_est;
+end
+
+if ok && stationary_lock_active
+    % Already locked onto a frozen point for stationary_lock_n_frames in a
+    % row (see stationary_streak's own upkeep) -- refuse to extend that
+    % streak with yet another point that's still essentially the same
+    % spot, even though it trivially passes both checks above (near-zero
+    % displacement always will). Forces the pool to either produce a
+    % genuinely different point or fail outright (frame gets NaN'd/flagged
+    % rather than silently continuing the freeze).
+    ok = pdist2(pt, tip_final_last) >= stationary_pos_eps_px;
+end
+end
+function [pt_new, moved_px] = step_along_contour(boundb, from_pt, to_pt, step_px, min_euclid)
+% Walk about step_px of ARC LENGTH along the ordered contour boundb, starting
+% at the contour point nearest from_pt and heading for the contour point
+% nearest to_pt (the shorter way round). Stops early at the target if it is
+% closer than step_px. min_euclid (optional) additionally requires the
+% stopping point to be at least that far, straight-line, from from_pt -- the
+% stationary nudge needs this so the move clears stationary_pos_eps_px.
+% Returns the point reached and its straight-line distance from from_pt
+% (moved_px = 0 means no move was possible, caller falls back).
+if nargin < 5, min_euclid = 0; end
+n = size(boundb, 1);
+by = double(boundb(:,1)); bx = double(boundb(:,2));
+[~, i0] = min(hypot(by - from_pt(1), bx - from_pt(2)));
+[~, i1] = min(hypot(by - to_pt(1), bx - to_pt(2)));
+fwd = mod(i1 - i0, n); bwd = mod(i0 - i1, n);
+if fwd <= bwd, dirn = 1; arc = fwd; else dirn = -1; arc = bwd; end
+if arc == 0
+    pt_new = boundb(i0,:); moved_px = 0; return;
+end
+path_idx = mod(i0 - 1 + dirn*(0:arc), n) + 1;
+seg = [0; cumsum(hypot(diff(by(path_idx)), diff(bx(path_idx))))];
+eu = hypot(by(path_idx) - from_pt(1), bx(path_idx) - from_pt(2));
+k = find(seg >= step_px & eu >= min_euclid, 1, 'first');
+if isempty(k)
+    k = numel(path_idx);
+elseif min_euclid == 0 && k > 1 && seg(k) > step_px
+    k = k - 1; % a cap must not overshoot; only the nudge (min_euclid > 0) may
+end
+pt_new = boundb(path_idx(k),:);
+moved_px = hypot(double(pt_new(1)) - from_pt(1), double(pt_new(2)) - from_pt(2));
 end

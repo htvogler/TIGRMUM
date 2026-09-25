@@ -352,3 +352,55 @@ ellipse_fit_method = 'ransac'; % 'ransac' (default): robust to a nearby branch p
                  % flattened cap (confirmed needed on HV210_3, 2026-09-18). No single method
                  % dominates on every stack -- this is a per-stack choice, not a global default
                  % to tune; try 'legacy' if RANSAC underperforms the old behaviour on a stack.
+
+% Tip-acceptance guards (see main_track_movies.m for the full derivation).
+% The values below are the defaults; they reproduce the HV209_62 run-3 settings.
+stationary_nudge_um = 1.0; % Freeze breaker: after stationary_lock_n_frames frames with the tip
+                 % frozen (position < stationary_pos_eps_px and diameter < stationary_diam_eps_px),
+                 % candidates within that radius are refused. Instead of snapping to the nearest
+                 % remaining candidate (which could be several um away), the tip moves this far
+                 % ALONG THE MASK BORDER toward it. 0 = old behaviour (snap to the candidate).
+border_jitter_um = 1.5; % Border-drift limit: the accepted tip may move at most
+                 % border_jitter_um + (max_growth_rate_um_per_min/60)*growth_safety_factor*frame_rate
+                 % per frame (x frames since the last good tip), measured ALONG the mask border;
+                 % a larger move is cut short by walking along the contour toward the target.
+                 % Applies on every acceptance path. Inf = off.
+lateral_offset_max_factor = Inf; % Old lateral guard: max sideways offset from the travel axis as a
+                 % fraction of the tube diameter (e.g. 0.30). Inf = off (default): the drift limit
+                 % above bounds the step size, and the lateral guard only ever bounded the
+                 % sideways part.
+ellipse_candidate_max_jump_factor = Inf; % Sanity bound inside ellipse_data.m ("fallback"): an ellipse
+                 % candidate more than factor * tube diameter from the previous tip is replaced
+                 % by the border point nearest the previous tip. Inf = off (default). It froze the
+                 % tip whenever the true apex was > 0.5 D away (HV200_4_5 F3552). 0.5 = the old
+                 % bound; can help with tip_method = 'ringwalk' when the ellipse spills sideways.
+
+nudge_max_cand_dist_factor = 0.25; % Freeze breaker (stationary_nudge_um > 0): only nudge toward a candidate
+                 % within this fraction of the tube diameter of the frozen tip. If none is that close,
+                 % the tip HOLDS -- a genuine growth pause looks exactly like a freeze, and the only
+                 % candidate left after the freeze breaker refuses the near ones can be far away on
+                 % another part of the tube end (HV209_62 F1883: the corner, 0.4 D away). Inf = no limit.
+side_offset_max_factor = 0.25; % Side memory (ON by default since 2026-09-25; Inf = off): cumulative sideways drift of the tip relative to the tube's
+                 % local axis may not exceed this fraction of the tube diameter (steps that reduce the
+                 % offset always pass). Stops a slow slide from the middle of the tube end onto a corner
+                 % in several small steps, which the per-frame limits cannot see. Inf = off.
+side_memory_decay = 0.99; % Per accepted frame leak of the remembered sideways offset, so a genuine turn is
+                 % not blocked forever (0.99 = half-life about 70 frames).
+
+vote_ellipse_first = 1; % 1 (default) = the ellipse candidate always wins the vote; 0 = older continuity-first vote:
+                 % the candidate (ellipse pole, skeleton end, border midpoint) nearest to the previous tip wins. With 1, skeleton/border candidates only enter via the guard recovery pool when the ellipse
+                 % candidate fails a guard. Motivation: on HV200_4_5 the drifting border-midpoint candidate takes
+                 % over from the ellipse pole and walks the tip base-ward.
+
+ellipse_first_min_ratio = 1.30; % Ellipse gate for vote_ellipse_first: ellipse-first is used only while the ellipse's
+ellipse_first_off_ratio = 1.25; % long/short axis ratio is at least min_ratio (switches OFF again below off_ratio, hysteresis).
+                 % Near-round ellipses (ratio ~1, hooked/rounded tips) have no well-defined long axis and made the
+                 % tip flicker on HV209_62; there the older nearest-to-previous-tip vote is used. Measured ratios:
+                 % HV200_4_5 1.33-1.9, HV209_62 hook 1.02-1.4. Set both to 0 for always-ellipse-first.
+
+jitter_smooth = 0; % Jitter-zone smoothing pass at the end of the run (0 = off). Zones = stretches where the finished tip track
+                 % flickers: >= jitter_zone_min_moves moves of >= jitter_zone_move_px px within any jitter_zone_span
+                 % consecutive frames, padded by jitter_zone_pad frames. Tips in a zone become the median of the raw tips in a
+                 % centered window of jitter_smooth_window frames, snapped to the mask border; centerline, ROI, diameter,
+                 % intensities and video frames of those frames are recomputed. Kymograph lines / arc length are NOT updated.
+jitter_smooth_window = 7; jitter_zone_move_px = 3; jitter_zone_min_moves = 3; jitter_zone_span = 11; jitter_zone_pad = 3;
