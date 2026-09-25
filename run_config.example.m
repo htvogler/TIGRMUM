@@ -380,21 +380,15 @@ nudge_max_cand_dist_factor = 0.25; % Freeze breaker (stationary_nudge_um > 0): o
                  % the tip HOLDS -- a genuine growth pause looks exactly like a freeze, and the only
                  % candidate left after the freeze breaker refuses the near ones can be far away on
                  % another part of the tube end (HV209_62 F1883: the corner, 0.4 D away). Inf = no limit.
-side_offset_max_factor = 0.25; % Side memory (ON by default since 2026-09-25; Inf = off): cumulative sideways drift of the tip relative to the tube's
-                 % local axis may not exceed this fraction of the tube diameter (steps that reduce the
-                 % offset always pass). Stops a slow slide from the middle of the tube end onto a corner
-                 % in several small steps, which the per-frame limits cannot see. Inf = off.
-side_memory_decay = 0.99; % Per accepted frame leak of the remembered sideways offset, so a genuine turn is
-                 % not blocked forever (0.99 = half-life about 70 frames).
-shank_axis_guard = 0; % 1 = shank-axis guard (default 0 = off; replaces the side memory when on): the tip may not cross the tube's
-                 % shank axis -- a straight line fitted to the first straight stretch (>= shank_axis_min_len_factor * D) of the
+side_memory = 1; % Side memory (default 1 = on, 0 = off; rebuilt 2026-09-26): the tip may not cross the tube's
+                 % shank axis -- a straight line fitted to the first straight stretch (>= side_memory_min_len_factor * D) of the
                  % skeleton path from the previous tip toward the base -- to the side opposite the previous tip by more than
-                 % max(shank_axis_tol_min_px, shank_axis_tol_factor * D). The first shank_axis_skip_factor * D behind the tip is
-                 % skipped, a stretch is straight while its RMS distance to the line is <= shank_axis_rms_px, shorter pieces after
-                 % a kink are ignored (at a V-shape only the arm the tip is on counts). shank_axis_hyst_factor keeps the old axis
+                 % max(side_memory_tol_min_px, side_memory_tol_factor * D). The first side_memory_skip_factor * D behind the tip is
+                 % skipped, a stretch is straight while its RMS distance to the line is <= side_memory_rms_px, shorter pieces after
+                 % a kink are ignored (at a V-shape only the arm the tip is on counts). side_memory_hyst_factor keeps the old axis
                  % until its stretch is that many D shorter than the minimum (and switches back only when the nearer stretch is that
-                 % much longer). D = diamo_est. Defaults: 2, 1, 1.5, 0.1, 2, 0.5. Unlike the side memory it cannot lock the tip out
-                 % at a turn (the side memory's axis runs through the previous tip along the border).
+                 % much longer). D = diamo_est. Defaults: 2, 1, 1.5, 0.1, 2, 0.5. Replaces the first side memory (sideways drift
+                 % against an axis through the previous tip, which locked the tip out at turns: HV204_105, HV203_4_21).
 
 vote_ellipse_first = 1; % 1 (default) = the ellipse candidate always wins the vote; 0 = older continuity-first vote:
                  % the candidate (ellipse pole, skeleton end, border midpoint) nearest to the previous tip wins. With 1, skeleton/border candidates only enter via the guard recovery pool when the ellipse
