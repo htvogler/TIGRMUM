@@ -140,7 +140,22 @@ if ~exist('side_memory_rms_px', 'var'), side_memory_rms_px = 1.5; end
 if ~exist('side_memory_tol_factor', 'var'), side_memory_tol_factor = 0.1; end
 if ~exist('side_memory_tol_min_px', 'var'), side_memory_tol_min_px = 2; end
 if ~exist('side_memory_hyst_factor', 'var'), side_memory_hyst_factor = 0.5; end
+% Activation window (2026-09-26; side_memory_windowed = 0 = enforce all the time): the axis line
+% is only a good description of the tube along its own straight stretch -- just after a kink it
+% is off-centre by up to ~5 px (HV204_105, 1.3-2.3 D behind the last-frame tip) -- so the side
+% memory only ENFORCES near a kink, once per axis. It arms when the skeleton path from the tip
+% reaches the band around the axis (the "crossing") within side_memory_arm_D * diamo_est. It
+% releases at the earlier of (a) side_memory_after_cross_D * diamo_est of tip travel past the
+% crossing, (b) side_memory_after_fire_D * diamo_est of tip travel after it first refused the
+% tip's pick. An axis that has been armed (or that the tip was already on) is not armed again.
+% Outside the window the side is still learned (side_sign) but nothing is refused.
+if ~exist('side_memory_windowed', 'var'), side_memory_windowed = 1; end
+if ~exist('side_memory_arm_D', 'var'), side_memory_arm_D = 1; end
+if ~exist('side_memory_after_cross_D', 'var'), side_memory_after_cross_D = 0.3; end
+if ~exist('side_memory_after_fire_D', 'var'), side_memory_after_fire_D = 1; end
 side_ax_prev = []; side_sign = 0;
+side_done = struct('c', {}, 'a', {}, 'L', {}, 'i0', {}, 'n', {}); % axes already armed
+side_active = false; side_travel = 0; side_cross_at = Inf; side_fire_at = NaN;
 % Ellipse-first vote (2026-09-24, default ON; 0 = the older continuity-first vote): the older vote
 % picked whichever of ellipsef/skel/mid is nearest to the previous tip. On
 % HV200_4_5 (F3680 onward) that lets the mid candidate, which drifts along with the tip, take over
@@ -1598,25 +1613,48 @@ for count = smp:-1:stp
         % Shank-axis guard -- see the side memory's doc near the top of this script.
         side_guard = []; side_fail = false;
         if side_memory
-            [sax, sax_same] = side_memory_axis_find(U, tip_final_last, diamo_est, side_ax_prev, ...
-                side_memory_min_len_factor, side_memory_skip_factor, side_memory_rms_px, side_memory_hyst_factor);
+            side_tol = max(side_memory_tol_min_px, side_memory_tol_factor * diamo_est);
+            [sax, sax_same, sax_dc] = side_memory_axis_find(U, tip_final_last, diamo_est, side_ax_prev, ...
+                side_memory_min_len_factor, side_memory_skip_factor, side_memory_rms_px, side_memory_hyst_factor, side_tol);
             if isempty(sax) && ~isempty(side_ax_prev) && ...
                     abs(dot(tip_final_last - side_ax_prev.c, side_ax_prev.n)) <= 2 * diamo_est
-                sax = side_ax_prev; sax_same = true; % no stretch now: keep the last axis while the tip is near it
+                sax = side_ax_prev; sax_same = true; sax_dc = Inf; % no stretch now: keep the last axis while the tip is near it
             end
             if ~isempty(sax)
-                if ~sax_same, side_sign = 0; end
-                side_tol = max(side_memory_tol_min_px, side_memory_tol_factor * diamo_est);
+                if ~sax_same, side_sign = 0; side_active = false; end
                 s_prev = dot(tip_final_last - sax.c, sax.n);
                 if abs(s_prev) > side_tol, side_sign = sign(s_prev); end
                 side_ax_prev = sax;
-                if side_sign ~= 0
+                enforce = true;
+                if side_memory_windowed
+                    if ~side_active
+                        is_done = false;
+                        for kd = 1:numel(side_done)
+                            if abs(dot(sax.a, side_done(kd).a)) > cosd(15) && abs(dot(sax.c - side_done(kd).c, side_done(kd).n)) < 0.5 * diamo_est
+                                is_done = true; break;
+                            end
+                        end
+                        if ~is_done
+                            if sax_dc == 0
+                                side_done(end+1) = sax; % the tip is already on this axis: nothing to guard
+                            elseif sax_dc <= side_memory_arm_D * diamo_est
+                                side_done(end+1) = sax; side_active = true; side_fire_at = NaN;
+                            end
+                        end
+                    end
+                    if side_active && sax_dc > 0 && isfinite(sax_dc)
+                        side_cross_at = side_travel + sax_dc; % travel coordinate of the crossing
+                    end
+                    enforce = side_active;
+                end
+                if side_sign ~= 0 && enforce
                     side_guard = struct('c', sax.c, 'n', sax.n, 'tol', side_tol, 'side', side_sign);
                     side_fail = side_memory_refuses(tip_final(count,:), side_guard);
+                    if side_fail && side_active && isnan(side_fire_at), side_fire_at = side_travel; end
                 end
                 if debug_mode
-                    fprintf('  DIAG F%d: side axis c=[%.1f %.1f] a=[%.2f %.2f] len=%.0fpx same=%d side=%d prev_off=%.2f tol=%.2f side_fail=%d\n', ...
-                        count, sax.c(1), sax.c(2), sax.a(1), sax.a(2), sax.L, sax_same, side_sign, s_prev, side_tol, side_fail);
+                    fprintf('  DIAG F%d: side axis c=[%.1f %.1f] a=[%.2f %.2f] len=%.0fpx same=%d side=%d prev_off=%.2f tol=%.2f dc=%.1f active=%d side_fail=%d\n', ...
+                        count, sax.c(1), sax.c(2), sax.a(1), sax.a(2), sax.L, sax_same, side_sign, s_prev, side_tol, sax_dc, side_active, side_fail);
                 end
             elseif debug_mode
                 fprintf('  DIAG F%d: side axis none (guard off this frame)\n', count);
@@ -1783,6 +1821,16 @@ for count = smp:-1:stp
             end
         end
 
+
+        % Side memory window upkeep: tip travel and release (see side_memory_windowed's doc).
+        if side_memory && side_memory_windowed && ~frame_failed(count)
+            side_travel = side_travel + pdist2(tip_final(count,:), tip_final_last);
+            if side_active && (side_travel >= side_cross_at + side_memory_after_cross_D * diamo_est || ...
+                    (~isnan(side_fire_at) && side_travel >= side_fire_at + side_memory_after_fire_D * diamo_est))
+                side_active = false;
+                if debug_mode, fprintf('  DIAG F%d: side memory window closed (travel %.1f, crossing at %.1f, first fire at %.1f)\n', count, side_travel, side_cross_at, side_fire_at); end
+            end
+        end
     end
 
     if weak_signal && (needs_repair(count) || frame_failed(count))
@@ -4888,15 +4936,15 @@ off = dot(pt - g.c, g.n);
 refuse = (sign(off) ~= g.side) && abs(off) > g.tol;
 end
 
-function [ax, same] = side_memory_axis_find(U, tip, diamo_est, prev_ax, min_len_f, skip_f, rms_max, hyst_f)
+function [ax, same, dc] = side_memory_axis_find(U, tip, diamo_est, prev_ax, min_len_f, skip_f, rms_max, hyst_f, tol)
 % Shank axis for the tip at `tip` ([row col]) in mask U: straight line through the first
 % straight stretch, >= min_len_f * diamo_est long, of the skeleton path from the tip toward
 % the base (largest column), starting skip_f * diamo_est behind the tip. See
 % the side memory's doc near the top of main_track_movies.m. Returns [] when there is no
 % such stretch (or no connected skeleton path). ax.c = point on the axis [row col], ax.a =
 % unit direction pointing tip-ward, ax.n = [-a(2) a(1)], ax.L = stretch length (px).
-% `same` = the axis is the one in prev_ax (still matched, possibly with hysteresis).
-ax = []; same = false;
+% `same` = the axis is the one in prev_ax (still matched, possibly with hysteresis). dc = see below.
+ax = []; same = false; dc = Inf;
 skel = bwmorph(U, 'skel', Inf);
 [sr, sc] = find(skel);
 if numel(sr) < 20, return; end
@@ -4967,6 +5015,15 @@ if pick == 0, return; end
 ax = segs(pick);
 ax.n = [-ax.a(2), ax.a(1)];
 same = (pick == ip);
+% dc = path length from the tip to the first entry into the tolerance band of the axis line
+% (0 if the path already starts inside the band, Inf if it never enters).
+off = (P(:,1) - ax.c(1)) * ax.n(1) + (P(:,2) - ax.c(2)) * ax.n(2);
+if abs(off(1)) <= tol
+    dc = 0;
+else
+    ie = find(abs(off) <= tol, 1);
+    if ~isempty(ie), dc = arc(ie); end
+end
 end
 
 function [c, a, rms] = side_memory_fit_window(S, i, j)

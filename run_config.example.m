@@ -390,6 +390,11 @@ side_memory = 1; % Side memory (default 1 = on, 0 = off; rebuilt 2026-09-26): th
                  % much longer). D = diamo_est. Defaults: 2, 1, 1.5, 0.1, 2, 0.5. Replaces the first side memory (sideways drift
                  % against an axis through the previous tip, which locked the tip out at turns: HV204_105, HV203_4_21).
 
+side_memory_windowed = 1; % 1 (default) = the side memory only enforces near a kink, once per axis; 0 = enforce all the time. It arms when the skeleton
+                 % path from the tip reaches the tolerance band of the axis within side_memory_arm_D * D (default 1) and releases at the earlier of
+                 % side_memory_after_cross_D * D (0.3) of tip travel past that crossing and side_memory_after_fire_D * D (1) of tip travel after it first
+                 % refused the tip. Reason: just after a kink the axis line is off-centre by up to ~5 px (HV204_105), so enforcing there could push the tip.
+
 vote_ellipse_first = 1; % 1 (default) = the ellipse candidate always wins the vote; 0 = older continuity-first vote:
                  % the candidate (ellipse pole, skeleton end, border midpoint) nearest to the previous tip wins. With 1, skeleton/border candidates only enter via the guard recovery pool when the ellipse
                  % candidate fails a guard. Motivation: on HV200_4_5 the drifting border-midpoint candidate takes
