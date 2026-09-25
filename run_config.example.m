@@ -402,5 +402,6 @@ jitter_smooth = 0; % Jitter-zone smoothing pass at the end of the run (0 = off).
                  % flickers: >= jitter_zone_min_moves moves of >= jitter_zone_move_px px within any jitter_zone_span
                  % consecutive frames, padded by jitter_zone_pad frames. Tips in a zone become the median of the raw tips in a
                  % centered window of jitter_smooth_window frames, snapped to the mask border; centerline, ROI, diameter,
-                 % intensities and video frames of those frames are recomputed. Kymograph lines / arc length are NOT updated.
+                 % intensities and video frames of those frames are recomputed. A smoothed tip is never further than the border-drift limit
+                 % from the final tip of the previous frame (analysis order). Kymograph lines / arc length are NOT updated.
 jitter_smooth_window = 7; jitter_zone_move_px = 3; jitter_zone_min_moves = 3; jitter_zone_span = 11; jitter_zone_pad = 3;

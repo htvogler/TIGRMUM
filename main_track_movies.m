@@ -150,7 +150,9 @@ ellipse_first_state = []; % empty until the first frame with a valid ratio decid
 % side. In a zone every frame's tip becomes the MEDIAN of the raw tips in a centered window of
 % jitter_smooth_window frames (both sides, so nothing is lost at the start of a zone), snapped to that frame's
 % own mask border; centerline, ROI halves, diameter, intensities and video frames of those frames are then
-% recomputed from the new tip. The anchor frame (smp, e.g. a manual seed) is never changed.
+% recomputed from the new tip. The anchor frame (smp, e.g. a manual seed) is never changed. A smoothed tip is
+% walked along the border so that it is never further than the border-drift limit (max_step_um) from the final
+% tip of the previous frame in analysis order.
 % NOT updated: the per-frame kymograph lines / arc length.
 if ~exist('jitter_smooth', 'var'), jitter_smooth = 0; end
 if ~exist('jitter_smooth_window', 'var'), jitter_smooth_window = 7; end
@@ -2786,8 +2788,8 @@ if jitter_smooth
     js_zone = (movmax(double(js_zone), 2*jitter_zone_pad+1) > 0) & js_valid;
     js_zone(js_frames == smp) = false; % the anchor frame (manual seed, or the tip found there) is never moved; its raw tip still counts in its neighbours' medians
     js_half = floor(jitter_smooth_window / 2);
-    js_changed = 0; js_redone = 0;
-    for js_k = find(js_zone)'
+    js_changed = 0; js_redone = 0; js_limited = 0;
+    for js_k = fliplr(find(js_zone)') % analysis order (high -> low frame number), so frame count+1 is already final
         count = js_frames(js_k);
         Uk = U_all_cache{count};
         if isempty(Uk), continue; end
@@ -2795,6 +2797,17 @@ if jitter_smooth
         js_med = median(js_tip(js_idx,:), 1); % median of the RAW tips (js_tip is a snapshot), not of already smoothed ones
         js_b = bwboundaries(Uk); [~, js_ib] = max(cellfun(@(b) size(b,1), js_b)); js_b = js_b{js_ib};
         [~, js_nn] = min(pdist2(js_b, js_med)); js_new = js_b(js_nn,:);
+        % Step limit: the smoothed tip may not be further from the FINAL tip of the previous frame in analysis order
+        % (count+1, already smoothed if it was a zone frame) than the main loop's border-drift limit allows; if it is,
+        % walk along this frame's border toward it by at most that limit. Without this the median can turn a real fast
+        % move into one big step (7.3 px on HV209_62 F2565 -> F2564).
+        if isfinite(max_step_um) && pixelsize > 0 && count < smp && all(isfinite(tip_final(count+1,:))) && ~frame_failed(count+1)
+            js_cap = max_step_um / pixelsize;
+            if pdist2(js_new, tip_final(count+1,:)) > js_cap
+                [js_lim, js_moved] = step_along_contour(js_b, tip_final(count+1,:), js_new, js_cap);
+                if js_moved > 0, js_new = js_lim; js_limited = js_limited + 1; end
+            end
+        end
         if pdist2(js_new, js_tip(js_k,:)) < 0.5, continue; end % already there
         js_changed = js_changed + 1;
         try
@@ -2862,7 +2875,11 @@ if jitter_smooth
             end
         end
     end
-    fprintf('Jitter smoothing: %d zone frames, %d with a changed tip, %d recomputed\n', nnz(js_zone), js_changed, js_redone);
+    js_final = tip_final(js_frames,:);
+    js_fstep = hypot(diff(js_final(:,1)), diff(js_final(:,2)));
+    js_chg = any(js_final ~= js_tip, 2); js_chg2 = (js_chg(1:end-1) | js_chg(2:end)) & isfinite(js_fstep);
+    if any(js_chg2), js_maxstep = max(js_fstep(js_chg2)); else, js_maxstep = 0; end
+    fprintf('Jitter smoothing: %d zone frames, %d with a changed tip, %d recomputed, %d limited by the step limit, max step next to a changed frame %.1f px\n', nnz(js_zone), js_changed, js_redone, js_limited, js_maxstep);
 end
 
 % Flush the buffered video frames to disk now, in TRUE CHRONOLOGICAL order
