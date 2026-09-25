@@ -386,6 +386,15 @@ side_offset_max_factor = 0.25; % Side memory (ON by default since 2026-09-25; In
                  % in several small steps, which the per-frame limits cannot see. Inf = off.
 side_memory_decay = 0.99; % Per accepted frame leak of the remembered sideways offset, so a genuine turn is
                  % not blocked forever (0.99 = half-life about 70 frames).
+shank_axis_guard = 0; % 1 = shank-axis guard (default 0 = off; replaces the side memory when on): the tip may not cross the tube's
+                 % shank axis -- a straight line fitted to the first straight stretch (>= shank_axis_min_len_factor * D) of the
+                 % skeleton path from the previous tip toward the base -- to the side opposite the previous tip by more than
+                 % max(shank_axis_tol_min_px, shank_axis_tol_factor * D). The first shank_axis_skip_factor * D behind the tip is
+                 % skipped, a stretch is straight while its RMS distance to the line is <= shank_axis_rms_px, shorter pieces after
+                 % a kink are ignored (at a V-shape only the arm the tip is on counts). shank_axis_hyst_factor keeps the old axis
+                 % until its stretch is that many D shorter than the minimum (and switches back only when the nearer stretch is that
+                 % much longer). D = diamo_est. Defaults: 2, 1, 1.5, 0.1, 2, 0.5. Unlike the side memory it cannot lock the tip out
+                 % at a turn (the side memory's axis runs through the previous tip along the border).
 
 vote_ellipse_first = 1; % 1 (default) = the ellipse candidate always wins the vote; 0 = older continuity-first vote:
                  % the candidate (ellipse pole, skeleton end, border midpoint) nearest to the previous tip wins. With 1, skeleton/border candidates only enter via the guard recovery pool when the ellipse

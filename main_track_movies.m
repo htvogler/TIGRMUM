@@ -128,6 +128,32 @@ if ~exist('nudge_max_cand_dist_factor', 'var'), nudge_max_cand_dist_factor = 0.2
 if ~exist('side_offset_max_factor', 'var'), side_offset_max_factor = 0.25; end % ON by default since 2026-09-25: keeps the tip from sliding to the wrong side on HV209_62 (checked there with the gate); NOT yet checked on HV200_4_5 with the gate -- with the old vote it caused a 28 px lag there. Inf = off.
 if ~exist('side_memory_decay', 'var'), side_memory_decay = 0.99; end
 side_acc = 0; side_axis_prev = [];
+% Shank-axis guard (2026-09-26, default OFF; replaces the side memory when ON): the side
+% memory's axis runs through the previous tip along the tube border, so at a turn it
+% refuses the correct tip (HV204_105, HV203_4_21). This guard uses the tube's SHANK AXIS
+% instead: a straight line fitted to the first straight stretch of the skeleton path from
+% the previous tip toward the base that is at least shank_axis_min_len_factor * diamo_est
+% long (the first shank_axis_skip_factor * diamo_est behind the tip, the flat end, is
+% skipped; a stretch is straight while its RMS distance to the fitted line is <=
+% shank_axis_rms_px; shorter pieces after a kink are ignored, so at a V-shape only the
+% arm the tip is on counts). The tip must stay on the side of that axis where the previous
+% tip is: a candidate on the OTHER side by more than max(shank_axis_tol_min_px,
+% shank_axis_tol_factor * diamo_est) is refused like any other guard failure (recovery
+% pool, else hold). The side is taken from the previous tip; if that lies within the band
+% the side remembered for the same axis is used (none for a new axis). The active axis
+% changes when the tip's own stretch gets shorter than the minimum (analysis runs from the
+% last frame backwards, so the tip retreats toward the kink); shank_axis_hyst_factor keeps
+% the old axis until its stretch is that much (in D) shorter than the minimum and switches
+% back only when the nearer stretch is that much longer. No stretch at all: the last axis
+% is reused while the previous tip is within 2 D of it, else the guard is off for the frame.
+if ~exist('shank_axis_guard', 'var'), shank_axis_guard = 0; end
+if ~exist('shank_axis_min_len_factor', 'var'), shank_axis_min_len_factor = 2; end
+if ~exist('shank_axis_skip_factor', 'var'), shank_axis_skip_factor = 1; end
+if ~exist('shank_axis_rms_px', 'var'), shank_axis_rms_px = 1.5; end
+if ~exist('shank_axis_tol_factor', 'var'), shank_axis_tol_factor = 0.1; end
+if ~exist('shank_axis_tol_min_px', 'var'), shank_axis_tol_min_px = 2; end
+if ~exist('shank_axis_hyst_factor', 'var'), shank_axis_hyst_factor = 0.5; end
+shank_ax_prev = []; shank_side = 0;
 % Ellipse-first vote (2026-09-24, default ON; 0 = the older continuity-first vote): the older vote
 % picked whichever of ellipsef/skel/mid is nearest to the previous tip. On
 % HV200_4_5 (F3680 onward) that lets the mid candidate, which drifts along with the tip, take over
@@ -1583,7 +1609,7 @@ for count = smp:-1:stp
 
         % Side memory -- see side_offset_max_factor's doc near the top of this script.
         side_n = [];
-        if isfinite(side_offset_max_factor)
+        if isfinite(side_offset_max_factor) && ~shank_axis_guard
             side_axis = local_tip_tangent(U, tip_final_last, diamo_est);
             if ~isempty(side_axis)
                 if ~isempty(side_axis_prev) && dot(side_axis, side_axis_prev) < 0, side_axis = -side_axis; end
@@ -1601,7 +1627,36 @@ for count = smp:-1:stp
             end
         end
 
-        if jump_fail || lateral_fail || stationary_fail || side_fail
+
+        % Shank-axis guard -- see shank_axis_guard's doc near the top of this script.
+        shank_guard = []; shank_fail = false;
+        if shank_axis_guard
+            [sax, sax_same] = shank_axis_find(U, tip_final_last, diamo_est, shank_ax_prev, ...
+                shank_axis_min_len_factor, shank_axis_skip_factor, shank_axis_rms_px, shank_axis_hyst_factor);
+            if isempty(sax) && ~isempty(shank_ax_prev) && ...
+                    abs(dot(tip_final_last - shank_ax_prev.c, shank_ax_prev.n)) <= 2 * diamo_est
+                sax = shank_ax_prev; sax_same = true; % no stretch now: keep the last axis while the tip is near it
+            end
+            if ~isempty(sax)
+                if ~sax_same, shank_side = 0; end
+                shank_tol = max(shank_axis_tol_min_px, shank_axis_tol_factor * diamo_est);
+                s_prev = dot(tip_final_last - sax.c, sax.n);
+                if abs(s_prev) > shank_tol, shank_side = sign(s_prev); end
+                shank_ax_prev = sax;
+                if shank_side ~= 0
+                    shank_guard = struct('c', sax.c, 'n', sax.n, 'tol', shank_tol, 'side', shank_side);
+                    shank_fail = shank_axis_refuses(tip_final(count,:), shank_guard);
+                end
+                if debug_mode
+                    fprintf('  DIAG F%d: shank axis c=[%.1f %.1f] a=[%.2f %.2f] len=%.0fpx same=%d side=%d prev_off=%.2f tol=%.2f shank_fail=%d\n', ...
+                        count, sax.c(1), sax.c(2), sax.a(1), sax.a(2), sax.L, sax_same, shank_side, s_prev, shank_tol, shank_fail);
+                end
+            elseif debug_mode
+                fprintf('  DIAG F%d: shank axis none (guard off this frame)\n', count);
+            end
+        end
+
+        if jump_fail || lateral_fail || stationary_fail || side_fail || shank_fail
             % The chosen candidate fails at least one guard -- before giving
             % up, check whether one of the OTHER candidates this same frame
             % already produced (ellipsef/skel/mid, whichever this code path
@@ -1643,10 +1698,10 @@ for count = smp:-1:stp
                 cand_ok(cand_i) = candidate_passes_tip_guard(cand(cand_i,:), tip_final_last, ...
                     axis_unit, max_tip_jump_um, frames_since_last_good, pixelsize, ...
                     lateral_offset_max_factor, diamo_est, stationary_lock_active, stationary_pos_eps_px, ...
-                    side_n, side_acc, side_limit_px);
+                    side_n, side_acc, side_limit_px, shank_guard);
             end
             % Nudge target limit -- see nudge_max_cand_dist_factor's doc near the top.
-            if stationary_nudge_um > 0 && stationary_fail && ~jump_fail && ~lateral_fail && ~side_fail
+            if stationary_nudge_um > 0 && stationary_fail && ~jump_fail && ~lateral_fail && ~side_fail && ~shank_fail
                 cand_ok(pdist2(cand, tip_final_last) > nudge_max_cand_dist_factor * diamo_est) = false;
             end
             if debug_mode
@@ -1672,10 +1727,11 @@ for count = smp:-1:stp
             if lateral_fail, fail_reason{end+1} = 'lateral'; end
             if stationary_fail, fail_reason{end+1} = 'stationary_lock'; end
             if side_fail, fail_reason{end+1} = 'side'; end
+            if shank_fail, fail_reason{end+1} = 'shank'; end
             fail_reason_str = strjoin(fail_reason, '+');
             if cand_ok(best_idx)
                 nudged = false;
-                if stationary_nudge_um > 0 && stationary_fail && ~jump_fail && ~lateral_fail && ~side_fail
+                if stationary_nudge_um > 0 && stationary_fail && ~jump_fail && ~lateral_fail && ~side_fail && ~shank_fail
                     [tip_nudged, nudged_px] = step_along_contour(boundb, tip_final_last, cand(best_idx,:), ...
                         stationary_nudge_um / pixelsize, stationary_pos_eps_px + 0.5);
                     if nudged_px > 0
@@ -4863,10 +4919,113 @@ if nargin < 23, forced_tip = []; end % jitter-zone smoothing: use this tip (snap
     yctk_out = yctk; xctk_out = xctk;
 end
 
+function refuse = shank_axis_refuses(pt, g)
+% True if pt lies on the other side of the shank axis than the side recorded in g
+% (g.side = +-1 relative to g.n) by more than g.tol px. See shank_axis_guard's doc.
+off = dot(pt - g.c, g.n);
+refuse = (sign(off) ~= g.side) && abs(off) > g.tol;
+end
+
+function [ax, same] = shank_axis_find(U, tip, diamo_est, prev_ax, min_len_f, skip_f, rms_max, hyst_f)
+% Shank axis for the tip at `tip` ([row col]) in mask U: straight line through the first
+% straight stretch, >= min_len_f * diamo_est long, of the skeleton path from the tip toward
+% the base (largest column), starting skip_f * diamo_est behind the tip. See
+% shank_axis_guard's doc near the top of main_track_movies.m. Returns [] when there is no
+% such stretch (or no connected skeleton path). ax.c = point on the axis [row col], ax.a =
+% unit direction pointing tip-ward, ax.n = [-a(2) a(1)], ax.L = stretch length (px).
+% `same` = the axis is the one in prev_ax (still matched, possibly with hysteresis).
+ax = []; same = false;
+skel = bwmorph(U, 'skel', Inf);
+[sr, sc] = find(skel);
+if numel(sr) < 20, return; end
+[~, k0] = min((sr - tip(1)).^2 + (sc - tip(2)).^2);
+[~, kb] = max(sc);
+Dg = bwdistgeodesic(skel, sc(kb), sr(kb), 'quasi-euclidean');
+Dp = padarray(Dg, [1 1], Inf);
+r = sr(k0) + 1; c = sc(k0) + 1;
+if ~isfinite(Dp(r, c)), return; end
+P = [r c];
+for it = 1:numel(sr)
+    if Dp(r, c) == 0, break; end
+    blk = Dp(r-1:r+1, c-1:c+1);
+    blk(2, 2) = Inf;
+    [bv, bi] = min(blk(:));
+    if ~(bv < Dp(r, c)), break; end
+    [dr, dc] = ind2sub([3 3], bi);
+    r = r + dr - 2; c = c + dc - 2;
+    P(end+1, :) = [r c]; %#ok<AGROW>
+end
+P = P - 1;
+n = size(P, 1);
+if n < 20, return; end
+arc = [0; cumsum(hypot(diff(P(:,1)), diff(P(:,2))))];
+S = struct('r', [0; cumsum(P(:,1))], 'c', [0; cumsum(P(:,2))], 'rr', [0; cumsum(P(:,1).^2)], ...
+    'cc', [0; cumsum(P(:,2).^2)], 'rc', [0; cumsum(P(:,1) .* P(:,2))]);
+% straight stretches
+segs = struct('c', {}, 'a', {}, 'L', {}, 'i0', {});
+i = find(arc >= skip_f * diamo_est, 1);
+win0 = 8;
+while ~isempty(i) && i + win0 <= n
+    [~, ~, rms0] = shank_fit_window(S, i, i + win0);
+    if rms0 > rms_max, i = i + 4; continue; end
+    j = i + win0;
+    while j + 1 <= n
+        [~, ~, rms1] = shank_fit_window(S, i, j + 1);
+        if rms1 > rms_max, break; end
+        j = j + 1;
+    end
+    [cc0, a0, ~] = shank_fit_window(S, i, j);
+    if dot(a0, P(i,:) - P(j,:)) < 0, a0 = -a0; end % tip-ward = toward smaller path index
+    segs(end+1) = struct('c', cc0, 'a', a0, 'L', arc(j) - arc(i), 'i0', i); %#ok<AGROW>
+    i = j;
+end
+if isempty(segs), return; end
+% which stretch is the previous axis (same line: similar direction, centre near the line)
+ip = 0;
+if ~isempty(prev_ax)
+    for k = 1:numel(segs)
+        if abs(dot(segs(k).a, prev_ax.a)) > cosd(15) && abs(dot(segs(k).c - prev_ax.c, prev_ax.n)) < 0.5 * diamo_est
+            ip = k; break;
+        end
+    end
+end
+min_len = min_len_f * diamo_est; hyst = hyst_f * diamo_est;
+pick = 0;
+for k = 1:numel(segs)
+    if k == ip
+        need = min_len - hyst;
+    elseif ip > 0 && k < ip
+        need = min_len + hyst; % a nearer stretch than the one in use must be clearly long enough
+    else
+        need = min_len;
+    end
+    if segs(k).L >= need, pick = k; break; end
+end
+if pick == 0, return; end
+ax = segs(pick);
+ax.n = [-ax.a(2), ax.a(1)];
+same = (pick == ip);
+end
+
+function [c, a, rms] = shank_fit_window(S, i, j)
+% Line fit (total least squares) to path points i..j from prefix sums S; c = centroid,
+% a = unit direction [drow dcol] (sign arbitrary), rms = RMS perpendicular distance.
+m = j - i + 1;
+mr = (S.r(j+1) - S.r(i)) / m; mc = (S.c(j+1) - S.c(i)) / m;
+vrr = (S.rr(j+1) - S.rr(i)) / m - mr^2;
+vcc = (S.cc(j+1) - S.cc(i)) / m - mc^2;
+vrc = (S.rc(j+1) - S.rc(i)) / m - mr * mc;
+th = 0.5 * atan2(2 * vrc, vrr - vcc);
+a = [cos(th) sin(th)];
+c = [mr mc];
+lam_min = (vrr + vcc) / 2 - sqrt(((vrr - vcc) / 2)^2 + vrc^2);
+rms = sqrt(max(lam_min, 0));
+end
+
 function ok = candidate_passes_tip_guard(pt, tip_final_last, axis_unit, ...
     max_tip_jump_um, frames_since_last_good, pixelsize, ...
     lateral_offset_max_factor, diamo_est, stationary_lock_active, stationary_pos_eps_px, ...
-    side_n, side_acc, side_limit_px)
+    side_n, side_acc, side_limit_px, shank_guard)
 % Unified acceptance test for a tip-position candidate, combining the three
 % independent guards (Euclidean jump budget, lateral-offset-from-axis, and
 % stationary-lock exclusion) into one predicate so the primary pick and
@@ -4883,8 +5042,13 @@ function ok = candidate_passes_tip_guard(pt, tip_final_last, axis_unit, ...
 % in which case the lateral check is simply skipped for this candidate.
 
 if nargin < 13, side_n = []; side_acc = 0; side_limit_px = Inf; end
+if nargin < 14, shank_guard = []; end
 jump_um = pdist2(pt, tip_final_last) * pixelsize;
 ok = jump_um <= max_tip_jump_um * frames_since_last_good;
+
+if ok && ~isempty(shank_guard)
+    ok = ~shank_axis_refuses(pt, shank_guard); % see shank_axis_guard's doc
+end
 
 if ok && ~isempty(side_n)
     % Side memory (see side_offset_max_factor's doc): cumulative sideways offset
