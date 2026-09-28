@@ -172,15 +172,16 @@ if ~exist('vote_ellipse_first', 'var'), vote_ellipse_first = 1; end
 if ~exist('ellipse_first_min_ratio', 'var'), ellipse_first_min_ratio = 1.30; end
 if ~exist('ellipse_first_off_ratio', 'var'), ellipse_first_off_ratio = 1.25; end
 ellipse_first_state = []; % empty until the first frame with a valid ratio decides it
-% Round-ellipse floor and gate hold (2026-09-28, HV209_62 F3038-F3032): on a round tube end (bulb) the fitted
-% ellipse is almost a circle (ratio ~1.05-1.2), its pole has no meaning and moves with tiny changes of the fitted angle,
-% while the skeleton end stays put. With ellipse_min_ratio > 0 the ellipse candidate gets NO vote (neither in the
-% vote nor in the guard recovery pool) in frames where the raw ratio long/short axis is below it, as long as a
-% skeleton or border-midpoint candidate exists and the ellipse-first gate is not ON. Also, one spurious elongated fit
-% between round ones (F3037: 1.08 -> 1.48 -> 1.08 pulled the tip 4 px off the end, and the nearest-to-previous vote then
-% followed the error for 8 frames) must not switch the gate on: it needs ratio >= ellipse_first_min_ratio in
-% ellipse_first_on_frames consecutive frames (1 = the old immediate switch-on; the first decision is always immediate).
-% ellipse_min_ratio = 0 turns the floor off.
+% Forced-ratio ellipse candidate and gate hold (2026-09-28, HV209_62 F3038-F3032 and F2504-F2485): on a round tube end
+% (bulb) the fitted ellipse is almost a circle (ratio ~1.0-1.2), its pole has no meaning and walks around the circle with
+% tiny changes of the fitted angle. With ellipse_min_ratio > 0 (default 1.25) the ellipse CANDIDATE in such frames comes from a
+% second ellipse whose axis ratio is fixed at ellipse_min_ratio, fitted to the same border points (ellipse_data.m's
+% forced_ratio_tip); the raw fit stays what the gate and the overlay see. Offline, on HV209_62 F2510-F2480 this candidate
+% stayed within 2 px in 31 frames while the pole of the raw fit wandered 13 px. 0 = off (raw pole as before).
+% Also, one spurious elongated fit between round ones (F3037: 1.08 -> 1.48 -> 1.08 pulled the tip 4 px off the end, and the
+% nearest-to-previous vote then followed the error for 8 frames) must not switch the gate on: it needs ratio >=
+% ellipse_first_min_ratio in ellipse_first_on_frames consecutive frames (1 = the old immediate switch-on; the first decision
+% is always immediate).
 if ~exist('ellipse_min_ratio', 'var'), ellipse_min_ratio = 1.25; end
 if ~exist('ellipse_first_on_frames', 'var'), ellipse_first_on_frames = 3; end
 ellipse_first_streak = 0;
@@ -1234,7 +1235,7 @@ for count = smp:-1:stp
     fb_pt = [];
     if exist('tip_final_last', 'var'), fb_pt = tip_final_last; end
     max_jump_px = ellipse_candidate_max_jump_factor * diamo_est; % see its own doc near the top of this file
-    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo_est, fb_pt, max_jump_px, ellipse_fit_method);
+    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo_est, fb_pt, max_jump_px, ellipse_fit_method, ellipse_min_ratio);
     if debug_mode
         % Ellipse shape per frame (for choosing a gate on the ellipse-first vote): ratio = long / short axis, ~1 = round
         % (long axis undefined, pole can flip), large = elongated. npts = border points that went into the fit.
@@ -1261,7 +1262,7 @@ for count = smp:-1:stp
     % tip_mid were actually computed THIS frame via isempty(), rather than
     % reading stale values left over from an earlier iteration that didn't
     % take the same code path.
-    tip_skel = []; tip_mid = []; ellipse_round_now = false;
+    tip_skel = []; tip_mid = [];
 
     if strcmp(tip_method, 'skeleton')
         % Skeletonizing and finding endpoints
@@ -1465,14 +1466,8 @@ for count = smp:-1:stp
                 end
             end
             gate_on = vote_ellipse_first && (isempty(ellipse_first_state) || ellipse_first_state);
-            ellipse_round_now = ellipse_min_ratio > 0 && isfinite(gate_ratio) && gate_ratio < ellipse_min_ratio ...
-                && ~gate_on && size(cand_branch, 1) > 1; % round ellipse: no vote for it -- see ellipse_min_ratio's doc
-            if gate_on
-                branch_best_idx = 1; % cand_branch(1,:) is ellipsef -- see vote_ellipse_first's doc
-            elseif ellipse_round_now
-                d_vote = cand_branch_dist; d_vote(1) = Inf; [~, branch_best_idx] = min(d_vote);
-            end
-            if debug_mode, fprintf('  GATE F%d: ellipse ratio=%.2f ellipse_first_active=%d streak=%d round_no_vote=%d\n', count, gate_ratio, gate_on, ellipse_first_streak, ellipse_round_now); end
+            if gate_on, branch_best_idx = 1; end % cand_branch(1,:) is ellipsef -- see vote_ellipse_first's doc
+            if debug_mode, fprintf('  GATE F%d: ellipse ratio=%.2f ellipse_first_active=%d streak=%d forced_ratio_used=%d\n', count, gate_ratio, gate_on, ellipse_first_streak, ellipse_min_ratio > 0 && isfinite(gate_ratio) && gate_ratio < ellipse_min_ratio); end
             tip_final(count,:) = cand_branch(branch_best_idx,:);
             if debug_mode
                 fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d -> %s (closest to tip_final_last=[%d %d]; dist ellipsef=%.1f skel=%.1f mid=%.1f)\n', ...
@@ -1698,7 +1693,6 @@ for count = smp:-1:stp
             % how often this situation can happen at all, rather than only
             % cleaning up after it.
             cand = tip_ellipsef; cand_label = {'ellipsef'};
-            if ellipse_round_now, cand = zeros(0,2); cand_label = {}; end % round ellipse: not in the recovery pool either
             if ~isempty(tip_skel), cand = [cand; tip_skel]; cand_label{end+1} = 'skel'; end
             if ~isempty(tip_mid),  cand = [cand; tip_mid];  cand_label{end+1} = 'mid';  end
             % Cross-method fallback (ringwalk only): tip_skel/tip_mid above
@@ -1712,7 +1706,7 @@ for count = smp:-1:stp
             if strcmp(tip_method, 'ringwalk') && ringwalk_fallback_to_skeleton
                 [fb_tip, fb_diam, fb_maxy, fb_boundb, fb_Qef, fb_Qel, fb_Qec, ...
                  fb_tip_ellipse, fb_center, fb_phin, fb_axes, fb_stats, fb_edges, fb_ok] = ...
-                    skeleton_tip_fallback(U, weight, diamo, tip_final_last, last_flag, count, debug_mode, ellipse_fit_method, ellipse_candidate_max_jump_factor);
+                    skeleton_tip_fallback(U, weight, diamo, tip_final_last, last_flag, count, debug_mode, ellipse_fit_method, ellipse_candidate_max_jump_factor, ellipse_min_ratio);
                 if fb_ok && ~isempty(fb_tip)
                     cand = [cand; fb_tip]; cand_label{end+1} = 'skeleton_fallback';
                 end
@@ -2808,7 +2802,7 @@ if weak_signal && exist('U_smp', 'var')
 
             [tip_row, diamf_val, intens, ok, yctk_rep, xctk_rep, F1_rep, F2_rep, U_smooth_rep] = find_tip_and_measure(count, U_rep, prev_tip_fwd, ...
                 weight, diamo, tip_method, pixelsize, ROItype, split, circle, starti, stopi, ...
-                diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um, ellipse_fit_method, ellipse_candidate_max_jump_factor);
+                diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um, ellipse_fit_method, ellipse_candidate_max_jump_factor, [], ellipse_min_ratio);
 
             if ok
                 tip_final(count,:) = tip_row;
@@ -2924,7 +2918,7 @@ if jitter_smooth
                 'intensityB2_F2', intensityB2_F2(count));
             [tip_row, diamf_val, intens, ok, yctk_j, xctk_j, F1_j, F2_j, U_smooth_j] = find_tip_and_measure(count, Uk, js_new, ...
                 weight, diamo, tip_method, pixelsize, ROItype, split, circle, starti, stopi, ...
-                diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um, ellipse_fit_method, ellipse_candidate_max_jump_factor, js_new);
+                diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um, ellipse_fit_method, ellipse_candidate_max_jump_factor, js_new, ellipse_min_ratio);
             if ok
                 tip_final(count,:) = tip_row;
                 diamf_avg(count) = diamf_val;
@@ -4239,7 +4233,7 @@ end
 % must never crash a run that would otherwise have just NaN'd one frame.
 function [tip_out, diam_out, maxy_out, boundb_out, Qef_out, Qel_out, Qec_out, ...
           tip_ellipse_out, center_out, phin_out, axes_out, stats_out, edges_out, ok] = ...
-    skeleton_tip_fallback(U, weight, diamo, tip_final_last, last_flag, count, debug_mode, ellipse_fit_method, ellipse_candidate_max_jump_factor)
+    skeleton_tip_fallback(U, weight, diamo, tip_final_last, last_flag, count, debug_mode, ellipse_fit_method, ellipse_candidate_max_jump_factor, ellipse_min_ratio)
 
     tip_out = []; diam_out = []; maxy_out = []; boundb_out = []; Qef_out = [];
     Qel_out = []; Qec_out = []; tip_ellipse_out = []; center_out = []; phin_out = [];
@@ -4302,7 +4296,7 @@ function [tip_out, diam_out, maxy_out, boundb_out, Qef_out, Qel_out, Qec_out, ..
         % diamo and tip_final_last are both already this function's own params.
         % max_jump_px: see ellipse_candidate_max_jump_factor's doc near the top of this file.
         max_jump_px = ellipse_candidate_max_jump_factor * diamo;
-        [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, tip_final_last, max_jump_px, ellipse_fit_method);
+        [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, tip_final_last, max_jump_px, ellipse_fit_method, ellipse_min_ratio);
         diam = robust_diam(U, size(U,2) - 1, diam, count, debug_mode);
         tip_ellipsepos = dsearchn(boundb,tip_ellipse);
         tip_ellipsef = boundb(tip_ellipsepos,:);
@@ -4423,10 +4417,11 @@ end
 
 function [tip_row, diamf_val, intens, ok, yctk_out, xctk_out, F1_out, F2_out, U_smooth_out] = find_tip_and_measure(count, U, prev_tip, ...
         weight, diamo, tip_method, pixelsize, ROItype, split, circle, starti, stopi, ...
-        diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um, ellipse_fit_method, ellipse_candidate_max_jump_factor, forced_tip)
+        diamcutoff, mode, O, BT1r, BT2r, old_intens, debug_mode, max_tip_jump_um, ellipse_fit_method, ellipse_candidate_max_jump_factor, forced_tip, ellipse_min_ratio)
 
 if nargin < 21 || isempty(ellipse_fit_method), ellipse_fit_method = 'ransac'; end
 if nargin < 22 || isempty(ellipse_candidate_max_jump_factor), ellipse_candidate_max_jump_factor = Inf; end
+if nargin < 24 || isempty(ellipse_min_ratio), ellipse_min_ratio = 0; end
 if nargin < 23, forced_tip = []; end % jitter-zone smoothing: use this tip (snapped to the border) instead of the one found here
 
     ok = true;
@@ -4495,7 +4490,7 @@ if nargin < 23, forced_tip = []; end % jitter-zone smoothing: use this tip (snap
     % diamo and prev_tip are both already this function's own params.
     % max_jump_px: see ellipse_candidate_max_jump_factor's doc near the top of this file.
     max_jump_px = ellipse_candidate_max_jump_factor * diamo;
-    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, prev_tip, max_jump_px, ellipse_fit_method);
+    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, prev_tip, max_jump_px, ellipse_fit_method, ellipse_min_ratio);
     % Same robust-diam overwrite as the reverse pass (see main loop) -- keeps
     % the tolerance check below comparing like-for-like instead of a robust
     % diamo reference against one noisy single-column per-frame sample.
@@ -5080,7 +5075,7 @@ function ok = candidate_passes_tip_guard(pt, tip_final_last, axis_unit, ...
 % Empty when no usable axis exists (see the caller's own fallback chain),
 % in which case the lateral check is simply skipped for this candidate.
 
-if nargin < 13, side_guard = []; end
+if nargin < 11, side_guard = []; end
 jump_um = pdist2(pt, tip_final_last) * pixelsize;
 ok = jump_um <= max_tip_jump_um * frames_since_last_good;
 

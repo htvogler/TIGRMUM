@@ -1,4 +1,12 @@
-function [tip_final,center,phi,axes,tip_check] = ellipse_data(tip_new, prev_tip, max_jump_px, fit_method)
+function [tip_final,center,phi,axes,tip_check] = ellipse_data(tip_new, prev_tip, max_jump_px, fit_method, min_ratio)
+
+% min_ratio (optional, default 0 = off): forced-ratio ellipse (2026-09-28, HV209_62 F3038-F3032 and F2504-F2485). When the
+% fitted ellipse is nearly round (long/short axis < min_ratio) its pole has no meaning: the fitted angle is arbitrary and
+% the pole walks around the circle from frame to frame. Then the tip candidate is taken from a SECOND ellipse whose axis
+% ratio is fixed at min_ratio (e.g. 1.25), fitted to the same border points by minimising the (truncated) point-to-ellipse
+% distance over centre, size and long-axis angle -- see forced_ratio_tip. On a bulb with a neck the border points
+% decide the angle, and the candidate stays put (HV209_62: within 2 px in 31 consecutive frames). center/phi/axes
+% returned by this function stay those of the ORIGINAL fit (the ellipse-first gate reads the raw ratio from them).
 
 % fit_method (optional, default 'ransac'): which conic fit ellipse_fit_ransac
 % wraps around. 'ransac' picks the largest self-consistent arc in the local
@@ -14,6 +22,7 @@ function [tip_final,center,phi,axes,tip_check] = ellipse_data(tip_new, prev_tip,
 % 'legacy' per-stack via run_config's ellipse_fit_method when RANSAC
 % underperforms the old naive fit on a particular stack.
 if nargin < 4 || isempty(fit_method), fit_method = 'ransac'; end
+if nargin < 5 || isempty(min_ratio), min_ratio = 0; end
 
 % prev_tip (optional): previous frame's tip position [row col]. When given,
 % used to choose between the ellipse's two extreme points instead of the
@@ -95,6 +104,12 @@ end
             tip_check = [xe2 ye2]; pos = pos2;
         end
         tip_final = tip_new(pos,:);
+
+        % Forced-ratio candidate for a round ellipse -- see min_ratio's doc.
+        if min_ratio > 0 && min(axes) > 0 && max(axes) / min(axes) < min_ratio
+            [tip_f, tip_c, ok_f] = forced_ratio_tip(x, y, tip_new, prev_tip, min_ratio, center, max(axes));
+            if ok_f, tip_final = tip_f; tip_check = tip_c; end
+        end
 
         % Sanity bound on the pick above -- see max_jump_px's own doc.
         if ~isempty(prev_tip) && pdist2(tip_final, prev_tip) > max_jump_px
@@ -275,4 +290,46 @@ ye1 = xy(2,:) + center(2);
 xe2 = -xy(1,:) + center(1);
 ye2 = -xy(2,:) + center(2);
 
+end
+
+
+function [tip_final, tip_check, ok] = forced_ratio_tip(x, y, tip_new, prev_tip, ratio, cen0, b0)
+% Ellipse with the axis ratio (long/short) fixed at `ratio`, fitted to the border points (x = rows, y = cols) by
+% minimising the sum of squared point-to-ellipse distances (each truncated at 3 px) over centre (2), long semi-axis (1)
+% and long-axis angle (1). Coarse search over 12 angles (centre and size optimised for each), then a free refinement of
+% all four parameters from the best. The pole choice follows ellipse_data: the border point of tip_new nearest to each of the
+% two poles; the one closer to prev_tip wins (the one with more of the cloud on its far side when prev_tip is empty).
+ok = false; tip_final = [0 0]; tip_check = [0 0];
+X = [x(:) y(:)];
+if size(X,1) < 8 || ~all(isfinite([cen0(:); b0])), return; end
+t = linspace(0, 2*pi, 180)';
+opts = optimset('Display', 'off', 'MaxIter', 80, 'MaxFunEvals', 160, 'TolX', 0.05, 'TolFun', 0.01);
+best = Inf; pbest = [];
+for th = (0:11) * pi / 12
+    [pp, fv] = fminsearch(@(p) fr_cost([p(1) p(2) p(3) th], X, t, ratio), [cen0(1) cen0(2) b0], opts);
+    if fv < best, best = fv; pbest = [pp th]; end
+end
+opts2 = optimset('Display', 'off', 'MaxIter', 200, 'MaxFunEvals', 400, 'TolX', 0.02, 'TolFun', 0.005);
+[pp, fv] = fminsearch(@(p) fr_cost(p, X, t, ratio), pbest, opts2);
+if fv <= best, pbest = pp; end
+c = pbest(1:2); b = abs(pbest(3)); u = [cos(pbest(4)) sin(pbest(4))];
+poles = [c + b * u; c - b * u];
+[~, pos1] = min(sum((tip_new - poles(1,:)).^2, 2)); cand1 = tip_new(pos1,:);
+[~, pos2] = min(sum((tip_new - poles(2,:)).^2, 2)); cand2 = tip_new(pos2,:);
+if ~isempty(prev_tip)
+    use1 = pdist2(cand1, prev_tip) <= pdist2(cand2, prev_tip);
+else
+    use1 = sum(sqrt(sum((tip_new - poles(1,:)).^2, 2))) < sum(sqrt(sum((tip_new - poles(2,:)).^2, 2)));
+end
+if use1, tip_check = poles(1,:); tip_final = cand1; else, tip_check = poles(2,:); tip_final = cand2; end
+ok = true;
+end
+
+function f = fr_cost(p, X, t, ratio)
+b = abs(p(3)); a = b / ratio; th = p(4);
+u = [cos(th) sin(th)]; v = [-sin(th) cos(th)];
+E1 = p(1) + b * cos(t) * u(1) + a * sin(t) * v(1);
+E2 = p(2) + b * cos(t) * u(2) + a * sin(t) * v(2);
+d2 = min((X(:,1) - E1').^2 + (X(:,2) - E2').^2, [], 2);
+f = sum(min(sqrt(d2), 3).^2);
 end
