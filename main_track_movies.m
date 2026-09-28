@@ -183,6 +183,12 @@ ellipse_first_state = []; % empty until the first frame with a valid ratio decid
 % ellipse_first_min_ratio in ellipse_first_on_frames consecutive frames (1 = the old immediate switch-on; the first decision
 % is always immediate).
 if ~exist('ellipse_min_ratio', 'var'), ellipse_min_ratio = 1.25; end
+% RANSAC seed per frame (2026-09-28, default ON): ellipse_data.m's RANSAC draws random subsets, so a borderline frame could
+% come out differently from run to run (HV209_62 F3037: ratio 1.48 in the run, 1.07 when redone). With
+% ellipse_seed_per_frame = 1 the random generator is set to the frame number (rng(count)) just before each locate_tip call and
+% the previous generator state is restored afterwards: every frame gets the same draws in every run, independent of other frames.
+% 0 = unseeded as before (the helper paths -- ringwalk skeleton fallback, weak_signal repair, jitter-smoothing recomputation -- always seed). This makes runs reproducible; it does not make the fit better (the gate hold and the forced ratio do that).
+if ~exist('ellipse_seed_per_frame', 'var'), ellipse_seed_per_frame = 1; end
 if ~exist('ellipse_first_on_frames', 'var'), ellipse_first_on_frames = 3; end
 ellipse_first_streak = 0;
 % Jitter-zone smoothing (2026-09-25, default OFF): a pass at the END of the run, before the videos are written.
@@ -1235,7 +1241,9 @@ for count = smp:-1:stp
     fb_pt = [];
     if exist('tip_final_last', 'var'), fb_pt = tip_final_last; end
     max_jump_px = ellipse_candidate_max_jump_factor * diamo_est; % see its own doc near the top of this file
+    if ellipse_seed_per_frame, rng_state_ = rng; rng(count); end
     [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo_est, fb_pt, max_jump_px, ellipse_fit_method, ellipse_min_ratio);
+    if ellipse_seed_per_frame, rng(rng_state_); end
     if debug_mode
         % Ellipse shape per frame (for choosing a gate on the ellipse-first vote): ratio = long / short axis, ~1 = round
         % (long axis undefined, pole can flip), large = elongated. npts = border points that went into the fit.
@@ -4296,7 +4304,9 @@ function [tip_out, diam_out, maxy_out, boundb_out, Qef_out, Qel_out, Qec_out, ..
         % diamo and tip_final_last are both already this function's own params.
         % max_jump_px: see ellipse_candidate_max_jump_factor's doc near the top of this file.
         max_jump_px = ellipse_candidate_max_jump_factor * diamo;
+        rng_state_ = rng; rng(count); % always seeded per frame in the helper paths, see ellipse_seed_per_frame's doc
         [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, tip_final_last, max_jump_px, ellipse_fit_method, ellipse_min_ratio);
+        rng(rng_state_);
         diam = robust_diam(U, size(U,2) - 1, diam, count, debug_mode);
         tip_ellipsepos = dsearchn(boundb,tip_ellipse);
         tip_ellipsef = boundb(tip_ellipsepos,:);
@@ -4490,7 +4500,9 @@ if nargin < 23, forced_tip = []; end % jitter-zone smoothing: use this tip (snap
     % diamo and prev_tip are both already this function's own params.
     % max_jump_px: see ellipse_candidate_max_jump_factor's doc near the top of this file.
     max_jump_px = ellipse_candidate_max_jump_factor * diamo;
+    rng_state_ = rng; rng(count); % always seeded per frame in the helper paths, see ellipse_seed_per_frame's doc
     [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo, prev_tip, max_jump_px, ellipse_fit_method, ellipse_min_ratio);
+    rng(rng_state_);
     % Same robust-diam overwrite as the reverse pass (see main loop) -- keeps
     % the tolerance check below comparing like-for-like instead of a robust
     % diamo reference against one noisy single-column per-frame sample.

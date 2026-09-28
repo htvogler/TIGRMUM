@@ -394,6 +394,8 @@ ellipse_min_ratio = 1.25; % Forced-ratio ellipse candidate (default 1.25, 0 = of
                  % the ellipse tip candidate comes from a second ellipse with the ratio fixed at this value, fitted to the same border points.
                  % On a round tube end the raw pole is arbitrary and walks around the circle (HV209_62 F3038-F3032, F2504-F2485). The gate and
                  % the overlay keep using the raw fit.
+ellipse_seed_per_frame = 1; % 1 (default) = seed the random generator with the frame number just before each ellipse fit (RANSAC), so every frame
+                 % gets the same random draws in every run (reproducible tracks, e.g. HV209_62 F3037 came out 1.48 once and 1.07 another time); 0 = unseeded.
 ellipse_first_on_frames = 3; % The ellipse-first gate switches ON only after this many consecutive frames with ratio >= ellipse_first_min_ratio
                  % (default 3; 1 = old immediate switch-on). One elongated fit between round ones (HV209_62 F3037) then cannot flip it.
 
