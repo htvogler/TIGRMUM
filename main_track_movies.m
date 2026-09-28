@@ -189,6 +189,14 @@ if ~exist('ellipse_min_ratio', 'var'), ellipse_min_ratio = 1.25; end
 % the previous generator state is restored afterwards: every frame gets the same draws in every run, independent of other frames.
 % 0 = unseeded as before (the helper paths -- ringwalk skeleton fallback, weak_signal repair, jitter-smoothing recomputation -- always seed). This makes runs reproducible; it does not make the fit better (the gate hold and the forced ratio do that).
 if ~exist('ellipse_seed_per_frame', 'var'), ellipse_seed_per_frame = 1; end
+% Ellipse off when the search radius is too wide (2026-09-28, HV209_116): locate_tip.m returns the previous tip as the ellipse
+% candidate whenever its search radius toln = 1.25 * tols is above the cap 2 * diamo_est. On a bulb wider than about 2.5 tube
+% widths that is every frame (166 of 185 dumped frames), and the fake candidate at distance 0 wins the vote, freezes the
+% tracker on itself and lets it creep. With ellipse_off_when_wide = 1 (default) such frames leave the ellipse candidate out of the
+% vote, the guard recovery pool and the ellipse-first gate (the skeleton end / mid decide); the unbranched path takes the skeleton
+% end. Stacks whose windows stay within the cap (HV209_62: toln 16-20 px vs cap 38) are not affected. 0 = old behaviour.
+if ~exist('ellipse_off_when_wide', 'var'), ellipse_off_when_wide = 1; end
+ellipse_off_count = 0; ellipse_off_frames = [];
 if ~exist('ellipse_first_on_frames', 'var'), ellipse_first_on_frames = 3; end
 ellipse_first_streak = 0;
 % Jitter-zone smoothing (2026-09-25, default OFF): a pass at the END of the run, before the videos are written.
@@ -1242,8 +1250,10 @@ for count = smp:-1:stp
     if exist('tip_final_last', 'var'), fb_pt = tip_final_last; end
     max_jump_px = ellipse_candidate_max_jump_factor * diamo_est; % see its own doc near the top of this file
     if ellipse_seed_per_frame, rng_state_ = rng; rng(count); end
-    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(U, tols, Qef, 2*diamo_est, fb_pt, max_jump_px, ellipse_fit_method, ellipse_min_ratio);
+    [boundb, tip_ellipse, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges, ellipse_usable] = locate_tip(U, tols, Qef, 2*diamo_est, fb_pt, max_jump_px, ellipse_fit_method, ellipse_min_ratio);
     if ellipse_seed_per_frame, rng(rng_state_); end
+    ellipse_off_frame = ellipse_off_when_wide && ~ellipse_usable && count ~= smp; % see ellipse_off_when_wide's doc (not on the anchor frame)
+    if ellipse_off_frame, ellipse_off_count = ellipse_off_count + 1; ellipse_off_frames(end+1) = count; end
     if debug_mode
         % Ellipse shape per frame (for choosing a gate on the ellipse-first vote): ratio = long / short axis, ~1 = round
         % (long axis undefined, pole can flip), large = elongated. npts = border points that went into the fit.
@@ -1455,6 +1465,7 @@ for count = smp:-1:stp
             % the fix needed for the narrower HV209_62 F3214 case (skel vs
             % ellipsef only); this generalizes it to all three candidates.
             cand_branch = tip_ellipsef; cand_branch_label = {'ellipsef'};
+            if ellipse_off_frame && (~isempty(tip_skel) || ~isempty(tip_mid)), cand_branch = zeros(0,2); cand_branch_label = {}; end % ellipse too wide: no ellipse candidate
             if ~isempty(tip_skel), cand_branch = [cand_branch; tip_skel]; cand_branch_label{end+1} = 'skel'; end
             if ~isempty(tip_mid),  cand_branch = [cand_branch; tip_mid];  cand_branch_label{end+1} = 'mid';  end
             cand_branch_dist = pdist2(cand_branch, tip_final_last);
@@ -1473,9 +1484,9 @@ for count = smp:-1:stp
                     end
                 end
             end
-            gate_on = vote_ellipse_first && (isempty(ellipse_first_state) || ellipse_first_state);
+            gate_on = vote_ellipse_first && (isempty(ellipse_first_state) || ellipse_first_state) && ~(ellipse_off_frame && (~isempty(tip_skel) || ~isempty(tip_mid)));
             if gate_on, branch_best_idx = 1; end % cand_branch(1,:) is ellipsef -- see vote_ellipse_first's doc
-            if debug_mode, fprintf('  GATE F%d: ellipse ratio=%.2f ellipse_first_active=%d streak=%d forced_ratio_used=%d\n', count, gate_ratio, gate_on, ellipse_first_streak, ellipse_min_ratio > 0 && isfinite(gate_ratio) && gate_ratio < ellipse_min_ratio); end
+            if debug_mode, fprintf('  GATE F%d: ellipse ratio=%.2f ellipse_first_active=%d streak=%d ellipse_off_wide=%d forced_ratio_used=%d\n', count, gate_ratio, gate_on, ellipse_first_streak, ellipse_off_frame, ellipse_min_ratio > 0 && isfinite(gate_ratio) && gate_ratio < ellipse_min_ratio); end
             tip_final(count,:) = cand_branch(branch_best_idx,:);
             if debug_mode
                 fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d -> %s (closest to tip_final_last=[%d %d]; dist ellipsef=%.1f skel=%.1f mid=%.1f)\n', ...
@@ -1517,6 +1528,7 @@ for count = smp:-1:stp
         if (last_flag) [tmp, tip_finaldistpos] = min([pdist2(tip_final_last,tip_ellipsef) pdist2(tip_final_last,tip_skel)]);
         else tip_finaldistpos = 2;
         end
+        if ellipse_off_frame, tip_finaldistpos = 2; end % ellipse too wide: skeleton end
         if (tip_finaldistpos == 1) tip_final(count,:) = tip_ellipsef; else tip_final(count,:) = tip_skel; end
         if debug_mode
             srclabel = 'skel'; if (tip_finaldistpos==1), srclabel = 'ellipsef'; end
@@ -1701,6 +1713,7 @@ for count = smp:-1:stp
             % how often this situation can happen at all, rather than only
             % cleaning up after it.
             cand = tip_ellipsef; cand_label = {'ellipsef'};
+            if ellipse_off_frame && (~isempty(tip_skel) || ~isempty(tip_mid)), cand = zeros(0,2); cand_label = {}; end % ellipse too wide: not in the recovery pool either
             if ~isempty(tip_skel), cand = [cand; tip_skel]; cand_label{end+1} = 'skel'; end
             if ~isempty(tip_mid),  cand = [cand; tip_mid];  cand_label{end+1} = 'mid';  end
             % Cross-method fallback (ringwalk only): tip_skel/tip_mid above
@@ -2968,6 +2981,10 @@ if jitter_smooth
     js_chg = any(js_final ~= js_tip, 2); js_chg2 = (js_chg(1:end-1) | js_chg(2:end)) & isfinite(js_fstep);
     if any(js_chg2), js_maxstep = max(js_fstep(js_chg2)); else, js_maxstep = 0; end
     fprintf('Jitter smoothing: %d zone frames, %d with a changed tip, %d recomputed, %d limited by the step limit, max step next to a changed frame %.1f px\n', nnz(js_zone), js_changed, js_redone, js_limited, js_maxstep);
+end
+
+if ellipse_off_when_wide
+    fprintf('Ellipse candidate left out (search radius above the cap 2*diamo_est): %d of %d frames\n', ellipse_off_count, smp - stp + 1);
 end
 
 % Flush the buffered video frames to disk now, in TRUE CHRONOLOGICAL order

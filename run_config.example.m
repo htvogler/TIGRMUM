@@ -396,6 +396,9 @@ ellipse_min_ratio = 1.25; % Forced-ratio ellipse candidate (default 1.25, 0 = of
                  % the overlay keep using the raw fit.
 ellipse_seed_per_frame = 1; % 1 (default) = seed the random generator with the frame number just before each ellipse fit (RANSAC), so every frame
                  % gets the same random draws in every run (reproducible tracks, e.g. HV209_62 F3037 came out 1.48 once and 1.07 another time); 0 = unseeded.
+ellipse_off_when_wide = 1; % 1 (default) = in frames where the ellipse search radius (1.25 * window radius) is already above the cap 2 * diamo_est (tip end wider
+                 % than ~2.5 tube widths, HV209_116) the ellipse candidate -- which locate_tip.m would replace by the previous tip -- is left out of the vote, the recovery
+                 % pool and the gate; the log ends with the number of such frames. 0 = old behaviour. Stacks that stay within the cap are unchanged.
 ellipse_first_on_frames = 3; % The ellipse-first gate switches ON only after this many consecutive frames with ratio >= ellipse_first_min_ratio
                  % (default 3; 1 = old immediate switch-on). One elongated fit between round ones (HV209_62 F3037) then cannot flip it.
 

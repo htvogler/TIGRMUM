@@ -1,4 +1,4 @@
-function [boundb, tip_final, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges] = locate_tip(H, tol, major, toln_cap, fallback_pt, max_jump_px, ellipse_fit_method, ellipse_min_ratio)
+function [boundb, tip_final, tip_new, tip_check, diam, maxy, center, phin, axes, stats, edges, ellipse_usable] = locate_tip(H, tol, major, toln_cap, fallback_pt, max_jump_px, ellipse_fit_method, ellipse_min_ratio)
 
 % toln_cap: ceiling on how far the tolerance-growth loop below is allowed
 % to search for a fittable point cloud, in px (default: unbounded, i.e.
@@ -20,6 +20,11 @@ if nargin < 5 || isempty(fallback_pt), fallback_pt = major(1,:); end
 if nargin < 6 || isempty(max_jump_px), max_jump_px = Inf; end
 if nargin < 7 || isempty(ellipse_fit_method), ellipse_fit_method = 'ransac'; end
 if nargin < 8 || isempty(ellipse_min_ratio), ellipse_min_ratio = 0; end % forced-ratio ellipse candidate for round ellipses, see ellipse_data.m's min_ratio
+% ellipse_usable (12th output, 2026-09-28): false when the very first search radius (toln = 1.25 * the window radius tols
+% found by the caller) is already above toln_cap, i.e. the tip end is too wide for the tip-local ellipse search (HV209_116: a bulb
+% 2.5 tube widths across needs tols 28-32 px, toln 35-40 px, cap 32 px). The loop below then ALWAYS returns fallback_pt (the previous
+% tip) as tip_final, which then wins every nearest-to-previous vote and freezes the tracker on itself; callers that read this
+% flag can leave the ellipse candidate out instead. Callers that do not ask for it are unaffected.
 % max_jump_px, ellipse_fit_method: passed straight through to ellipse_data.m
 % -- see its own doc.
 
@@ -64,6 +69,7 @@ boundc = circshift(bound,-ybound(1));
 
 toln = tol*1.25; tip_final = [0 0];
 toln_max = toln_cap;
+ellipse_usable = ~(toln > toln_max);
 while (nnz(tip_final) == 0)
     tip_new = [];
     for i = 1:length(bound)
