@@ -172,6 +172,18 @@ if ~exist('vote_ellipse_first', 'var'), vote_ellipse_first = 1; end
 if ~exist('ellipse_first_min_ratio', 'var'), ellipse_first_min_ratio = 1.30; end
 if ~exist('ellipse_first_off_ratio', 'var'), ellipse_first_off_ratio = 1.25; end
 ellipse_first_state = []; % empty until the first frame with a valid ratio decides it
+% Round-ellipse floor and gate hold (2026-09-28, HV209_62 F3038-F3032): on a round tube end (bulb) the fitted
+% ellipse is almost a circle (ratio ~1.05-1.2), its pole has no meaning and moves with tiny changes of the fitted angle,
+% while the skeleton end stays put. With ellipse_min_ratio > 0 the ellipse candidate gets NO vote (neither in the
+% vote nor in the guard recovery pool) in frames where the raw ratio long/short axis is below it, as long as a
+% skeleton or border-midpoint candidate exists and the ellipse-first gate is not ON. Also, one spurious elongated fit
+% between round ones (F3037: 1.08 -> 1.48 -> 1.08 pulled the tip 4 px off the end, and the nearest-to-previous vote then
+% followed the error for 8 frames) must not switch the gate on: it needs ratio >= ellipse_first_min_ratio in
+% ellipse_first_on_frames consecutive frames (1 = the old immediate switch-on; the first decision is always immediate).
+% ellipse_min_ratio = 0 turns the floor off.
+if ~exist('ellipse_min_ratio', 'var'), ellipse_min_ratio = 1.25; end
+if ~exist('ellipse_first_on_frames', 'var'), ellipse_first_on_frames = 3; end
+ellipse_first_streak = 0;
 % Jitter-zone smoothing (2026-09-25, default OFF): a pass at the END of the run, before the videos are written.
 % Zones = stretches where the finished tip track flickers: at least jitter_zone_min_moves moves of >=
 % jitter_zone_move_px px within any jitter_zone_span consecutive frames, padded by jitter_zone_pad frames each
@@ -1249,7 +1261,7 @@ for count = smp:-1:stp
     % tip_mid were actually computed THIS frame via isempty(), rather than
     % reading stale values left over from an earlier iteration that didn't
     % take the same code path.
-    tip_skel = []; tip_mid = [];
+    tip_skel = []; tip_mid = []; ellipse_round_now = false;
 
     if strcmp(tip_method, 'skeleton')
         % Skeletonizing and finding endpoints
@@ -1438,22 +1450,29 @@ for count = smp:-1:stp
             if ~isempty(tip_mid),  cand_branch = [cand_branch; tip_mid];  cand_branch_label{end+1} = 'mid';  end
             cand_branch_dist = pdist2(cand_branch, tip_final_last);
             [~, branch_best_idx] = min(cand_branch_dist);
+            gate_ratio = NaN;
+            if numel(axes) >= 2 && min(axes) > 0, gate_ratio = max(axes) / min(axes); end
             if vote_ellipse_first
-                if numel(axes) >= 2 && min(axes) > 0
-                    gate_ratio = max(axes) / min(axes);
+                if isfinite(gate_ratio)
+                    if gate_ratio >= ellipse_first_min_ratio, ellipse_first_streak = ellipse_first_streak + 1; else, ellipse_first_streak = 0; end
                     if isempty(ellipse_first_state)
                         ellipse_first_state = gate_ratio >= ellipse_first_min_ratio;
-                    elseif ~ellipse_first_state && gate_ratio >= ellipse_first_min_ratio
+                    elseif ~ellipse_first_state && ellipse_first_streak >= ellipse_first_on_frames
                         ellipse_first_state = true;
                     elseif ellipse_first_state && gate_ratio < ellipse_first_off_ratio
                         ellipse_first_state = false;
                     end
-                else
-                    gate_ratio = NaN;
                 end
-                if isempty(ellipse_first_state) || ellipse_first_state, branch_best_idx = 1; end % cand_branch(1,:) is ellipsef -- see vote_ellipse_first's doc
-                if debug_mode, fprintf('  GATE F%d: ellipse ratio=%.2f ellipse_first_active=%d\n', count, gate_ratio, ~isempty(ellipse_first_state) && ellipse_first_state); end
             end
+            gate_on = vote_ellipse_first && (isempty(ellipse_first_state) || ellipse_first_state);
+            ellipse_round_now = ellipse_min_ratio > 0 && isfinite(gate_ratio) && gate_ratio < ellipse_min_ratio ...
+                && ~gate_on && size(cand_branch, 1) > 1; % round ellipse: no vote for it -- see ellipse_min_ratio's doc
+            if gate_on
+                branch_best_idx = 1; % cand_branch(1,:) is ellipsef -- see vote_ellipse_first's doc
+            elseif ellipse_round_now
+                d_vote = cand_branch_dist; d_vote(1) = Inf; [~, branch_best_idx] = min(d_vote);
+            end
+            if debug_mode, fprintf('  GATE F%d: ellipse ratio=%.2f ellipse_first_active=%d streak=%d round_no_vote=%d\n', count, gate_ratio, gate_on, ellipse_first_streak, ellipse_round_now); end
             tip_final(count,:) = cand_branch(branch_best_idx,:);
             if debug_mode
                 fprintf('  tip F%d: branchpt=%d branched choice=%d ellipsepos=%d -> %s (closest to tip_final_last=[%d %d]; dist ellipsef=%.1f skel=%.1f mid=%.1f)\n', ...
@@ -1679,6 +1698,7 @@ for count = smp:-1:stp
             % how often this situation can happen at all, rather than only
             % cleaning up after it.
             cand = tip_ellipsef; cand_label = {'ellipsef'};
+            if ellipse_round_now, cand = zeros(0,2); cand_label = {}; end % round ellipse: not in the recovery pool either
             if ~isempty(tip_skel), cand = [cand; tip_skel]; cand_label{end+1} = 'skel'; end
             if ~isempty(tip_mid),  cand = [cand; tip_mid];  cand_label{end+1} = 'mid';  end
             % Cross-method fallback (ringwalk only): tip_skel/tip_mid above

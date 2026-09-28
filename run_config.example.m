@@ -390,6 +390,12 @@ side_memory = 1; % Side memory (default 1 = on, 0 = off; rebuilt 2026-09-26): th
                  % much longer). D = diamo_est. Defaults: 2, 1, 1.5, 0.1, 2, 0.5. Replaces the first side memory (sideways drift
                  % against an axis through the previous tip, which locked the tip out at turns: HV204_105, HV203_4_21).
 
+ellipse_min_ratio = 1.25; % Round-ellipse floor (default 1.25, 0 = off): below this ratio (long/short axis) the ellipse candidate gets no vote
+                 % (nor a place in the guard recovery pool) as long as a skeleton/midpoint candidate exists and the ellipse-first gate is off.
+                 % On a round tube end the ellipse is a circle whose pole is arbitrary (HV209_62 F3038-F3032: pole walked up the wall).
+ellipse_first_on_frames = 3; % The ellipse-first gate switches ON only after this many consecutive frames with ratio >= ellipse_first_min_ratio
+                 % (default 3; 1 = old immediate switch-on). One elongated fit between round ones (HV209_62 F3037) then cannot flip it.
+
 side_memory_windowed = 1; % 1 (default) = the side memory only enforces near a kink, once per axis; 0 = enforce all the time. It arms when the skeleton
                  % path from the tip reaches the tolerance band of the axis within side_memory_arm_D * D (default 1) and releases at the earlier of
                  % side_memory_after_cross_D * D (0.3) of tip travel past that crossing and side_memory_after_fire_D * D (1) of tip travel after it first
