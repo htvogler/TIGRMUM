@@ -399,6 +399,8 @@ ellipse_seed_per_frame = 1; % 1 (default) = seed the random generator with the f
 ellipse_off_when_wide = 1; % 1 (default) = in frames where the ellipse search radius (1.25 * window radius) is already above the cap 2 * diamo_est (tip end wider
                  % than ~2.5 tube widths, HV209_116) the ellipse candidate -- which locate_tip.m would replace by the previous tip -- is left out of the vote, the recovery
                  % pool and the gate; the log ends with the number of such frames. 0 = old behaviour. Stacks that stay within the cap are unchanged.
+qef_by_continuity = 0; % 1 = the ellipse-search seed Qef is the thin-skeleton endpoint nearest to the previous tip (base endpoint excluded) instead of what branch_removal
+                 % leaves (default 0 = off). On a bulb branch_removal flips between a prong pointing at the tip and one high in the bulb (HV209_116 F792/F786/F780).
 ellipse_first_on_frames = 3; % The ellipse-first gate switches ON only after this many consecutive frames with ratio >= ellipse_first_min_ratio
                  % (default 3; 1 = old immediate switch-on). One elongated fit between round ones (HV209_62 F3037) then cannot flip it.
 

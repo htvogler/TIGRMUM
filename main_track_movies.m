@@ -197,6 +197,13 @@ if ~exist('ellipse_seed_per_frame', 'var'), ellipse_seed_per_frame = 1; end
 % end. Stacks whose windows stay within the cap (HV209_62: toln 16-20 px vs cap 38) are not affected. 0 = old behaviour.
 if ~exist('ellipse_off_when_wide', 'var'), ellipse_off_when_wide = 1; end
 ellipse_off_count = 0; ellipse_off_frames = [];
+% Qef by continuity (2026-09-28, default OFF; HV209_116): the seed Qef of the ellipse search is what branch_removal leaves of the thin
+% skeleton (bwmorph thin) after it prunes at every branch point. On a bulb the thin skeleton is a Y with a lower prong pointing at the
+% tip and an upper prong up in the bulb; branch_removal's angle test keeps one of them from frame to frame -- in F792/F786/F780 the
+% upper one, 27-28 px from the previous tip, which also makes the skeleton pruning (close_dist) drop one foot end and with it `mid`.
+% With qef_by_continuity = 1 (only frames with a previous tip) Qef is instead the thin endpoint nearest to the previous tip, without the
+% endpoint with the largest column (the base). 0 = branch_removal's choice as before.
+if ~exist('qef_by_continuity', 'var'), qef_by_continuity = 0; end
 if ~exist('ellipse_first_on_frames', 'var'), ellipse_first_on_frames = 3; end
 ellipse_first_streak = 0;
 % Jitter-zone smoothing (2026-09-25, default OFF): a pass at the END of the run, before the videos are written.
@@ -1015,6 +1022,14 @@ for count = smp:-1:stp
             % better than crashing on an empty seed.
             [~, Qepos] = max(Qel(:,2));
             Qef = Qel(Qepos,:);
+        end
+        if qef_by_continuity && last_flag == 1 && exist('tip_final_last', 'var') && ~isempty(tip_final_last) && size(Qel,1) >= 2
+            Qef_old = Qef(1,:);
+            [~, base_i] = max(Qel(:,2)); cand_q = Qel; cand_q(base_i,:) = [];
+            [~, qi] = min(pdist2(cand_q, tip_final_last)); Qef = cand_q(qi,:);
+            if debug_mode && ~isequal(Qef, Qef_old)
+                fprintf('  Qef F%d: by continuity [%d,%d] (branch_removal had [%d,%d])\n', count, Qef(1), Qef(2), Qef_old(1), Qef_old(2));
+            end
         end
     end
 
