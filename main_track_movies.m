@@ -1295,7 +1295,7 @@ for count = smp:-1:stp
     % tip_mid were actually computed THIS frame via isempty(), rather than
     % reading stale values left over from an earlier iteration that didn't
     % take the same code path.
-    tip_skel = []; tip_mid = [];
+    tip_skel = []; tip_mid = []; tip_skel_cont = [];
 
     if strcmp(tip_method, 'skeleton')
         % Skeletonizing and finding endpoints
@@ -1308,6 +1308,25 @@ for count = smp:-1:stp
         Sb = bwmorph(S,'branchpoints');
         [Sbr,Sbc] = find(Sb > 0);
         Sbl = [Sbr Sbc];
+
+        % Branch-keep-by-continuity candidate (2026-09-29, HV209_116 F68-F67): branch_removal's own angle-based
+        % tie-break, and the close_dist pruning that decides whether to run it at all, can discard the skeleton prong
+        % that actually continues from the previous tip and keep a different one (a short side prong, e.g. a nub next
+        % to the true tip) -- that also silently removes the `mid` candidate when only one prong survives. This is a
+        % second, independent read of the SAME raw endpoints (Sel, before any pruning): whichever one is nearest the
+        % previous tip (excluding the base endpoint at the tube's own entry, largest column). Unlike the side memory
+        % guard it carries no state between frames -- recomputed fresh every frame from tip_final_last alone, so it
+        % needs no memory of which side is "correct" and nothing to re-anchor at a kink. It is only ever ONE MORE
+        % candidate fed into the existing nearest-to-previous-tip vote/recovery pool below, never a forced override.
+        tip_skel_cont = [];
+        if last_flag && exist('tip_final_last', 'var') && ~isempty(tip_final_last) && size(Sel,1) >= 1
+            Sel_nb = Sel;
+            if size(Sel_nb,1) >= 2, [~, base_i] = max(Sel_nb(:,2)); Sel_nb(base_i,:) = []; end
+            if ~isempty(Sel_nb)
+                [~, ki] = min(pdist2(Sel_nb, tip_final_last));
+                tip_skel_cont = boundb(dsearchn(boundb, Sel_nb(ki,:)),:);
+            end
+        end
     end
 
     if (count == smp)
@@ -1483,6 +1502,9 @@ for count = smp:-1:stp
             if ellipse_off_frame && (~isempty(tip_skel) || ~isempty(tip_mid)), cand_branch = zeros(0,2); cand_branch_label = {}; end % ellipse too wide: no ellipse candidate
             if ~isempty(tip_skel), cand_branch = [cand_branch; tip_skel]; cand_branch_label{end+1} = 'skel'; end
             if ~isempty(tip_mid),  cand_branch = [cand_branch; tip_mid];  cand_branch_label{end+1} = 'mid';  end
+            if ~isempty(tip_skel_cont) && (isempty(tip_skel) || pdist2(tip_skel_cont, tip_skel) > 0.5) % see tip_skel_cont's doc near Sel/Sbl above
+                cand_branch = [cand_branch; tip_skel_cont]; cand_branch_label{end+1} = 'skel_cont';
+            end
             cand_branch_dist = pdist2(cand_branch, tip_final_last);
             [~, branch_best_idx] = min(cand_branch_dist);
             gate_ratio = NaN;
@@ -1540,15 +1562,22 @@ for count = smp:-1:stp
         end
     else
         tip_skel = boundb(dsearchn(boundb,Sef(1,:)),:);
-        if (last_flag) [tmp, tip_finaldistpos] = min([pdist2(tip_final_last,tip_ellipsef) pdist2(tip_final_last,tip_skel)]);
-        else tip_finaldistpos = 2;
+        cand_u = tip_ellipsef; cand_u_label = {'ellipsef'};
+        if ellipse_off_frame, cand_u = zeros(0,2); cand_u_label = {}; end % ellipse too wide: no ellipse candidate
+        cand_u = [cand_u; tip_skel]; cand_u_label{end+1} = 'skel';
+        if ~isempty(tip_skel_cont) && pdist2(tip_skel_cont, tip_skel) > 0.5 % see tip_skel_cont's doc near Sel/Sbl above
+            cand_u = [cand_u; tip_skel_cont]; cand_u_label{end+1} = 'skel_cont';
         end
-        if ellipse_off_frame, tip_finaldistpos = 2; end % ellipse too wide: skeleton end
-        if (tip_finaldistpos == 1) tip_final(count,:) = tip_ellipsef; else tip_final(count,:) = tip_skel; end
+        if last_flag
+            [~, tip_finaldistpos] = min(pdist2(cand_u, tip_final_last));
+        else
+            tip_finaldistpos = find(strcmp(cand_u_label, 'skel'), 1); % cold start: no continuity signal, old default (skel over ellipsef)
+            if isempty(tip_finaldistpos), tip_finaldistpos = 1; end
+        end
+        tip_final(count,:) = cand_u(tip_finaldistpos,:);
         if debug_mode
-            srclabel = 'skel'; if (tip_finaldistpos==1), srclabel = 'ellipsef'; end
             fprintf('  tip F%d: branchpt=%d unbranched last_flag=%d -> %s\n', ...
-                count, ~isempty(Sbl), last_flag, srclabel);
+                count, ~isempty(Sbl), last_flag, cand_u_label{tip_finaldistpos});
         end
     end
     end
@@ -1683,12 +1712,16 @@ for count = smp:-1:stp
                                 is_done = true; break;
                             end
                         end
-                        if ~is_done
-                            if sax_dc == 0
-                                side_done(end+1) = sax; % the tip is already on this axis: nothing to guard
-                            elseif sax_dc <= side_memory_arm_D * diamo_est
-                                side_done(end+1) = sax; side_active = true; side_fire_at = NaN;
-                            end
+                        if ~is_done && sax_dc > 0 && sax_dc <= side_memory_arm_D * diamo_est
+                            % Only record an axis as done at the moment it actually arms (2026-09-29, HV209_116 F68-F67
+                            % fix). dc == 0 (tip already on this axis, nothing to guard) used to also append an entry --
+                            % on a long stable shank that happens on almost every frame, each with a slightly different
+                            % fitted centre, so side_done fills in a near-continuous corridor covering the axis's whole
+                            % drift range and permanently blocks any later GENUINE arm on the same physical line (this
+                            % axis armed cleanly at F585/F572 while the corridor was still sparse, then was blocked from
+                            % F568 all the way to the real crossing at F67). dc == 0 needs no bookkeeping at all: the
+                            % elseif above already guarantees it can never arm.
+                            side_done(end+1) = sax; side_active = true; side_fire_at = NaN;
                         end
                     end
                     if side_active && sax_dc > 0 && isfinite(sax_dc)
@@ -1731,6 +1764,9 @@ for count = smp:-1:stp
             if ellipse_off_frame && (~isempty(tip_skel) || ~isempty(tip_mid)), cand = zeros(0,2); cand_label = {}; end % ellipse too wide: not in the recovery pool either
             if ~isempty(tip_skel), cand = [cand; tip_skel]; cand_label{end+1} = 'skel'; end
             if ~isempty(tip_mid),  cand = [cand; tip_mid];  cand_label{end+1} = 'mid';  end
+            if ~isempty(tip_skel_cont) && (isempty(tip_skel) || pdist2(tip_skel_cont, tip_skel) > 0.5) % see tip_skel_cont's doc near Sel/Sbl above
+                cand = [cand; tip_skel_cont]; cand_label{end+1} = 'skel_cont';
+            end
             % Cross-method fallback (ringwalk only): tip_skel/tip_mid above
             % are only ever populated when tip_method='skeleton' natively
             % runs, so a failing ringwalk frame otherwise has just ONE
