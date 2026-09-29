@@ -147,14 +147,15 @@ if ~exist('side_memory_hyst_factor', 'var'), side_memory_hyst_factor = 0.5; end
 % reaches the band around the axis (the "crossing") within side_memory_arm_D * diamo_est. It
 % releases at the earlier of (a) side_memory_after_cross_D * diamo_est of tip travel past the
 % crossing, (b) side_memory_after_fire_D * diamo_est of tip travel after it first refused the
-% tip's pick. An axis that has been armed (or that the tip was already on) is not armed again.
-% Outside the window the side is still learned (side_sign) but nothing is refused.
+% tip's pick. Arming has no memory of past episodes (2026-09-29: a "done" list of already-armed axes was removed --
+% it blocked a genuine re-arm on the same physical axis after its first-ever episode for the rest of the run, which is
+% wrong whenever the tip flickers near a kink: arms, releases at 0.3 D, drifts back within 1 D -- still mid-crossing,
+% not a new episode). Outside the window the side is still learned (side_sign) but nothing is refused.
 if ~exist('side_memory_windowed', 'var'), side_memory_windowed = 1; end
 if ~exist('side_memory_arm_D', 'var'), side_memory_arm_D = 1; end
 if ~exist('side_memory_after_cross_D', 'var'), side_memory_after_cross_D = 0.3; end
 if ~exist('side_memory_after_fire_D', 'var'), side_memory_after_fire_D = 1; end
 side_ax_prev = []; side_sign = 0;
-side_done = struct('c', {}, 'a', {}, 'L', {}, 'i0', {}, 'n', {}); % axes already armed
 side_active = false; side_travel = 0; side_cross_at = Inf; side_fire_at = NaN;
 % Ellipse-first vote (2026-09-24, default ON; 0 = the older continuity-first vote): the older vote
 % picked whichever of ellipsef/skel/mid is nearest to the previous tip. On
@@ -1713,24 +1714,17 @@ for count = smp:-1:stp
                 side_ax_prev = sax;
                 enforce = true;
                 if side_memory_windowed
-                    if ~side_active
-                        is_done = false;
-                        for kd = 1:numel(side_done)
-                            if abs(dot(sax.a, side_done(kd).a)) > cosd(15) && abs(dot(sax.c - side_done(kd).c, side_done(kd).n)) < 0.5 * diamo_est
-                                is_done = true; break;
-                            end
-                        end
-                        if ~is_done && sax_dc > 0 && sax_dc <= side_memory_arm_D * diamo_est
-                            % Only record an axis as done at the moment it actually arms (2026-09-29, HV209_116 F68-F67
-                            % fix). dc == 0 (tip already on this axis, nothing to guard) used to also append an entry --
-                            % on a long stable shank that happens on almost every frame, each with a slightly different
-                            % fitted centre, so side_done fills in a near-continuous corridor covering the axis's whole
-                            % drift range and permanently blocks any later GENUINE arm on the same physical line (this
-                            % axis armed cleanly at F585/F572 while the corridor was still sparse, then was blocked from
-                            % F568 all the way to the real crossing at F67). dc == 0 needs no bookkeeping at all: the
-                            % elseif above already guarantees it can never arm.
-                            side_done(end+1) = sax; side_active = true; side_fire_at = NaN;
-                        end
+                    % Arm purely on the current dc, no memory of past episodes (2026-09-29, HV209_116 F347 fix): a
+                    % "done" list of axes that have already armed once was removed entirely. It never did anything the
+                    % dc-based arm condition doesn't already do on its own -- dc == 0 (tip already on the axis) can
+                    % never arm anyway, regardless of any done-list, and once the tip is genuinely settled past a kink
+                    % dc naturally grows past the arm distance and arming stops needing to be blocked by anything else.
+                    % What the done-list actually did was block a GENUINE re-arm on the same physical axis after its
+                    % first-ever episode, for the rest of the run -- exactly wrong when the tip flickers near a kink
+                    % (arms, releases at 0.3 D, drifts back within 1 D): that is still mid-crossing, not a new episode,
+                    % and the guard should stay available for it, not be permanently spent after the first pass.
+                    if ~side_active && sax_dc > 0 && sax_dc <= side_memory_arm_D * diamo_est
+                        side_active = true; side_fire_at = NaN;
                     end
                     if side_active && sax_dc > 0 && isfinite(sax_dc)
                         side_cross_at = side_travel + sax_dc; % travel coordinate of the crossing
