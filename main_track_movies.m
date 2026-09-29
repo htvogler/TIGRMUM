@@ -1701,7 +1701,15 @@ for count = smp:-1:stp
             if ~isempty(sax)
                 if ~sax_same, side_sign = 0; side_active = false; end
                 s_prev = dot(tip_final_last - sax.c, sax.n);
-                if abs(s_prev) > side_tol, side_sign = sign(s_prev); end
+                % Learn the side ONCE per axis, not every frame (2026-09-29, HV209_116 F572 fix): this used to run
+                % unconditionally, so side_sign kept re-syncing to wherever the tip currently was, on every frame its
+                % offset exceeded side_tol -- whether the guard was armed or not. A memory that continuously overwrites
+                % itself to match current reality can never detect a violation of it: by the time the window happened
+                % to re-arm (e.g. F572), side_sign had already silently flipped to match a drift that occurred while
+                % the guard was closed, so the re-arm just enshrined the wrong side as "correct" instead of catching
+                % the crossing. side_sign is now set only the first time (per axis, i.e. since the last ~sax_same
+                % reset) that the offset clears the tolerance, then frozen until the axis genuinely changes.
+                if side_sign == 0 && abs(s_prev) > side_tol, side_sign = sign(s_prev); end
                 side_ax_prev = sax;
                 enforce = true;
                 if side_memory_windowed
