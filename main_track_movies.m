@@ -118,25 +118,54 @@ if ~exist('nudge_max_cand_dist_factor', 'var'), nudge_max_cand_dist_factor = 0.2
 % Side memory (2026-09-24; rebuilt 2026-09-26, default ON). The first version measured the
 % sideways drift against an axis through the previous tip along the tube border, so at a turn
 % it refused the correct tip (HV204_105, HV203_4_21); it was replaced (see git history:
-% 4659ca6 and earlier). This one uses the tube's SHANK AXIS: a straight line fitted to the first straight stretch of the skeleton path from
-% the previous tip toward the base that is at least side_memory_min_len_factor * diamo_est
-% long (the first side_memory_skip_factor * diamo_est behind the tip, the flat end, is
-% skipped; a stretch is straight while its RMS distance to the fitted line is <=
-% side_memory_rms_px; shorter pieces after a kink are ignored, so at a V-shape only the
-% arm the tip is on counts). The tip must stay on the side of that axis where the previous
-% tip is: a candidate on the OTHER side by more than max(side_memory_tol_min_px,
-% side_memory_tol_factor * diamo_est) is refused like any other guard failure (recovery
-% pool, else hold). The side is taken from the previous tip; if that lies within the band
-% the side remembered for the same axis is used (none for a new axis). The active axis
-% changes when the tip's own stretch gets shorter than the minimum (analysis runs from the
-% last frame backwards, so the tip retreats toward the kink); side_memory_hyst_factor keeps
-% the old axis until its stretch is that much (in D) shorter than the minimum and switches
-% back only when the nearer stretch is that much longer. No stretch at all: the last axis
-% is reused while the previous tip is within 2 D of it, else the guard is off for the frame.
+% 4659ca6 and earlier). This one uses the tube's SHANK AXIS: a straight line fitted to one
+% stretch of the skeleton path from the previous tip toward the base, at least
+% side_memory_min_len_factor * diamo_est long.
+% Segment boundaries (2026-09-29, replaces the old growing-RMS-window walk -- see git history
+% around bed3527..HEAD): a kink is a local min/max of the path's ROW OR COLUMN coordinate
+% along arc length, searched from the tip itself -- the point where the tube's vertical or
+% horizontal trend reverses, which is what a real channel turn looks like geometrically (row
+% alone misses a turn that's purely a column reversal, e.g. HV209_62's tip briefly backtracking
+% in column while row keeps falling). The old method grew a window one point at a time while
+% its RMS stayed <= a threshold and cut a new segment the instant a single point broke it; that
+% reacts to ordinary in-channel wobble and gentle curvature exactly like a real kink, so a
+% long gently-curving or wobbly stretch got fragmented into several short, wrongly-oriented
+% pieces (HV209_62: one true ~10D channel run came out as three). Local extrema don't have
+% that failure mode: row(arc) and col(arc) are resampled to a uniform 1px step and
+% Gaussian-smoothed (window ~= side_memory_extrema_smooth_factor * diamo_est) so a single noisy
+% skeleton pixel can't pass as an extremum, and only extrema at least
+% side_memory_extrema_prominence_factor * diamo_est prominent count -- ordinary wobble stays
+% below that bar, a real turn clears it. Searching from the tip itself (rather than some
+% distance behind it) matters: a real extremum sitting just past an artificial start point
+% doesn't give findpeaks enough "before" data to score its full prominence and gets missed
+% (HV204_105: a real turn at 1.52D was invisible to a search that only started at 1.0D).
+% Each stretch between extrema (including the path start and end) is a candidate
+% segment regardless of its own length; shorter pieces after a kink are still ignored by the
+% min-length check below, so at a V-shape only the arm the tip is on counts. The tip must stay
+% on the side of the picked axis where the previous tip is: a candidate on the OTHER side by
+% more than max(side_memory_tol_min_px, side_memory_tol_factor * diamo_est) is refused like any
+% other guard failure (recovery pool, else hold). The side is taken from the previous tip; if
+% that lies within the band the side remembered for the same axis is used (none for a new
+% axis). The active axis changes when the tip's own stretch gets shorter than the minimum
+% (analysis runs from the last frame backwards, so the tip retreats toward the kink);
+% side_memory_hyst_factor keeps the old axis until its stretch is that much (in D) shorter than
+% the minimum and switches back only when the nearer stretch is that much longer. No stretch at
+% all: the last axis is reused while the previous tip is within 2 D of it, else the guard is off
+% for the frame.
 if ~exist('side_memory', 'var'), side_memory = 1; end % 1 = on (default), 0 = off
-if ~exist('side_memory_min_len_factor', 'var'), side_memory_min_len_factor = 2; end
-if ~exist('side_memory_skip_factor', 'var'), side_memory_skip_factor = 1; end
-if ~exist('side_memory_rms_px', 'var'), side_memory_rms_px = 1.5; end
+if ~exist('side_memory_min_len_factor', 'var'), side_memory_min_len_factor = 3; end
+if ~exist('side_memory_extrema_smooth_factor', 'var'), side_memory_extrema_smooth_factor = 1; end
+% 0.25, not 0.5: 0.5 missed a real near-tip extremum (HV209_62, a column reversal only
+% ~0.44D deep raw) while 0.25 recovers it and stays stable (no spurious splits) on the other
+% two validation stacks (2026-09-29).
+if ~exist('side_memory_extrema_prominence_factor', 'var'), side_memory_extrema_prominence_factor = 0.25; end
+% Kink-zone merging (2026-09-30): half-window for the local tangent-angle profile, the
+% rotation-rate threshold that counts as "really bending" vs ordinary wobble, and the minimum
+% sustained length for that to count -- see the segmentation block's own doc for why these
+% exist. Validated on the same three stacks (HV204_105, HV209_62, HV209_116).
+if ~exist('side_memory_bend_win_factor', 'var'), side_memory_bend_win_factor = 0.75; end
+if ~exist('side_memory_bend_thresh_deg_per_D', 'var'), side_memory_bend_thresh_deg_per_D = 8; end
+if ~exist('side_memory_bend_min_D', 'var'), side_memory_bend_min_D = 0.3; end
 if ~exist('side_memory_tol_factor', 'var'), side_memory_tol_factor = 0.1; end
 if ~exist('side_memory_tol_min_px', 'var'), side_memory_tol_min_px = 2; end
 if ~exist('side_memory_hyst_factor', 'var'), side_memory_hyst_factor = 0.5; end
@@ -1694,7 +1723,9 @@ for count = smp:-1:stp
         if side_memory
             side_tol = max(side_memory_tol_min_px, side_memory_tol_factor * diamo_est);
             [sax, sax_same, sax_dc] = side_memory_axis_find(U, tip_final_last, diamo_est, side_ax_prev, ...
-                side_memory_min_len_factor, side_memory_skip_factor, side_memory_rms_px, side_memory_hyst_factor, side_tol);
+                side_memory_min_len_factor, side_memory_extrema_smooth_factor, ...
+                side_memory_extrema_prominence_factor, side_memory_hyst_factor, side_tol, ...
+                side_memory_bend_win_factor, side_memory_bend_thresh_deg_per_D, side_memory_bend_min_D);
             if isempty(sax) && ~isempty(side_ax_prev) && ...
                     abs(dot(tip_final_last - side_ax_prev.c, side_ax_prev.n)) <= 2 * diamo_est
                 sax = side_ax_prev; sax_same = true; sax_dc = Inf; % no stretch now: keep the last axis while the tip is near it
@@ -5033,13 +5064,14 @@ off = dot(pt - g.c, g.n);
 refuse = (sign(off) ~= g.side) && abs(off) > g.tol;
 end
 
-function [ax, same, dc] = side_memory_axis_find(U, tip, diamo_est, prev_ax, min_len_f, skip_f, rms_max, hyst_f, tol)
-% Shank axis for the tip at `tip` ([row col]) in mask U: straight line through the first
-% straight stretch, >= min_len_f * diamo_est long, of the skeleton path from the tip toward
-% the base (largest column), starting skip_f * diamo_est behind the tip. See
-% the side memory's doc near the top of main_track_movies.m. Returns [] when there is no
-% such stretch (or no connected skeleton path). ax.c = point on the axis [row col], ax.a =
-% unit direction pointing tip-ward, ax.n = [-a(2) a(1)], ax.L = stretch length (px).
+function [ax, same, dc] = side_memory_axis_find(U, tip, diamo_est, prev_ax, min_len_f, smooth_f, prom_f, hyst_f, tol, bend_win_f, bend_thresh_f, bend_min_f)
+% Shank axis for the tip at `tip` ([row col]) in mask U: straight line through one stretch,
+% >= min_len_f * diamo_est long, of the skeleton path from the tip toward the base (largest
+% column); stretch boundaries are local row/column extrema (smooth_f, prom_f), searched from
+% the tip itself, not a growing-RMS-window walk. See the side memory's doc near the top of
+% main_track_movies.m. Returns [] when there is no such stretch (or no connected skeleton
+% path). ax.c = point on the axis [row col], ax.a = unit direction pointing tip-ward,
+% ax.n = [-a(2) a(1)], ax.L = stretch length (px).
 % `same` = the axis is the one in prev_ax (still matched, possibly with hysteresis). dc = see below.
 ax = []; same = false; dc = Inf;
 skel = bwmorph(U, 'skel', Inf);
@@ -5068,23 +5100,108 @@ if n < 20, return; end
 arc = [0; cumsum(hypot(diff(P(:,1)), diff(P(:,2))))];
 S = struct('r', [0; cumsum(P(:,1))], 'c', [0; cumsum(P(:,2))], 'rr', [0; cumsum(P(:,1).^2)], ...
     'cc', [0; cumsum(P(:,2).^2)], 'rc', [0; cumsum(P(:,1) .* P(:,2))]);
-% straight stretches
-segs = struct('c', {}, 'a', {}, 'L', {}, 'i0', {});
-i = find(arc >= skip_f * diamo_est, 1);
-win0 = 8;
-while ~isempty(i) && i + win0 <= n
-    [~, ~, rms0] = side_memory_fit_window(S, i, i + win0);
-    if rms0 > rms_max, i = i + 4; continue; end
-    j = i + win0;
-    while j + 1 <= n
-        [~, ~, rms1] = side_memory_fit_window(S, i, j + 1);
-        if rms1 > rms_max, break; end
-        j = j + 1;
+% Stretch boundaries: local extrema of the path's row AND column coordinates along arc
+% length (see the side memory's doc near the top of this script for why, vs. the old
+% growing-RMS-window walk). Search from the true tip (index 1), not skip_f*diamo_est --
+% starting the search array AT skip_f left findpeaks unable to see enough "before" data to
+% score a real extremum sitting just past that cutoff, so it was silently missed (HV204_105:
+% a real turn at 1.52D, right past the old 1.0D cutoff, 2026-09-29). Row alone also misses a
+% turn that's purely a column reversal (HV209_62: the tip briefly backtracks in column with
+% row still falling the whole time) -- so both coordinates are searched and combined.
+%
+% Nearby extrema are then merged into KINK ZONES (2026-09-30) rather than used as point
+% boundaries directly: HV209_116's hook shows a column-minimum and a row-minimum ~1.6D apart
+% from ONE continuous ~90-degree turn, not two separate kinks -- merging avoids treating it as
+% two. A zone is any stretch where the local tangent angle keeps rotating the same way
+% (|dtheta/darc| > side_memory_bend_thresh_deg_per_D, sustained >= side_memory_bend_min_D)
+% that contains at least one real extremum. Segments are then the gaps between zones -- this
+% also replaces the fixed 0.5D buffer guess in side_memory_border_fit's spirit with an
+% actually-measured exclusion around each kink, for free.
+%
+% The picked axis is anchored through the kink zone immediately tip-ward of it, not through
+% its own fitted centroid (2026-09-30): the guard's real job is gating candidates and pruning
+% branches AT that kink boundary, where the tip is approaching from the adjacent segment -- it
+% is never inside the segment being fitted. A raw local tangent measured right at the kink is
+% unstable (a short window straddling the transition), so the anchor uses the segment's own
+% robust whole-segment direction, just re-anchored to pass through the kink point instead of
+% the segment's own (possibly distant) centroid. The very first segment (nearest the tip) has
+% no preceding kink zone and keeps its own centroid.
+segs = struct('c', {}, 'a', {}, 'L', {}, 'i0', {}, 'j0', {}, 'kink_c', {}, 'has_kink', {});
+i_start = 1;
+if i_start < n
+    [a_grid, row_s, col_s] = side_memory_smooth_path(P, arc, i_start, smooth_f, diamo_est);
+    prom = prom_f * diamo_est;
+    pk_all = [];
+    if numel(row_s) >= 3
+        [~, pk_r_hi] = findpeaks(row_s, 'MinPeakProminence', prom);
+        [~, pk_r_lo] = findpeaks(-row_s, 'MinPeakProminence', prom);
+        [~, pk_c_hi] = findpeaks(col_s, 'MinPeakProminence', prom);
+        [~, pk_c_lo] = findpeaks(-col_s, 'MinPeakProminence', prom);
+        pk_all = [pk_r_hi(:); pk_r_lo(:); pk_c_hi(:); pk_c_lo(:)];
     end
-    [cc0, a0, ~] = side_memory_fit_window(S, i, j);
-    if dot(a0, P(i,:) - P(j,:)) < 0, a0 = -a0; end % tip-ward = toward smaller path index
-    segs(end+1) = struct('c', cc0, 'a', a0, 'L', arc(j) - arc(i), 'i0', i); %#ok<AGROW>
-    i = j;
+    real_extrema_a = a_grid(sort(pk_all));
+
+    % local tangent angle profile, vectorized (shifted-window finite difference -- avoids a
+    % slow per-point loop; this runs every frame)
+    npts = numel(row_s);
+    half_win_px = max(1, round(bend_win_f * diamo_est));
+    idxv = (1:npts)';
+    lo_i = max(idxv - half_win_px, 1); hi_i = min(idxv + half_win_px, npts);
+    theta = unwrap(atan2(col_s(hi_i) - col_s(lo_i), row_s(hi_i) - row_s(lo_i)));
+    dtheta = gradient(theta) ./ gradient(a_grid) * diamo_est * 180 / pi; % deg per D
+
+    bend_state = zeros(npts, 1);
+    bend_state(dtheta > bend_thresh_f) = 1; bend_state(dtheta < -bend_thresh_f) = -1;
+    runs = []; ri = 1;
+    while ri <= npts
+        rj = ri;
+        while rj < npts && bend_state(rj + 1) == bend_state(ri), rj = rj + 1; end
+        runs(end+1, :) = [ri, rj, bend_state(ri)]; ri = rj + 1; %#ok<AGROW>
+    end
+    for kr = 1:size(runs, 1)
+        if runs(kr, 3) ~= 0 && (a_grid(runs(kr, 2)) - a_grid(runs(kr, 1))) < bend_min_f * diamo_est
+            runs(kr, 3) = 0;
+        end
+    end
+    kink_a0 = []; kink_a1 = [];
+    for kr = 1:size(runs, 1)
+        if runs(kr, 3) == 0, continue; end
+        a0r = a_grid(runs(kr, 1)); a1r = a_grid(runs(kr, 2));
+        if any(real_extrema_a >= a0r & real_extrema_a <= a1r)
+            kink_a0(end+1) = a0r; kink_a1(end+1) = a1r; %#ok<AGROW>
+        end
+    end
+    if ~isempty(kink_a0)
+        [kink_a0, kord] = sort(kink_a0); kink_a1 = kink_a1(kord);
+        ka0 = kink_a0(1); ka1 = kink_a1(1); mg0 = []; mg1 = [];
+        for kz = 2:numel(kink_a0)
+            if kink_a0(kz) <= ka1
+                ka1 = max(ka1, kink_a1(kz));
+            else
+                mg0(end+1) = ka0; mg1(end+1) = ka1; ka0 = kink_a0(kz); ka1 = kink_a1(kz); %#ok<AGROW>
+            end
+        end
+        mg0(end+1) = ka0; mg1(end+1) = ka1;
+        kink_a0 = mg0; kink_a1 = mg1;
+    end
+
+    a_bounds = [arc(i_start), reshape([kink_a0; kink_a1], 1, []), arc(end)];
+    for si = 1:numel(a_bounds) / 2
+        i = find(arc >= a_bounds(2 * si - 1), 1);
+        j = find(arc <= a_bounds(2 * si), 1, 'last');
+        if isempty(i) || isempty(j) || j <= i, continue; end
+        [cc0, a0, ~] = side_memory_fit_window(S, i, j);
+        if dot(a0, P(i,:) - P(j,:)) < 0, a0 = -a0; end % tip-ward = toward smaller path index
+        if si >= 2 && (si - 1) <= numel(kink_a0)
+            kzc = (kink_a0(si - 1) + kink_a1(si - 1)) / 2;
+            kc_idx = find(arc >= kzc, 1); if isempty(kc_idx), kc_idx = n; end
+            segs(end+1) = struct('c', cc0, 'a', a0, 'L', arc(j) - arc(i), 'i0', i, 'j0', j, ...
+                'kink_c', P(kc_idx, :), 'has_kink', true); %#ok<AGROW>
+        else
+            segs(end+1) = struct('c', cc0, 'a', a0, 'L', arc(j) - arc(i), 'i0', i, 'j0', j, ...
+                'kink_c', cc0, 'has_kink', false); %#ok<AGROW>
+        end
+    end
 end
 if isempty(segs), return; end
 % which stretch is the previous axis (same line: similar direction, centre near the line)
@@ -5110,6 +5227,10 @@ for k = 1:numel(segs)
 end
 if pick == 0, return; end
 ax = segs(pick);
+ax = side_memory_border_fit(U, P, arc, ax, diamo_est);
+if segs(pick).has_kink
+    ax.c = segs(pick).kink_c; % anchor through the kink point, not the segment's own centroid
+end
 ax.n = [-ax.a(2), ax.a(1)];
 same = (pick == ip);
 % dc = path length from the tip to the first entry into the tolerance band of the axis line
@@ -5136,6 +5257,90 @@ a = [cos(th) sin(th)];
 c = [mr mc];
 lam_min = (vrr + vcc) / 2 - sqrt(((vrr - vcc) / 2)^2 + vrc^2);
 rms = sqrt(max(lam_min, 0));
+end
+
+function ax_out = side_memory_border_fit(U, P, arc, ax, diamo_est)
+% If either end of ax's stretch touches an image border, trim the corner-skewed
+% border_trim_d worth of arc off that end and refit anchored through the true mask-center
+% there instead (see side_memory_border_point). The skeleton hugs a corner instead of the
+% true centerline right at a hard-cut mask edge -- HV204_105's rightmost segment bends
+% toward the mask's lower corner over a sustained ~1.8D stretch approaching the border (not
+% just the last point), so 0.5D only cut off a third of it; 1.0D trim + a stronger anchor
+% weight (20, not 8) clears the whole bend and lands the refit within ~0.6px of the true
+% center (2026-09-30, was ~1px with the old 0.5D/8 pair on a less-contaminated segment).
+ax_out = ax;
+trim_d = 1.0; anchor_w = 20; tol_px = 2;
+i = ax.i0; j = ax.j0;
+bc0 = side_memory_border_point(U, P(i, :), tol_px);
+bc1 = side_memory_border_point(U, P(j, :), tol_px);
+if isempty(bc0) && isempty(bc1), return; end
+i_use = i; j_use = j;
+if ~isempty(bc0)
+    ii = find(arc >= arc(i) + trim_d * diamo_est, 1);
+    if ~isempty(ii) && ii <= j, i_use = ii; end
+end
+if ~isempty(bc1)
+    jj = find(arc <= arc(j) - trim_d * diamo_est, 1, 'last');
+    if ~isempty(jj) && jj >= i_use, j_use = jj; end
+end
+pts = P(i_use:j_use, :);
+if ~isempty(bc0), pts = [pts; repmat(bc0, anchor_w, 1)]; end
+if ~isempty(bc1), pts = [pts; repmat(bc1, anchor_w, 1)]; end
+c = mean(pts, 1);
+[~, ~, V] = svd(pts - c, 0);
+a = V(:, 1)';
+if dot(a, P(i, :) - P(j, :)) < 0, a = -a; end
+ax_out.c = c; ax_out.a = a;
+end
+
+function pt = side_memory_border_point(U, p, tol_px)
+% p = [row col] in the same 0-indexed pixel coordinates as the skeleton path P (see
+% side_memory_axis_find). If p sits within tol_px of an image edge, return the true
+% mask-center point on that same edge (row or column). Returns [] if p is not near an edge.
+pt = [];
+[nrows, ncols] = size(U);
+r0 = round(p(1)); c0 = round(p(2));
+if c0 <= tol_px - 1 || c0 >= ncols - tol_px
+    cc0 = 0; if c0 > tol_px - 1, cc0 = ncols - 1; end
+    rows0 = find(U(:, cc0 + 1)) - 1;
+    if ~isempty(rows0), pt = [(min(rows0) + max(rows0)) / 2, cc0]; return; end
+end
+if r0 <= tol_px - 1 || r0 >= nrows - tol_px
+    rr0 = 0; if r0 > tol_px - 1, rr0 = nrows - 1; end
+    cols0 = find(U(rr0 + 1, :)) - 1;
+    if ~isempty(cols0), pt = [rr0, (min(cols0) + max(cols0)) / 2]; return; end
+end
+end
+
+function [a_grid, row_s, col_s] = side_memory_smooth_path(P, arc, i_start, smooth_f, diamo_est)
+% Resample the skeleton path's row and column coordinates to a uniform 1px arc step from
+% i_start to the end, and Gaussian-smooth both (window ~= smooth_f * diamo_est). Shared by
+% the kink-boundary search (row_s only, see side_memory_axis_find) and by
+% side_memory_local_tangent (both, to trace genuine within-segment meander -- 2026-09-29,
+% 209_62: a single straight-line fit per segment missed the tip's true local direction
+% where the channel still meanders before it hits the wall).
+a_grid = (arc(i_start):1:arc(end))';
+if numel(a_grid) < 2, a_grid = [arc(i_start); arc(end)]; end
+row_u = interp1(arc, P(:,1), a_grid, 'linear');
+col_u = interp1(arc, P(:,2), a_grid, 'linear');
+smooth_win = max(3, round(smooth_f * diamo_est));
+row_s = smoothdata(row_u, 'gaussian', smooth_win);
+col_s = smoothdata(col_u, 'gaussian', smooth_win);
+end
+
+function [c, a] = side_memory_local_tangent(a_grid, row_s, col_s, a_query, half_win)
+% Local unit tangent of the smoothed (row_s(arc), col_s(arc)) curve at arc position
+% a_query, by finite difference over +-half_win (px), clamped to the available range.
+% c = the curve's own point at a_query [row col] (not necessarily on the raw skeleton --
+% it's the smoothed centerline). a points toward increasing arc (base-ward); the caller
+% flips it tip-ward the same way side_memory_axis_find does for a straight-line ax.a.
+lo = max(a_grid(1), a_query - half_win);
+hi = min(a_grid(end), a_query + half_win);
+r0 = interp1(a_grid, row_s, lo); c0 = interp1(a_grid, col_s, lo);
+r1 = interp1(a_grid, row_s, hi); c1 = interp1(a_grid, col_s, hi);
+d = [r1 - r0, c1 - c0];
+a = d / norm(d);
+c = [interp1(a_grid, row_s, a_query), interp1(a_grid, col_s, a_query)];
 end
 
 function ok = candidate_passes_tip_guard(pt, tip_final_last, axis_unit, ...
