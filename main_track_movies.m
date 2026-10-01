@@ -2351,24 +2351,7 @@ for count = smp:-1:stp
     xct = round(sgolayfilt(double(xct),3,15)); yct = round(sgolayfilt(double(yct),3,15));
     xct = max(1, min(xct, size(U,2))); yct = max(1, min(yct, size(U,1)));
 
-    % distc_t: kept as-is for its own, separate purpose below (the
-    % "tip_final-to-ROI gap" debug diagnostic) -- it measures how far the
-    % FINAL voted tip (tip_final) ended up from Qef, which is only ever a
-    % rough SEED for locate_tip's ellipse search (see Qef's own definition
-    % comment above), not the final tip itself. That gap is a genuine QC
-    % signal (how much did refinement move the tip from its seed), but it
-    % has nothing to do with where the centerline's own arc-length
-    % coordinate should start, and using it to trim xc/yc/distc (as this
-    % used to do) silently shifted EVERY arc-length position -- including
-    % non-zero starti/stopi, i.e. any shifted ROI, not just a tip-flush
-    % one -- by however much that frame's Qef happened to miss tip_final
-    % (confirmed on real data: 2.8-8.6px, frame-varying). The path already
-    % starts at the mask pixel nearest tip_final (see "Nearest U pixel to
-    % tip_final as trace start" above), so distct(1) is already ~0 there;
-    % distct is monotonically non-decreasing by construction, so its own
-    % minimum (index 1) is always the correct, tip-anchored start -- no
-    % search or trim needed.
-    distc_t = pdist2(tip_final(count,:), Qef);
+    % cut stays 1: the traced path already starts at the mask pixel nearest tip_final.
     cut = 1;
     xc = xct(cut:end); yc = yct(cut:end); distc = distct(cut:end);
 
@@ -2501,196 +2484,13 @@ for count = smp:-1:stp
         U_render = reconstruct_smooth_mask(U, boundb, xc, yc, dx, dy, distc, t1_all, t2_all, diamo, postotal1, postotal2);
     end
 
-    % Cutoff the tip
-    [tmp, distpos, tmp] = intersect(distc,distcf);
-    distctf = [distct(1:cut-1); distc(distpos)]; xctf = [xct(1:cut-1); xc(distpos)]; yctf = [yct(1:cut-1); yc(distpos)]; 
-    linectf = [yctf xctf];
-
     if (ROItype > 0)
-        Esize = size(U);
-        % Find ROI from centerline distance using percentages or distance
-        % tip_excl_dist: total1/total2 always exclude boundary points within
-        % diamo*0.75 px of tip_final (see postotal1/postotal2 above), so the
-        % ROI side-curves always fall short of the tip by that radius. The
-        % stitch (boundb(...postotal...)) is the only thing that closes that
-        % gap, so it must fire whenever starti requests a start point inside
-        % that always-excluded region — not merely when distc_t (an
-        % unrelated tip-to-Qef distance) happens to exceed starti.
-        if (pixelsize == 0)
-            percent = (100*distctf)./(distctf(end));
-            start_length = abs(percent - starti); [tmp startpos] = min(start_length);
-            stop_length = abs(percent - stopi); [tmp stoppos] = min(stop_length);
-            distc_t = (100*distc_t)/max(distctf);
-            tip_excl_dist = (100*diamo*0.75)/max(distctf);
-        else
-            start_length = abs(distctf*pixelsize - starti); [tmp startpos] = min(start_length);
-            stop_length = abs(distctf*pixelsize - stopi); [tmp stoppos] = min(stop_length);
-            distc_t = distc_t*pixelsize;
-            tip_excl_dist = diamo*0.75*pixelsize;
-        end
-        
-        % Project ROI length onto the side curves.
-        % Map the target physical distances (starti, stopi in µm) directly
-        % onto the DENSE 100-pt centerline (distc in px / xc,yc) by
-        % converting to pixels and finding the nearest-neighbour index.
-        % This avoids distctf(startpos/stoppos) which can be wrong for
-        % S-curved tubes where line_continuity leaves large gaps in distctf.
-        if pixelsize > 0
-            arc_start_px = starti / pixelsize;
-            arc_stop_px  = min(stopi / pixelsize, distc(end));
-        else
-            arc_start_px = starti / 100 * distc(end);
-            arc_stop_px  = stopi  / 100 * distc(end);
-        end
-        [~, k_start] = min(abs(distc - arc_start_px));
-        [~, k_stop]  = min(abs(distc - arc_stop_px));
-        k_start = max(1, min(k_start, length(xc)));
-        k_stop  = max(1, min(k_stop,  length(xc)));
-
-        % ROI start/stop boundary points, via the same construction as the
-        % diameter cross-section search (see roi_boundary_crossing) instead
-        % of closest_bound.m's own separate, cruder tangent estimate.
-        % k_start's crossing search is anchored tip-side (see
-        % nearest_crossing_to_sample's tip_anchor doc) -- k_stop is an
-        % interior crossing with no such prior, so it keeps the default
-        % Euclidean anchor. Constrained to land past k_start's own crossing
-        % on each side (min_arclen) -- see nearest_crossing_to_sample's
-        % min_arclen doc for the hairpin-collapse this guards against.
-        % Local, tip-anchored wall arcs (2026-09-30, HV209_116 F512 root-
-        % cause fix, v2): total1/total2 (built far above from a naive
-        % 50/50-by-INDEX bisection of the WHOLE boundary, patched by two
-        % independent rebalancing passes that can fight each other) are
-        % kept as-is for the general diameter-measurement cross-section
-        % search elsewhere in this script, which needs them spanning close
-        % to the whole tube -- but the ROI polygon only ever needs a short
-        % stretch near the tip (0 to stopi, here ~31px), and searching for
-        % ITS crossings within total1/total2 inherits their instability.
-        % v1 of this fix (walk boundb directly between total1/total2's own
-        % crossing indices) only fixed the OUTER polygon: when total1
-        % collapses to a handful of points (confirmed: F512's own mask is a
-        % hard 1px tip-position knife-edge, total1 14pts/total2 471pts),
-        % the crossing SEARCH itself still only had those few collapsed
-        % points to choose from, so the near-tip and far-end crossings
-        % landed on nearly the SAME point -- walking "directly" between two
-        % near-identical points just gave a near-empty arc instead of a
-        % huge one. Root cause is one level further up: total1/total2
-        % themselves. Fix: build a fresh, LOCAL wall pair for the ROI's own
-        % search, by walking boundb outward from the tip in each direction
-        % (excluding the same near-tip radius total1/total2 exclude) far
-        % enough to comfortably cover the ROI's own arc-length window --
-        % this can't collapse the way the global bisection does, since it's
-        % anchored at the tip and only asked to cover a short, fixed
-        % distance, never contended for by a rebalancing pass solving a
-        % DIFFERENT (far-end) problem on the other side of the tube.
-        max_local_arclen = arc_stop_px + 3*diamo;
-        tip_boundpos = dsearchn(boundb, tip_final(count,:));
-        % Direction convention: match whichever of +1/-1 heads toward
-        % total1's own first point, so Half1/Half2 keep the same physical-
-        % side meaning as before (needed for Ratio_Half2_Half1 etc. to stay
-        % interpretable run to run) even though the POINTS now come from a
-        % fresh local walk, not total1/total2 itself.
-        n_bb = size(boundb,1);
-        d_fwd = mod(postotal1(1) - tip_boundpos, n_bb);
-        d_bwd = mod(tip_boundpos - postotal1(1), n_bb);
-        if d_fwd <= d_bwd, dir1 = 1; else, dir1 = -1; end
-        dir2 = -dir1;
-        [wall1_pts, al1_local] = local_wall_walk(boundb, tip_boundpos, dir1, max_local_arclen, diamo*0.75, tip_final(count,:));
-        [wall2_pts, al2_local] = local_wall_walk(boundb, tip_boundpos, dir2, max_local_arclen, diamo*0.75, tip_final(count,:));
-
-        [startc1, startc2] = roi_boundary_crossing(k_start, xc, yc, dx, dy, wall1_pts, al1_local, wall2_pts, al2_local, crossing_window, true);
-        [stopc1,  stopc2]  = roi_boundary_crossing(k_stop,  xc, yc, dx, dy, wall1_pts, al1_local, wall2_pts, al2_local, crossing_window, false, al1_local(startc1), al2_local(startc2));
-        % wall1_pts/wall2_pts are built by walking monotonically outward
-        % from the tip, so arc-length only increases with index -- startc*
-        % (near arc-length 0) is always <= stopc* (near arc-length
-        % arc_stop_px), no direction ambiguity to resolve per side the way
-        % the old total1/total2-based ordered_range needed.
-        wall1_arc = wall1_pts(startc1:stopc1,:);
-        wall2_arc = wall2_pts(startc2:stopc2,:);
-        if debug_mode
-            fprintf('F%d: arcs %.1f->%.1f  k:%d->%d  c1:%d->%d  c2:%d->%d  al1:%.1f->%.1f  al2:%.1f->%.1f  n1=%d n2=%d\n', ...
-                count,arc_start_px,arc_stop_px,k_start,k_stop,startc1,stopc1,startc2,stopc2, ...
-                al1_local(startc1),al1_local(stopc1),al2_local(startc2),al2_local(stopc2),numel(al1_local),numel(al2_local));
-        end
-
-        % tip_boundpos/tip_end1/tip_end2/cap_pts: computed once, up front,
-        % and reused for BOTH the outer F polygon just below and the
-        % roi1/roi2 stitch further down (see cap_boundary_arc/tip_cap_stitch).
-        % The outer
-        % polygon used to patch its own tip-ward gap with the raw
-        % boundb(postotal2(1):postotal1(2),:) range instead -- the same
-        % range the roi1/roi2 fix below already identified as wrong
-        % (postotal1(2)/postotal2(1) are just the first elements past an
-        % unrelated bisection point, not anchored to the tip at all). Since
-        % F1/F2 = F .* roi1/roi2, a wrong/mismatched patch on the OUTER F
-        % silently clips roi1/roi2 regardless of how correct they are --
-        % confirmed on HV209_116 frame 1: F1/F2 still showed a notched,
-        % disconnected edge after fixing roi1/roi2's own stitch, because F
-        % itself was still cut along the old wrong range.
-        if (starti < tip_excl_dist)
-            tip_boundpos = dsearchn(boundb, tip_final(count,:));
-            [~, near1] = min(abs(postotal1 - tip_boundpos)); tip_end1 = postotal1(near1);
-            [~, near2] = min(abs(postotal2 - tip_boundpos)); tip_end2 = postotal2(near2);
-            [cap_pts, end1_at_start] = cap_boundary_arc(boundb, tip_boundpos, tip_end1, tip_end2);
-        end
-
-        % Create masks for rectangles and circles, and include whether they are
-        % normal, split or stationary
         if (ROItype ~= 2 | count == smp)
-            if (circle == 0)
-                roi = vertcat(wall1_arc, flip(wall2_arc));
-                if (starti < tip_excl_dist) roi = vertcat(cap_pts,roi); end
-                F = poly2mask(roi(:,2),roi(:,1),Esize(1),Esize(2));
-            else
-                mask = zeros(Esize(1),Esize(2));
-                roi = [linectf(stoppos,1) linectf(stoppos,2)];
-                mask(roi(1),roi(2)) = 1;
-                F = bwdist(mask) >= 0.5*circle.*diamo;
-                F = imcomplement(F);
-            end
-
-            if (split == 1)
-                if (circle > 0)
-                    stoppos = length(linectf); stopc1 = length(total1); stopc2 = length(total2);
-                end
-                roi1 = vertcat(wall1_arc, [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
-                roi2 = vertcat(wall2_arc, [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
-                if (starti < tip_excl_dist)
-                    % Stitch from the boundary point actually nearest the tip
-                    % (tip_boundpos) to whichever element of postotal1/postotal2
-                    % is actually closest to it BY BOUNDB INDEX -- not
-                    % postotal1(2)/postotal2(1), which are just the first
-                    % elements past an arbitrary bisection point
-                    % (ceil(length(boundb)*0.5)) used only to split boundb into
-                    % range1/range2 for the postotal1/postotal2 scan, unrelated
-                    % to where the tip is. The two USUALLY sit close together
-                    % (boundb's own start point often lands near the tip by
-                    % convention), but not always -- confirmed on real data
-                    % (HV207_24_left frame 1134-adjacent frames): when they
-                    % don't, boundb(tip_boundpos:postotal1(2),:) walks a huge,
-                    % wrong stretch of the boundary (270+ points instead of the
-                    % ~20-point true tip cap) instead of erroring, so the old
-                    % "usually close" assumption fails silently, not loudly.
-                    % Verified on HV197_4_19 frames 2000-2043: valid frames went
-                    % from 42/44 to 44/44 after the tip_boundpos change (kept);
-                    % this closes the remaining gap in what it was anchored to.
-                    % cap_pts/end1_at_start already computed above, up front
-                    % (shared with the outer F polygon's own patch).
-                    [stitch1, stitch2] = tip_cap_stitch(cap_pts, end1_at_start, xc, yc, dx, dy);
-                    roi1 = vertcat(stitch1,roi1,boundb(tip_boundpos,:));
-                    roi2 = vertcat(stitch2,roi2,boundb(tip_boundpos,:));
-                end
-                F1 = F.*poly2mask(roi1(:,2),roi1(:,1),Esize(1),Esize(2));
-                F2 = F.*poly2mask(roi2(:,2),roi2(:,1),Esize(1),Esize(2));
-                % (2026-09-30: an earlier result-level fallback here --
-                % detect an implausibly large F1/F2 and reclassify by side-
-                % of-centerline -- is superseded by wall1_arc/wall2_arc
-                % above fixing the actual root cause, and was removed.)
-                if debug_mode
-                    roi_gap_px = min(pdist2(tip_final(count,:), vertcat(roi1,roi2)));
-                    distc_t_unit = 'pct'; if (pixelsize > 0), distc_t_unit = 'um'; end
-                    fprintf('  roi F%d: tip_final-to-ROI gap=%.1fpx (stitch_fired=%d, distc_t=%.2f%s, tip_excl_dist=%.2f%s)\n', ...
-                        count, roi_gap_px, starti < tip_excl_dist, distc_t, distc_t_unit, tip_excl_dist, distc_t_unit);
-                end
+            [F, F1, F2, roi_info] = build_roi_masks(U, boundb, xc, yc, dx, dy, distc, starti, stopi, pixelsize, split, circle, diamo);
+            if debug_mode
+                fprintf('  roi F%d: anchor=[%.1f %.1f] ext=%.1fpx tip_to_anchor=%.1fpx far=[%.1f %.1f] s_stop=%.1fpx far1=[%d %d] far2=[%d %d] arc1=%d arc2=%d F=%d F1=%d F2=%d\n', ...
+                    count, roi_info.anchor, roi_info.ext, pdist2(tip_final(count,:), roi_info.anchor), roi_info.c_far, roi_info.s_stop, ...
+                    roi_info.far1, roi_info.far2, roi_info.n_arc1, roi_info.n_arc2, nnz(F), nnz(F1), nnz(F2));
             end
         end
     
@@ -3875,207 +3675,123 @@ end
 idx = cand(rel);
 end
 
-function [c1, c2] = roi_boundary_crossing(pos, xc, yc, dx, dy, total1, al1, total2, al2, window, tip_anchor, min_al1, min_al2)
-% tip_anchor (optional, default false): passed straight through to
-% nearest_crossing_to_sample -- see its own doc for why the tip-ward
-% (k_start) call needs this and the interior (k_stop) one doesn't.
-% min_al1/min_al2 (optional, default -Inf i.e. unconstrained): passed
-% straight through as nearest_crossing_to_sample's min_arclen -- pass
-% al1(startc1)/al2(startc2) for the k_stop call so its crossing can never
-% land at or before the already-found start crossing on the same side. See
-% nearest_crossing_to_sample's own min_arclen doc for the failure this
-% guards (HV209_116 frame 494).
-if nargin < 11, tip_anchor = false; end
-% Off-by-one fix (2026-10-01, HV204_1 F4240): min_al1 is parameter 12 and
-% min_al2 is parameter 13, but these checked nargin<13/nargin<14 -- for
-% min_al2 specifically (the LAST parameter), nargin can never reach 14, so
-% "nargin<14 || isempty(min_al2)" was unconditionally TRUE on every call,
-% silently wiping the caller's min_al2 to -Inf regardless of what was
-% passed. This is the min_arclen safety constraint that's supposed to stop
-% the k_stop crossing search from ever landing at or before the already-
-% found k_start crossing on the same side (the hairpin-collapse guard
-% documented above, and in nearest_crossing_to_sample's own doc) -- it was
-% silently inert for side2 on every call in this codebase's history, not
-% just the new local_wall_walk callers. Confirmed on HV204_1 F4240: with
-% the guard actually active, side2's k_stop crossing moves from index 1
-% (al2=0, wrongly re-landing on the near-tip point) to a proper index with
-% al2=3.4, clearing the ROI collapse (23px -> normal range).
-if nargin < 12 || isempty(min_al1), min_al1 = -Inf; end
-if nargin < 13 || isempty(min_al2), min_al2 = -Inf; end
-% Finds where a "diameter line" at centerline sample `pos` crosses each
-% side -- literally the same construction the per-sample diameter
-% cross-section search uses (this file's own reverse-pass loop), just
-% evaluated at one specific position instead of every sample. Used for the
-% ROI's start/stop boundary (at arc-length starti/stopi from the tip),
-% which used to go through closest_bound.m instead.
-%
-% The point of doing it THIS way rather than calling closest_bound.m:
-% dx/dy here are gradient(xc)/gradient(yc), a CENTERED difference computed
-% once over the whole centerline (averaging both neighbours) -- the same
-% tangent estimate already proven out for the diameter measurement.
-% closest_bound.m instead recomputed its own tangent from scratch at just
-% the one query position, using a one-sided difference (only the point
-% ahead, or only the point behind -- never both). Confirmed on real data
-% (HV207_58): after fixing closest_bound.m's crossing SEARCH (restricting
-% to genuine local minima, tie-broken by distance), several frames still
-% showed a stable, repeatable "not quite perpendicular" ROI cut, with
-% start/stop indices barely different from before the fix -- i.e. the
-% search was already finding the right answer for the line it was given,
-% the line itself was pointing slightly the wrong way. A one-sided
-% difference is exactly the kind of estimate that produces a consistent
-% bias at a specific index rather than random noise, which matches what
-% was observed (stable across frames, not flickering). Reusing the
-% already-centered dx/dy removes that discrepancy entirely instead of
-% patching around it.
-nfitc = fit(vertcat(xc(pos),(xc(pos) - dy(pos))),vertcat(yc(pos),(yc(pos) + dx(pos))),'poly1');
-sample_pt = [yc(pos), xc(pos)];
-edge1 = total1(:,1) - nfitc.p1.*total1(:,2) - nfitc.p2;
-c1 = nearest_crossing_to_sample(edge1, total1, al1, sample_pt, window, tip_anchor, min_al1);
-edge2 = total2(:,1) - nfitc.p1.*total2(:,2) - nfitc.p2;
-c2 = nearest_crossing_to_sample(edge2, total2, al2, sample_pt, window, tip_anchor, min_al2);
-end
+function [F, F1, F2, info] = build_roi_masks(U, boundb, xc, yc, dx, dy, distc, starti, stopi, pixelsize, split, circle, diamo)
+% ROI from four points: the anchor (centerline continued tip-ward to the mask edge), the centerline
+% point stopi beyond it, and where that point's perpendicular (same dx/dy as the diameter) leaves the mask.
+Esize = size(U);
+Uf = imfill(logical(U), 'holes');
+nb = size(boundb, 1);
+xc = double(xc(:)); yc = double(yc(:)); dx = double(dx(:)); dy = double(dy(:));
+s_cl = double(distc(:)) - double(distc(1));
 
-function [cap_pts, end1_at_start] = cap_boundary_arc(boundb, tip_boundpos, tip_end1, tip_end2)
-% Extracts the near-tip boundary arc bounded by tip_end1/tip_end2 (with
-% tip_boundpos always inside it) -- the tube's true rounded/blunt tip cap,
-% excluded from total1/total2 by the diamo*0.75 tip-exclusion radius.
-% boundb is a CLOSED loop, so the arc between two indices can be walked
-% two ways; picks whichever of boundb(cap_lo:cap_hi,:) or its wrap-around
-% complement boundb([cap_hi:end,1:cap_lo],:) is SHORTER. A plain
-% boundb(cap_lo:cap_hi,:) silently picks the wrong (long) one whenever
-% tip_boundpos/tip_end1/tip_end2 straddle boundb's own index-1/end seam --
-% which happens whenever the tip actually used for tip_final(count,:) (the
-% post-voting/post-jump-recovery decision) drifts away from the internal
-% ellipse-fit tip that locate_tip.m centered boundb on. Confirmed on
-% HV203_4_21 (a zigzag-tube dataset, threshold_method=triangle): the near-
-% tip gap should only span ~1.5*diamo (~20-30px), but the raw index slice
-% was instead pulling in 100+ points -- visible as a ballooned, rounded
-% "blob" ROI cap in growth.mp4 instead of the tube's true tapered tip, and
-% as a degenerate (occasionally empty) roi1/roi2 downstream. The true
-% near-tip arc is never more than a few tube-widths, i.e. always much
-% shorter than half of boundb, so "shorter of the two arcs" is a safe,
-% general disambiguator -- no dataset-specific threshold needed.
-%
-% end1_at_start: true if cap_pts(1,:) is the tip_end1 side, so callers can
-% tell the two ends apart without relying on cap_lo/cap_hi identity (which
-% the wrap-around case inverts).
-L = size(boundb, 1);
-cap_lo = min([tip_boundpos, tip_end1, tip_end2]);
-cap_hi = max([tip_boundpos, tip_end1, tip_end2]);
-if (cap_hi - cap_lo) <= L - (cap_hi - cap_lo)
-    cap_pts = boundb(cap_lo:cap_hi, :);
-    end1_at_start = (tip_end1 == cap_lo);
+% Tip-ward direction over ~half a diameter: one subsampled, rounded centerline step is too coarse.
+kb = find(s_cl >= min(diamo/2, s_cl(end)), 1);
+if isempty(kb) || kb == 1
+    t_tip = -[dy(1), dx(1)];
 else
-    cap_pts = boundb([cap_hi:L, 1:cap_lo], :);
-    end1_at_start = (tip_end1 == cap_hi);
+    t_tip = [yc(1) - yc(kb), xc(1) - xc(kb)];
 end
-end
+t_tip = t_tip / norm(t_tip);
+c_start = [yc(1), xc(1)];
+anchor = march_to_edge(Uf, c_start, t_tip);
+ext = norm(anchor - c_start);
+i0 = dsearchn(boundb, anchor);
+s_cl = s_cl + ext; % arc-length from the anchor
+s_max = s_cl(end);
 
-function [stitch1, stitch2] = tip_cap_stitch(cap_pts, end1_at_start, xc, yc, dx, dy)
-% Splits the near-tip boundary arc (see cap_boundary_arc, which supplies
-% cap_pts/end1_at_start) by which side of the tube's own local axis each
-% point falls on, using the tip-most centerline tangent
-% (xc(1)/yc(1)/dx(1)/dy(1)) -- NOT by raw boundb index order split at the
-% single point tip_boundpos (the previous approach), which only produces
-% an even split when tip_boundpos happens to sit exactly at the cap's
-% true bilateral center. For a wide/blunt tip (e.g. flattened against a
-% wall), a small offset there sends most of the round cap's arc to one
-% side, badly skewing Half1/Half2 signal comparisons even though the tip
-% position itself is fine and nothing else about the frame looks wrong.
-% Confirmed on HV209_116 frame 832 (a wall-flattened tip): the old split
-% put nearly the whole cap on one side, visibly non-perpendicular to the
-% traced centerline in growth.mp4/roi_debug.avi.
-%
-% IMPORTANT: cap_pts is filtered by side as a single CONTIGUOUS run per
-% side, not a per-point boolean split -- boundb is a pixelated, staircase
-% digital contour, so the raw cross-product sign can flip back and forth
-% for a few points right around the true crossing instead of changing
-% exactly once. A per-point filter (side>=0 / side<0) fragments those
-% flickers into multiple separate runs, which poly2mask then renders as a
-% notched, disconnected ROI edge that doesn't follow the tube outline at
-% all -- confirmed on HV209_116 frame 1 after the first version of this
-% fix. Finding the single point closest to the dividing axis and splitting
-% the already-ordered cap_pts there instead keeps each side one genuine
-% contiguous arc, like the boundb-index split this replaces did.
-Tx = dx(1); Ty = dy(1); Cx = xc(1); Cy = yc(1); % tip-ward tangent + tip point, (col,row)
-side = Ty.*(cap_pts(:,2)-Cx) - Tx.*(cap_pts(:,1)-Cy); % cross(T, P-C): which side of the tube's axis
-[~, split_idx] = min(abs(side)); % single contiguous split, closest point to the axis
-part_a = cap_pts(1:split_idx, :);
-part_b = cap_pts(split_idx+1:end, :);
-
-if end1_at_start
-    stitch1 = part_a; stitch2 = part_b;
+if pixelsize > 0
+    s_start = starti / pixelsize; s_stop = stopi / pixelsize;
 else
-    stitch1 = part_b; stitch2 = part_a;
+    s_start = starti / 100 * s_max; s_stop = stopi / 100 * s_max;
 end
-end
-
-function r = ordered_range(a, b)
-% Builds an index range from a to b, ascending or descending as needed --
-% used instead of a plain `a:b` wherever a and b are two INDEPENDENTLY
-% meaningful crossing indices (e.g. startc1 = side1's crossing of the
-% k_start line, stopc1 = side1's crossing of the k_stop line) that must
-% keep their identity rather than being reordered by numeric value.
-%
-% An earlier version of this code instead swapped startc1<->stopc1 (and
-% separately startc2<->stopc2) whenever the pair came out numerically
-% backwards, to guarantee a valid ascending slice. That silently breaks
-% the correspondence between "this side's crossing of the k_start line"
-% and "...of the k_stop line" whenever side1 and side2 happen to be
-% indexed in OPPOSITE directions along the boundary for a given frame --
-% which they can be, independently, since total1/total2 are each traced
-% from the mask's own boundary-following order with no guaranteed
-% relationship to the centerline's own direction. Confirmed on real data
-% (HV207_58 frame 940, a tube with a sharp ~90deg hook near the tip):
-% side1 needed no swap (already ascending) but side2 did, so after
-% independent swapping "stopc2" ended up holding side2's crossing of the
-% k_START line while "stopc1" still correctly held side1's crossing of
-% the k_STOP line -- total1(stopc1) and total2(stopc2) were then each on
-% a DIFFERENT fitted line, nowhere near collinear with the actual k_stop
-% centerline point (perpendicular distance up to ~9px in that frame,
-% instead of ~0). Fix: never swap which line a crossing belongs to --
-% just walk each side's own index range in whichever direction its own
-% start/stop crossing indices imply, independently per side.
-if a <= b, r = a:b; else, r = a:-1:b; end
+s_stop = min(max(s_stop, 0), s_max);
+s_start = min(max(s_start, 0), s_stop);
+if circle > 0
+    r_disk = 0.5 * circle * diamo;
+    s_hi = min(s_stop + r_disk + 2, s_max); % halves must reach past the whole disk
+    s_lo = 0;
+else
+    s_hi = s_stop; s_lo = s_start;
 end
 
-function [side_pts, side_arclen] = local_wall_walk(boundb, tip_boundpos, direction, max_arclen, excl_radius, tip_pt)
-% Walks boundb (a closed loop of boundary points, indexed 1..n) outward
-% from tip_boundpos in the given direction (+1 or -1, wrapping), building
-% a fresh, LOCAL wall segment for the ROI's own near-tip crossing search
-% -- see the caller's own doc (HV209_116 F512 root-cause fix, v2) for why
-% this replaced slicing into total1/total2 (built from a naive, far-away
-% bisection of the WHOLE boundary that can collapse near the tip on some
-% frames, corrupting the crossing search itself, not just how the result
-% got walked). Skips the initial stretch within excl_radius of the tip
-% (matching total1/total2's own near-tip exclusion), then accumulates
-% points and their cumulative arc-length (from the first INCLUDED point)
-% until max_arclen is exceeded -- anchored at the tip and asked to cover
-% only a short, fixed distance, so it can't be starved by a DIFFERENT
-% rebalancing problem on the other side of the tube the way total1/total2
-% can.
-n = size(boundb, 1);
-side_pts = zeros(0,2); side_arclen = zeros(0,1);
-idx = tip_boundpos;
-prev_pt = [];
-cum = 0;
-for step = 1:n
-    idx = mod(idx - 1 + direction, n) + 1;
-    pt = boundb(idx,:);
-    if pdist2(pt, tip_pt) <= excl_radius
-        continue;
-    end
-    if isempty(prev_pt)
-        cum = 0;
+[c_far, pa, pb] = roi_cross_section(Uf, s_hi, s_cl, xc, yc, dx, dy, anchor);
+ia = dsearchn(boundb, pa); ib = dsearchn(boundb, pb);
+% Side 1 = boundb walked +1 from the tip: locate_tip centers boundb on the tip and total1 is the half after it.
+if mod(ia - i0, nb) <= mod(ib - i0, nb), if1 = ia; if2 = ib; else, if1 = ib; if2 = ia; end
+if s_lo > 0
+    [c_near, pa, pb] = roi_cross_section(Uf, s_lo, s_cl, xc, yc, dx, dy, anchor);
+    ia = dsearchn(boundb, pa); ib = dsearchn(boundb, pb);
+    if mod(ia - i0, nb) <= mod(ib - i0, nb), in1 = ia; in2 = ib; else, in1 = ib; in2 = ia; end
+    if mod(in1 - i0, nb) > mod(if1 - i0, nb), in1 = if1; end % near crossing snapped past the far one (inner wall of a bend)
+    if mod(i0 - in2, nb) > mod(i0 - if2, nb), in2 = if2; end
+else
+    c_near = anchor; in1 = i0; in2 = i0;
+end
+arc1 = boundb(boundary_walk(in1, if1, 1, nb), :);
+arc2 = boundb(boundary_walk(in2, if2, -1, nb), :);
+
+if circle == 0
+    outer = vertcat(arc1, flipud(arc2));
+    F = poly2mask(outer(:,2), outer(:,1), Esize(1), Esize(2));
+    c_stop = c_far;
+else
+    c_stop = roi_cross_section(Uf, s_stop, s_cl, xc, yc, dx, dy, anchor);
+    [cc, rr] = meshgrid(1:Esize(2), 1:Esize(1));
+    F = hypot(rr - c_stop(1), cc - c_stop(2)) < r_disk;
+end
+
+F1 = zeros(Esize); F2 = zeros(Esize);
+if split == 1
+    kin = find(s_cl > s_lo & s_cl < s_hi);
+    cl_back = vertcat(c_far, [yc(flipud(kin)), xc(flipud(kin))], c_near);
+    roi1 = vertcat(arc1, cl_back);
+    roi2 = vertcat(arc2, cl_back);
+    F1 = F .* poly2mask(roi1(:,2), roi1(:,1), Esize(1), Esize(2));
+    F2 = F .* poly2mask(roi2(:,2), roi2(:,1), Esize(1), Esize(2));
+end
+
+info = struct('anchor', anchor, 'ext', ext, 'c_far', c_stop, 's_stop', s_stop, ...
+    'far1', boundb(if1,:), 'far2', boundb(if2,:), 'n_arc1', size(arc1,1), 'n_arc2', size(arc2,1));
+end
+
+function [c, p_plus, p_minus] = roi_cross_section(Uf, s, s_cl, xc, yc, dx, dy, anchor)
+% Centerline point at arc-length s from the anchor, and where its perpendicular leaves the mask on each side.
+if s <= s_cl(1)
+    w = 0; if s_cl(1) > 0, w = s / s_cl(1); end
+    c = anchor + w * ([yc(1), xc(1)] - anchor);
+    tx = dx(1); ty = dy(1);
+else
+    k = find(s_cl <= s, 1, 'last');
+    if k == numel(s_cl)
+        c = [yc(k), xc(k)]; tx = dx(k); ty = dy(k);
     else
-        cum = cum + pdist2(pt, prev_pt);
-    end
-    prev_pt = pt;
-    side_pts(end+1,:) = pt; side_arclen(end+1,1) = cum;
-    if cum > max_arclen
-        break;
+        w = 0; if s_cl(k+1) > s_cl(k), w = (s - s_cl(k)) / (s_cl(k+1) - s_cl(k)); end
+        c = [yc(k) + w*(yc(k+1)-yc(k)), xc(k) + w*(xc(k+1)-xc(k))];
+        tx = dx(k) + w*(dx(k+1)-dx(k)); ty = dy(k) + w*(dy(k+1)-dy(k));
     end
 end
+nrm = [tx, -ty] / hypot(tx, ty);
+p_plus = march_to_edge(Uf, c, nrm);
+p_minus = march_to_edge(Uf, c, -nrm);
+end
+
+function p_edge = march_to_edge(Uf, p0, v)
+% Last in-mask point stepping from p0 along unit v ([row col]): the first exit, never a farther crossing.
+step = 0.25;
+p_edge = p0;
+for i = 1:ceil(hypot(size(Uf,1), size(Uf,2)) / step)
+    p = p0 + i*step*v;
+    r = round(p(1)); c = round(p(2));
+    if r < 1 || c < 1 || r > size(Uf,1) || c > size(Uf,2) || ~Uf(r,c)
+        return;
+    end
+    p_edge = p;
+end
+end
+
+function idx = boundary_walk(i_from, i_to, direction, nb)
+% boundb indices from i_from to i_to (inclusive), stepping `direction` (+1/-1) around the closed loop.
+idx = mod((i_from - 1) + direction * (0:mod(direction*(i_to - i_from), nb))', nb) + 1;
 end
 
 function w = fwhm_cross_section(O_raw, row0, col0, dx_n, dy_n, max_radius)
@@ -5006,11 +4722,6 @@ if nargin < 23, forced_tip = []; end % jitter-zone smoothing: use this tip (snap
     xct = round(sgolayfilt(double(xct),3,15)); yct = round(sgolayfilt(double(yct),3,15));
     xct = max(1, min(xct, size(U,2))); yct = max(1, min(yct, size(U,1)));
 
-    % See the reverse pass's own copy of this block for why cut is fixed
-    % at 1 (the path's own start, already ~tip_row) instead of searching
-    % for a match to distc_t (the tip-to-Qef seed gap, a QC number
-    % unrelated to where arc-length should start).
-    distc_t = pdist2(tip_row, Qef);
     cut = 1;
     xc = xct(cut:end); yc = yct(cut:end); distc = distct(cut:end);
 
@@ -5063,102 +4774,8 @@ if nargin < 23, forced_tip = []; end % jitter-zone smoothing: use this tip (snap
     % separate gate needed here.
     U_smooth_out = reconstruct_smooth_mask(U, boundb, xc, yc, dx, dy, distc, t1_all, t2_all, diamo, postotal1, postotal2);
 
-    [tmp, distpos, tmp] = intersect(distc,distcf);
-    distctf = [distct(1:cut-1); distc(distpos)]; xctf = [xct(1:cut-1); xc(distpos)]; yctf = [yct(1:cut-1); yc(distpos)];
-    linectf = [yctf xctf];
-
     if (ROItype > 0) && (ROItype ~= 2)
-        Esize = size(U);
-        if (pixelsize == 0)
-            percent = (100*distctf)./(distctf(end));
-            stop_length = abs(percent - stopi); [tmp, stoppos] = min(stop_length);
-            distc_t = (100*distc_t)/max(distctf);
-            tip_excl_dist = (100*diamo*0.75)/max(distctf);
-        else
-            stop_length = abs(distctf*pixelsize - stopi); [tmp, stoppos] = min(stop_length);
-            distc_t = distc_t*pixelsize;
-            tip_excl_dist = diamo*0.75*pixelsize;
-        end
-
-        if pixelsize > 0
-            arc_start_px = starti / pixelsize;
-            arc_stop_px  = min(stopi / pixelsize, distc(end));
-        else
-            arc_start_px = starti / 100 * distc(end);
-            arc_stop_px  = stopi  / 100 * distc(end);
-        end
-        [~, k_start] = min(abs(distc - arc_start_px));
-        [~, k_stop]  = min(abs(distc - arc_stop_px));
-        k_start = max(1, min(k_start, length(xc)));
-        k_stop  = max(1, min(k_stop,  length(xc)));
-
-        % See the reverse pass's own copy of this block for why this uses
-        % roi_boundary_crossing (the diameter-line construction) instead of
-        % closest_bound.m.
-        % k_start's crossing search is anchored tip-side (see
-        % nearest_crossing_to_sample's tip_anchor doc) -- k_stop is an
-        % interior crossing with no such prior, so it keeps the default
-        % Euclidean anchor. Constrained to land past k_start's own crossing
-        % on each side (min_arclen) -- see nearest_crossing_to_sample's
-        % min_arclen doc for the hairpin-collapse this guards against.
-        % Local, tip-anchored wall arcs -- see the reverse pass's own copy
-        % of this block for the full doc (HV209_116 F512 root-cause fix, v2).
-        max_local_arclen = arc_stop_px + 3*diamo;
-        tip_boundpos = dsearchn(boundb, tip_row);
-        n_bb = size(boundb,1);
-        d_fwd = mod(postotal1(1) - tip_boundpos, n_bb);
-        d_bwd = mod(tip_boundpos - postotal1(1), n_bb);
-        if d_fwd <= d_bwd, dir1 = 1; else, dir1 = -1; end
-        dir2 = -dir1;
-        [wall1_pts, al1_local] = local_wall_walk(boundb, tip_boundpos, dir1, max_local_arclen, diamo*0.75, tip_row);
-        [wall2_pts, al2_local] = local_wall_walk(boundb, tip_boundpos, dir2, max_local_arclen, diamo*0.75, tip_row);
-
-        [startc1, startc2] = roi_boundary_crossing(k_start, xc, yc, dx, dy, wall1_pts, al1_local, wall2_pts, al2_local, crossing_window, true);
-        [stopc1,  stopc2]  = roi_boundary_crossing(k_stop,  xc, yc, dx, dy, wall1_pts, al1_local, wall2_pts, al2_local, crossing_window, false, al1_local(startc1), al2_local(startc2));
-        wall1_arc = wall1_pts(startc1:stopc1,:);
-        wall2_arc = wall2_pts(startc2:stopc2,:);
-
-        % See the reverse pass's own copy of this block for why this is
-        % computed once, up front, and reused for both the outer F polygon
-        % just below and the roi1/roi2 stitch further down.
-        if (starti < tip_excl_dist)
-            tip_boundpos = dsearchn(boundb, tip_row);
-            [~, near1] = min(abs(postotal1 - tip_boundpos)); tip_end1 = postotal1(near1);
-            [~, near2] = min(abs(postotal2 - tip_boundpos)); tip_end2 = postotal2(near2);
-            [cap_pts, end1_at_start] = cap_boundary_arc(boundb, tip_boundpos, tip_end1, tip_end2);
-        end
-
-        if (circle == 0)
-            roi = vertcat(wall1_arc, flip(wall2_arc));
-            if (starti < tip_excl_dist), roi = vertcat(cap_pts,roi); end
-            F = poly2mask(roi(:,2),roi(:,1),Esize(1),Esize(2));
-        else
-            maskc = zeros(Esize(1),Esize(2));
-            roi = [linectf(stoppos,1) linectf(stoppos,2)];
-            maskc(roi(1),roi(2)) = 1;
-            F = bwdist(maskc) >= 0.5*circle.*diamo;
-            F = imcomplement(F);
-        end
-
-        if (split == 1)
-            if (circle > 0)
-                stoppos = length(linectf); stopc1 = length(total1); stopc2 = length(total2);
-            end
-            roi1 = vertcat(wall1_arc, [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
-            roi2 = vertcat(wall2_arc, [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
-            if (starti < tip_excl_dist)
-                % cap_pts/end1_at_start already computed above, up front
-                % (shared with the outer F polygon's own patch).
-                [stitch1, stitch2] = tip_cap_stitch(cap_pts, end1_at_start, xc, yc, dx, dy);
-                roi1 = vertcat(stitch1,roi1,boundb(tip_boundpos,:));
-                roi2 = vertcat(stitch2,roi2,boundb(tip_boundpos,:));
-            end
-            F1 = F.*poly2mask(roi1(:,2),roi1(:,1),Esize(1),Esize(2));
-            F2 = F.*poly2mask(roi2(:,2),roi2(:,1),Esize(1),Esize(2));
-            % (2026-09-30: the result-level fallback formerly here is
-            % superseded by wall1_arc/wall2_arc above fixing the actual
-            % root cause -- see the reverse pass's own copy of this block.)
-        end
+        [F, F1, F2] = build_roi_masks(U, boundb, xc, yc, dx, dy, distc, starti, stopi, pixelsize, split, circle, diamo);
 
         if (max(O(:)) <= 255) FO = uint8(F);
         else FO = uint16(F);
