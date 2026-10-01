@@ -3886,8 +3886,22 @@ function [c1, c2] = roi_boundary_crossing(pos, xc, yc, dx, dy, total1, al1, tota
 % nearest_crossing_to_sample's own min_arclen doc for the failure this
 % guards (HV209_116 frame 494).
 if nargin < 11, tip_anchor = false; end
-if nargin < 13 || isempty(min_al1), min_al1 = -Inf; end
-if nargin < 14 || isempty(min_al2), min_al2 = -Inf; end
+% Off-by-one fix (2026-10-01, HV204_1 F4240): min_al1 is parameter 12 and
+% min_al2 is parameter 13, but these checked nargin<13/nargin<14 -- for
+% min_al2 specifically (the LAST parameter), nargin can never reach 14, so
+% "nargin<14 || isempty(min_al2)" was unconditionally TRUE on every call,
+% silently wiping the caller's min_al2 to -Inf regardless of what was
+% passed. This is the min_arclen safety constraint that's supposed to stop
+% the k_stop crossing search from ever landing at or before the already-
+% found k_start crossing on the same side (the hairpin-collapse guard
+% documented above, and in nearest_crossing_to_sample's own doc) -- it was
+% silently inert for side2 on every call in this codebase's history, not
+% just the new local_wall_walk callers. Confirmed on HV204_1 F4240: with
+% the guard actually active, side2's k_stop crossing moves from index 1
+% (al2=0, wrongly re-landing on the near-tip point) to a proper index with
+% al2=3.4, clearing the ROI collapse (23px -> normal range).
+if nargin < 12 || isempty(min_al1), min_al1 = -Inf; end
+if nargin < 13 || isempty(min_al2), min_al2 = -Inf; end
 % Finds where a "diameter line" at centerline sample `pos` crosses each
 % side -- literally the same construction the per-sample diameter
 % cross-section search uses (this file's own reverse-pass loop), just
