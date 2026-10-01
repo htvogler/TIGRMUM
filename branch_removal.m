@@ -1,5 +1,19 @@
-function [Q2, Qe,Qarea] = branch_removal(Q,Qbf,Qel,angdiff,close_dist)
-
+function [Q2, Qe,Qarea] = branch_removal(Q,Qbf,Qel,angdiff,close_dist,side_info)
+% side_info (2026-09-30, optional, default [] = old behaviour): struct('c',...,'n',...,
+% 'side',...) -- the shank-axis guard's own axis (see side_memory_axis_find's doc near the
+% top of main_track_movies.m). The angle+area heuristic below picks which of (up to) 3
+% locally-competing skeleton arms at a branch point is the spurious one purely from local
+% orientation/size -- it has no notion of which side of the tube's own known axis is
+% correct, so at a genuine apical fork it can keep the WRONG arm whenever local conditions
+% (noise, a stub angled favourably) make the wrong one look like the "real" continuation.
+% When side_info is given and exactly one of the (up to) 3 local arms disagrees with it
+% while the angle-heuristic's current discard choice (Q3min) is NOT that arm (i.e. it would
+% keep the wrong-side arm and discard a correct-side one), the choice is overridden to
+% discard the disagreeing arm instead. Never fires when the side test is ambiguous (0 or 2+
+% of the arms disagree) or side_info wasn't provided, so it only acts on a genuine,
+% unambiguous mismatch -- see main_track_movies.m's doc near the top for why this matters
+% (prevents the tip jumping to the wrong side of the apical region).
+if nargin < 6, side_info = []; end
 Q2 = Q;
 Qbr = Qbf(:,1);
 Qbc = Qbf(:,2);
@@ -90,6 +104,25 @@ while(length(Qbr) > 0)
         [~, Q2_largest] = max(Q2area3);
         if Q3min == Q2_largest
             [~, Q3min] = min(Q2area3);
+        end
+
+        % Shank-axis side override (2026-09-30) -- see this function's own doc above.
+        if ~isempty(side_info)
+            n_arms = min(3, length(Q2stat));
+            arm_side = zeros(1, n_arms);
+            bpt = [Qbr(1), Qbc(1)];
+            for ai = 1:n_arms
+                pix = Q2stat(ai).PixelList; % [col row]
+                pix_rc = [pix(:,2), pix(:,1)];
+                [~, nearest_i] = min(sum((pix_rc - bpt).^2, 2));
+                rep_pt = pix_rc(nearest_i, :);
+                off = dot(rep_pt - side_info.c, side_info.n);
+                arm_side(ai) = sign(off);
+            end
+            disagree = find(arm_side ~= side_info.side);
+            if numel(disagree) == 1 && Q3min ~= disagree
+                Q3min = disagree;
+            end
         end
 
         if (angdiff > 0)

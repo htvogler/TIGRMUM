@@ -233,7 +233,8 @@ ellipse_off_count = 0; ellipse_off_frames = [];
 % upper one, 27-28 px from the previous tip, which also makes the skeleton pruning (close_dist) drop one foot end and with it `mid`.
 % With qef_by_continuity = 1 (only frames with a previous tip) Qef is instead the thin endpoint nearest to the previous tip, without the
 % endpoint with the largest column (the base). 0 = branch_removal's choice as before.
-if ~exist('qef_by_continuity', 'var'), qef_by_continuity = 0; end
+% Default flipped to ON (2026-09-30): validated across the guard_test comparison runs, kept on ever since.
+if ~exist('qef_by_continuity', 'var'), qef_by_continuity = 1; end
 if ~exist('ellipse_first_on_frames', 'var'), ellipse_first_on_frames = 3; end
 ellipse_first_streak = 0;
 % Jitter-zone smoothing (2026-09-25, default OFF): a pass at the END of the run, before the videos are written.
@@ -246,7 +247,8 @@ ellipse_first_streak = 0;
 % walked along the border so that it is never further than the border-drift limit (max_step_um) from the final
 % tip of the previous frame in analysis order.
 % NOT updated: the per-frame kymograph lines / arc length.
-if ~exist('jitter_smooth', 'var'), jitter_smooth = 0; end
+% Default flipped to ON (2026-09-30): validated across the guard_test comparison runs, kept on ever since.
+if ~exist('jitter_smooth', 'var'), jitter_smooth = 1; end
 if ~exist('jitter_smooth_window', 'var'), jitter_smooth_window = 7; end
 if ~exist('jitter_zone_move_px', 'var'), jitter_zone_move_px = 3; end
 if ~exist('jitter_zone_min_moves', 'var'), jitter_zone_min_moves = 3; end
@@ -1451,7 +1453,17 @@ for count = smp:-1:stp
             fprintf('  weight F%d: seed-to-branchpt=%.1fpx vs weight*diamo=%.1fpx (weight=%.2f) -> close_dist=%d\n', ...
                 count, pdist2(Qef,Sbf), weight*diamo, weight, close_dist);
         end
-        [S2,Sef,S2area] = branch_removal(S,Sbf,Sel,kill_angle,close_dist);
+        % Shank-axis side info for branch_removal's own pruning choice (2026-09-30, see
+        % branch_removal.m's doc): this is the axis carried over from the END of the
+        % PREVIOUS frame (side_ax_prev/side_sign are updated later in THIS frame's own
+        % processing, near the bottom of the loop, so they still hold last frame's values
+        % here) -- side_sign changes rarely (frozen once learned per axis-episode), so the
+        % previous frame's value is a reliable enough reference for this frame's own pruning.
+        branch_side_info = [];
+        if ~isempty(side_ax_prev) && side_sign ~= 0
+            branch_side_info = struct('c', side_ax_prev.c, 'n', side_ax_prev.n, 'side', side_sign, 'active', side_active);
+        end
+        [S2,Sef,S2area] = branch_removal(S,Sbf,Sel,kill_angle,close_dist,branch_side_info);
     end
 
     % If more than 2 branches, further evaluation is needed
@@ -1484,6 +1496,33 @@ for count = smp:-1:stp
             choice = skel_lastpos;
         else
             choice = skel_ellipsepos;
+        end
+        % Shank-axis side override on the 2-candidate choice (2026-09-30): nearest-to-
+        % previous-tip (above) is a pure local-attraction heuristic with no notion of which
+        % side of the tube's own known axis is correct, so at a genuine apical fork it picks
+        % whichever candidate conditions happen to favour, even if that's the wrong side. When
+        % side info is available, always prefer whichever of the two survivors is further
+        % toward the correct side (side_sign); if both already agree, prefer whichever is MORE
+        % on that side (the larger signed offset), not merely nearest the previous tip.
+        % Gated by branch_side_info.active (2026-09-30, HV209_116 jitter fix): this stack has
+        % exactly one real kink, but the override was firing on ~30% of ALL branch points across
+        % the whole tube -- everywhere else the "two candidates" are just sub-pixel branch-point
+        % noise a few px apart, not a real fork, and the distant axis has no business arbitrating
+        % them (confirmed at F1980: candidates 2px apart, axis fit far away, active=0). `active`
+        % is the same per-frame arming flag (side_memory_windowed/dc-based) the pre-existing
+        % candidate-vote guard already uses to restrict itself to genuine kink crossings -- see
+        % that guard's own doc a few hundred lines down. It carries no memory of past episodes
+        % (the old is_done history was removed entirely, bed3527) so gating on it here can't
+        % reintroduce that bug; it's just reading the previous frame's already-fresh value, same
+        % as side_ax_prev/side_sign above.
+        if ~isempty(branch_side_info) && branch_side_info.active
+            off1 = dot(Sef(1,:) - branch_side_info.c, branch_side_info.n);
+            off2 = dot(Sef(2,:) - branch_side_info.c, branch_side_info.n);
+            if branch_side_info.side * off1 >= branch_side_info.side * off2
+                choice = 1;
+            else
+                choice = 2;
+            end
         end
 
         tip_choice = [dsearchn(boundb,Sef(1,:));dsearchn(boundb,Sef(2,:))];
@@ -2517,23 +2556,60 @@ for count = smp:-1:stp
         % Euclidean anchor. Constrained to land past k_start's own crossing
         % on each side (min_arclen) -- see nearest_crossing_to_sample's
         % min_arclen doc for the hairpin-collapse this guards against.
-        [startc1, startc2] = roi_boundary_crossing(k_start, xc, yc, dx, dy, total1, al1, total2, al2, crossing_window, true);
-        [stopc1,  stopc2]  = roi_boundary_crossing(k_stop,  xc, yc, dx, dy, total1, al1, total2, al2, crossing_window, false, al1(startc1), al2(startc2));
+        % Local, tip-anchored wall arcs (2026-09-30, HV209_116 F512 root-
+        % cause fix, v2): total1/total2 (built far above from a naive
+        % 50/50-by-INDEX bisection of the WHOLE boundary, patched by two
+        % independent rebalancing passes that can fight each other) are
+        % kept as-is for the general diameter-measurement cross-section
+        % search elsewhere in this script, which needs them spanning close
+        % to the whole tube -- but the ROI polygon only ever needs a short
+        % stretch near the tip (0 to stopi, here ~31px), and searching for
+        % ITS crossings within total1/total2 inherits their instability.
+        % v1 of this fix (walk boundb directly between total1/total2's own
+        % crossing indices) only fixed the OUTER polygon: when total1
+        % collapses to a handful of points (confirmed: F512's own mask is a
+        % hard 1px tip-position knife-edge, total1 14pts/total2 471pts),
+        % the crossing SEARCH itself still only had those few collapsed
+        % points to choose from, so the near-tip and far-end crossings
+        % landed on nearly the SAME point -- walking "directly" between two
+        % near-identical points just gave a near-empty arc instead of a
+        % huge one. Root cause is one level further up: total1/total2
+        % themselves. Fix: build a fresh, LOCAL wall pair for the ROI's own
+        % search, by walking boundb outward from the tip in each direction
+        % (excluding the same near-tip radius total1/total2 exclude) far
+        % enough to comfortably cover the ROI's own arc-length window --
+        % this can't collapse the way the global bisection does, since it's
+        % anchored at the tip and only asked to cover a short, fixed
+        % distance, never contended for by a rebalancing pass solving a
+        % DIFFERENT (far-end) problem on the other side of the tube.
+        max_local_arclen = arc_stop_px + 3*diamo;
+        tip_boundpos = dsearchn(boundb, tip_final(count,:));
+        % Direction convention: match whichever of +1/-1 heads toward
+        % total1's own first point, so Half1/Half2 keep the same physical-
+        % side meaning as before (needed for Ratio_Half2_Half1 etc. to stay
+        % interpretable run to run) even though the POINTS now come from a
+        % fresh local walk, not total1/total2 itself.
+        n_bb = size(boundb,1);
+        d_fwd = mod(postotal1(1) - tip_boundpos, n_bb);
+        d_bwd = mod(tip_boundpos - postotal1(1), n_bb);
+        if d_fwd <= d_bwd, dir1 = 1; else, dir1 = -1; end
+        dir2 = -dir1;
+        [wall1_pts, al1_local] = local_wall_walk(boundb, tip_boundpos, dir1, max_local_arclen, diamo*0.75, tip_final(count,:));
+        [wall2_pts, al2_local] = local_wall_walk(boundb, tip_boundpos, dir2, max_local_arclen, diamo*0.75, tip_final(count,:));
 
-        % startc1/stopc1 and startc2/stopc2 are deliberately NOT swapped into
-        % numeric order here (an earlier version of this code did, and it was
-        % wrong -- see ordered_range's own comment for the full writeup: it
-        % broke the pairing between "this side's crossing of the k_start
-        % line" and "this side's crossing of the k_stop line" whenever side1
-        % and side2 happened to be indexed in opposite directions along the
-        % boundary for a given frame). startc1/startc2 always mean "this
-        % side's crossing of the k_start line"; stopc1/stopc2 always mean
-        % "...of the k_stop line" -- ordered_range (used below wherever a
-        % slice is needed) handles whichever index direction that implies
-        % per side, independently.
+        [startc1, startc2] = roi_boundary_crossing(k_start, xc, yc, dx, dy, wall1_pts, al1_local, wall2_pts, al2_local, crossing_window, true);
+        [stopc1,  stopc2]  = roi_boundary_crossing(k_stop,  xc, yc, dx, dy, wall1_pts, al1_local, wall2_pts, al2_local, crossing_window, false, al1_local(startc1), al2_local(startc2));
+        % wall1_pts/wall2_pts are built by walking monotonically outward
+        % from the tip, so arc-length only increases with index -- startc*
+        % (near arc-length 0) is always <= stopc* (near arc-length
+        % arc_stop_px), no direction ambiguity to resolve per side the way
+        % the old total1/total2-based ordered_range needed.
+        wall1_arc = wall1_pts(startc1:stopc1,:);
+        wall2_arc = wall2_pts(startc2:stopc2,:);
         if debug_mode
-            fprintf('F%d: arcs %.1f->%.1f  k:%d->%d  c1:%d->%d  c2:%d->%d\n', ...
-                count,arc_start_px,arc_stop_px,k_start,k_stop,startc1,stopc1,startc2,stopc2);
+            fprintf('F%d: arcs %.1f->%.1f  k:%d->%d  c1:%d->%d  c2:%d->%d  al1:%.1f->%.1f  al2:%.1f->%.1f  n1=%d n2=%d\n', ...
+                count,arc_start_px,arc_stop_px,k_start,k_stop,startc1,stopc1,startc2,stopc2, ...
+                al1_local(startc1),al1_local(stopc1),al2_local(startc2),al2_local(stopc2),numel(al1_local),numel(al2_local));
         end
 
         % tip_boundpos/tip_end1/tip_end2/cap_pts: computed once, up front,
@@ -2561,7 +2637,7 @@ for count = smp:-1:stp
         % normal, split or stationary
         if (ROItype ~= 2 | count == smp)
             if (circle == 0)
-                roi = vertcat(total1(ordered_range(startc1,stopc1),:), total2(flip(ordered_range(startc2,stopc2)),:));
+                roi = vertcat(wall1_arc, flip(wall2_arc));
                 if (starti < tip_excl_dist) roi = vertcat(cap_pts,roi); end
                 F = poly2mask(roi(:,2),roi(:,1),Esize(1),Esize(2));
             else
@@ -2576,8 +2652,8 @@ for count = smp:-1:stp
                 if (circle > 0)
                     stoppos = length(linectf); stopc1 = length(total1); stopc2 = length(total2);
                 end
-                roi1 = vertcat(total1(ordered_range(startc1,stopc1),:), [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
-                roi2 = vertcat(total2(ordered_range(startc2,stopc2),:), [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
+                roi1 = vertcat(wall1_arc, [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
+                roi2 = vertcat(wall2_arc, [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
                 if (starti < tip_excl_dist)
                     % Stitch from the boundary point actually nearest the tip
                     % (tip_boundpos) to whichever element of postotal1/postotal2
@@ -2605,6 +2681,10 @@ for count = smp:-1:stp
                 end
                 F1 = F.*poly2mask(roi1(:,2),roi1(:,1),Esize(1),Esize(2));
                 F2 = F.*poly2mask(roi2(:,2),roi2(:,1),Esize(1),Esize(2));
+                % (2026-09-30: an earlier result-level fallback here --
+                % detect an implausibly large F1/F2 and reclassify by side-
+                % of-centerline -- is superseded by wall1_arc/wall2_arc
+                % above fixing the actual root cause, and was removed.)
                 if debug_mode
                     roi_gap_px = min(pdist2(tip_final(count,:), vertcat(roi1,roi2)));
                     distc_t_unit = 'pct'; if (pixelsize > 0), distc_t_unit = 'um'; end
@@ -3945,6 +4025,45 @@ function r = ordered_range(a, b)
 if a <= b, r = a:b; else, r = a:-1:b; end
 end
 
+function [side_pts, side_arclen] = local_wall_walk(boundb, tip_boundpos, direction, max_arclen, excl_radius, tip_pt)
+% Walks boundb (a closed loop of boundary points, indexed 1..n) outward
+% from tip_boundpos in the given direction (+1 or -1, wrapping), building
+% a fresh, LOCAL wall segment for the ROI's own near-tip crossing search
+% -- see the caller's own doc (HV209_116 F512 root-cause fix, v2) for why
+% this replaced slicing into total1/total2 (built from a naive, far-away
+% bisection of the WHOLE boundary that can collapse near the tip on some
+% frames, corrupting the crossing search itself, not just how the result
+% got walked). Skips the initial stretch within excl_radius of the tip
+% (matching total1/total2's own near-tip exclusion), then accumulates
+% points and their cumulative arc-length (from the first INCLUDED point)
+% until max_arclen is exceeded -- anchored at the tip and asked to cover
+% only a short, fixed distance, so it can't be starved by a DIFFERENT
+% rebalancing problem on the other side of the tube the way total1/total2
+% can.
+n = size(boundb, 1);
+side_pts = zeros(0,2); side_arclen = zeros(0,1);
+idx = tip_boundpos;
+prev_pt = [];
+cum = 0;
+for step = 1:n
+    idx = mod(idx - 1 + direction, n) + 1;
+    pt = boundb(idx,:);
+    if pdist2(pt, tip_pt) <= excl_radius
+        continue;
+    end
+    if isempty(prev_pt)
+        cum = 0;
+    else
+        cum = cum + pdist2(pt, prev_pt);
+    end
+    prev_pt = pt;
+    side_pts(end+1,:) = pt; side_arclen(end+1,1) = cum;
+    if cum > max_arclen
+        break;
+    end
+end
+end
+
 function w = fwhm_cross_section(O_raw, row0, col0, dx_n, dy_n, max_radius)
 % Full-width-at-half-maximum across the tube, measured directly off raw
 % (unmasked) intensity along the perpendicular "diameter line" through
@@ -4968,11 +5087,22 @@ if nargin < 23, forced_tip = []; end % jitter-zone smoothing: use this tip (snap
         % Euclidean anchor. Constrained to land past k_start's own crossing
         % on each side (min_arclen) -- see nearest_crossing_to_sample's
         % min_arclen doc for the hairpin-collapse this guards against.
-        [startc1, startc2] = roi_boundary_crossing(k_start, xc, yc, dx, dy, total1, al1, total2, al2, crossing_window, true);
-        [stopc1,  stopc2]  = roi_boundary_crossing(k_stop,  xc, yc, dx, dy, total1, al1, total2, al2, crossing_window, false, al1(startc1), al2(startc2));
-        % See the reverse pass's own copy of this block (and ordered_range's
-        % comment) for why startc1/stopc1/startc2/stopc2 are NOT swapped into
-        % numeric order here.
+        % Local, tip-anchored wall arcs -- see the reverse pass's own copy
+        % of this block for the full doc (HV209_116 F512 root-cause fix, v2).
+        max_local_arclen = arc_stop_px + 3*diamo;
+        tip_boundpos = dsearchn(boundb, tip_row);
+        n_bb = size(boundb,1);
+        d_fwd = mod(postotal1(1) - tip_boundpos, n_bb);
+        d_bwd = mod(tip_boundpos - postotal1(1), n_bb);
+        if d_fwd <= d_bwd, dir1 = 1; else, dir1 = -1; end
+        dir2 = -dir1;
+        [wall1_pts, al1_local] = local_wall_walk(boundb, tip_boundpos, dir1, max_local_arclen, diamo*0.75, tip_row);
+        [wall2_pts, al2_local] = local_wall_walk(boundb, tip_boundpos, dir2, max_local_arclen, diamo*0.75, tip_row);
+
+        [startc1, startc2] = roi_boundary_crossing(k_start, xc, yc, dx, dy, wall1_pts, al1_local, wall2_pts, al2_local, crossing_window, true);
+        [stopc1,  stopc2]  = roi_boundary_crossing(k_stop,  xc, yc, dx, dy, wall1_pts, al1_local, wall2_pts, al2_local, crossing_window, false, al1_local(startc1), al2_local(startc2));
+        wall1_arc = wall1_pts(startc1:stopc1,:);
+        wall2_arc = wall2_pts(startc2:stopc2,:);
 
         % See the reverse pass's own copy of this block for why this is
         % computed once, up front, and reused for both the outer F polygon
@@ -4985,7 +5115,7 @@ if nargin < 23, forced_tip = []; end % jitter-zone smoothing: use this tip (snap
         end
 
         if (circle == 0)
-            roi = vertcat(total1(ordered_range(startc1,stopc1),:), total2(flip(ordered_range(startc2,stopc2)),:));
+            roi = vertcat(wall1_arc, flip(wall2_arc));
             if (starti < tip_excl_dist), roi = vertcat(cap_pts,roi); end
             F = poly2mask(roi(:,2),roi(:,1),Esize(1),Esize(2));
         else
@@ -5000,8 +5130,8 @@ if nargin < 23, forced_tip = []; end % jitter-zone smoothing: use this tip (snap
             if (circle > 0)
                 stoppos = length(linectf); stopc1 = length(total1); stopc2 = length(total2);
             end
-            roi1 = vertcat(total1(ordered_range(startc1,stopc1),:), [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
-            roi2 = vertcat(total2(ordered_range(startc2,stopc2),:), [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
+            roi1 = vertcat(wall1_arc, [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
+            roi2 = vertcat(wall2_arc, [yc(k_stop:-1:k_start), xc(k_stop:-1:k_start)]);
             if (starti < tip_excl_dist)
                 % cap_pts/end1_at_start already computed above, up front
                 % (shared with the outer F polygon's own patch).
@@ -5011,6 +5141,9 @@ if nargin < 23, forced_tip = []; end % jitter-zone smoothing: use this tip (snap
             end
             F1 = F.*poly2mask(roi1(:,2),roi1(:,1),Esize(1),Esize(2));
             F2 = F.*poly2mask(roi2(:,2),roi2(:,1),Esize(1),Esize(2));
+            % (2026-09-30: the result-level fallback formerly here is
+            % superseded by wall1_arc/wall2_arc above fixing the actual
+            % root cause -- see the reverse pass's own copy of this block.)
         end
 
         if (max(O(:)) <= 255) FO = uint8(F);
