@@ -235,6 +235,24 @@ ellipse_off_count = 0; ellipse_off_frames = [];
 % endpoint with the largest column (the base). 0 = branch_removal's choice as before.
 % Default flipped to ON (2026-09-30): validated across the guard_test comparison runs, kept on ever since.
 if ~exist('qef_by_continuity', 'var'), qef_by_continuity = 1; end
+% Mask dropout (2026-10-02, HV202_1_2_29_cropped F298-F288): when the tube end drops out of the mask for a few frames, the
+% tracker followed the cut edge base-ward and afterwards compared every candidate with that wrong position. Going backward in
+% time the tube end can only retreat by growth, so a frame whose mask leaves the last good tip more than
+% mask_retreat_max_factor * diamo_est outside is a lost frame: it is flagged (results NaN) and the reference tip is kept, for at
+% most mask_retreat_max_frames frames in a row (then the frame is accepted, in case the reference itself was wrong). 0 = off.
+% Re-anchor (2026-10-02, HV204_3 F832-F523): with the ellipse gate off, the vote takes the candidate nearest to the previous tip,
+% so a small error becomes the next frame's reference and the tip walks away (there: off the apex and 30 px down the shank) while
+% the ellipse candidate stays at the true tip; the side memory and the step cap then block the way back. When the accepted tip
+% has been more than reanchor_min_dist_factor * diamo_est from the ellipse candidate for reanchor_frames frames in a row, and the
+% ellipse candidate stayed within reanchor_stable_factor * diamo_est of its own median over those frames, the tip is moved onto
+% the ellipse candidate and the side memory relearns its side. A wandering ellipse pole (hooked/round tips) never qualifies.
+% reanchor_frames = 0 switches it off.
+if ~exist('reanchor_frames', 'var'), reanchor_frames = 10; end
+if ~exist('reanchor_min_dist_factor', 'var'), reanchor_min_dist_factor = 0.4; end
+if ~exist('reanchor_stable_factor', 'var'), reanchor_stable_factor = 0.2; end
+reanchor_hist = zeros(0,2);
+if ~exist('mask_retreat_max_factor', 'var'), mask_retreat_max_factor = 0.5; end
+if ~exist('mask_retreat_max_frames', 'var'), mask_retreat_max_frames = 25; end
 if ~exist('ellipse_first_on_frames', 'var'), ellipse_first_on_frames = 3; end
 ellipse_first_streak = 0;
 % Jitter-zone smoothing (2026-09-25, default OFF): a pass at the END of the run, before the videos are written.
@@ -1962,6 +1980,19 @@ for count = smp:-1:stp
             end
         end
 
+        % Mask dropout (see mask_retreat_max_factor's doc near the top): lost frame, the reference tip is kept.
+        if mask_retreat_max_factor > 0 && isfinite(mask_retreat_max_factor) && ~frame_failed(count)
+            [u_r, u_c] = find(U);
+            retreat_px = min(hypot(u_r - tip_final_last(1), u_c - tip_final_last(2)));
+            if retreat_px > mask_retreat_max_factor * diamo_est && frames_since_last_good <= mask_retreat_max_frames
+                frame_failed(count) = true;
+                if debug_mode
+                    fprintf('  tip F%d: MASK DROPOUT -- last good tip [%d %d] is %.1fpx outside this mask (limit %.1fpx), frame %d of at most %d lost, reference kept\n', ...
+                        count, tip_final_last(1), tip_final_last(2), retreat_px, mask_retreat_max_factor * diamo_est, frames_since_last_good, mask_retreat_max_frames);
+                end
+            end
+        end
+
         % Per-frame step cap (see max_step_um's doc near the top). Applied to
         % whatever tip_final ended up being, whichever path produced it.
         if isfinite(max_step_um) && ~frame_failed(count)
@@ -1975,6 +2006,28 @@ for count = smp:-1:stp
                             count, step_px_now, step_px_now*pixelsize, capped_px);
                     end
                     tip_final(count,:) = tip_capped;
+                end
+            end
+        end
+
+        % Re-anchor (see reanchor_frames' doc near the top): overrides the guards and the step cap above.
+        if reanchor_frames > 0
+            if ellipse_off_frame || frame_failed(count) || pdist2(tip_final(count,:), tip_ellipsef) <= reanchor_min_dist_factor * diamo_est
+                reanchor_hist = zeros(0,2);
+            else
+                reanchor_hist(end+1,:) = tip_ellipsef;
+                if size(reanchor_hist,1) >= reanchor_frames
+                    reanchor_win = reanchor_hist(end-reanchor_frames+1:end,:);
+                    reanchor_spread = max(pdist2(reanchor_win, median(reanchor_win,1)));
+                    if reanchor_spread <= reanchor_stable_factor * diamo_est
+                        if debug_mode
+                            fprintf('  tip F%d: RE-ANCHOR -- tip [%d %d] was %.1fpx from an ellipse candidate that stayed within %.1fpx for %d frames, moved to it [%d %d]\n', ...
+                                count, tip_final(count,1), tip_final(count,2), pdist2(tip_final(count,:), tip_ellipsef), reanchor_spread, reanchor_frames, tip_ellipsef(1), tip_ellipsef(2));
+                        end
+                        tip_final(count,:) = tip_ellipsef;
+                        reanchor_hist = zeros(0,2);
+                        side_sign = 0; side_active = false; % the side was learned from the displaced tip
+                    end
                 end
             end
         end
