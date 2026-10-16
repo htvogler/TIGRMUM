@@ -380,15 +380,16 @@ nudge_max_cand_dist_factor = 0.25; % Freeze breaker (stationary_nudge_um > 0): o
                  % the tip HOLDS -- a genuine growth pause looks exactly like a freeze, and the only
                  % candidate left after the freeze breaker refuses the near ones can be far away on
                  % another part of the tube end (HV209_62 F1883: the corner, 0.4 D away). Inf = no limit.
-side_memory = 1; % Side memory (default 1 = on, 0 = off; rebuilt 2026-09-26): the tip may not cross the tube's
-                 % shank axis -- a straight line fitted to the first straight stretch (>= side_memory_min_len_factor * D) of the
-                 % skeleton path from the previous tip toward the base -- to the side opposite the previous tip by more than
-                 % max(side_memory_tol_min_px, side_memory_tol_factor * D). The first side_memory_skip_factor * D behind the tip is
-                 % skipped, a stretch is straight while its RMS distance to the line is <= side_memory_rms_px, shorter pieces after
-                 % a kink are ignored (at a V-shape only the arm the tip is on counts). side_memory_hyst_factor keeps the old axis
-                 % until its stretch is that many D shorter than the minimum (and switches back only when the nearer stretch is that
-                 % much longer). D = diamo_est. Defaults: 2, 1, 1.5, 0.1, 2, 0.5. Replaces the first side memory (sideways drift
-                 % against an axis through the previous tip, which locked the tip out at turns: HV204_105, HV203_4_21).
+side_memory = 1; % Side memory (default 1 = on, 0 = off): the tip may not cross the tube's shank axis -- a straight
+                 % line fitted to one stretch (>= side_memory_min_len_factor * D long, default 3) of the skeleton path from the
+                 % previous tip toward the base -- to the side opposite the previous tip by more than
+                 % max(side_memory_tol_min_px, side_memory_tol_factor * D) (defaults 2 px, 0.1). Stretches end at kinks = local
+                 % minima/maxima of the path's row or column, after smoothing over side_memory_extrema_smooth_factor * D (1),
+                 % that are at least side_memory_extrema_prominence_factor * D (0.25) prominent; bends turning faster than
+                 % side_memory_bend_thresh_deg_per_D (8 deg per D) over side_memory_bend_min_D (0.3) are merged into one kink zone
+                 % (angle window side_memory_bend_win_factor * D, 0.75). Shorter pieces after a kink are ignored (at a V-shape only
+                 % the arm the tip is on counts). side_memory_hyst_factor (0.5) keeps the old axis until its stretch is that many D
+                 % shorter than the minimum. D = diamo_est. Not set here = defaults.
 
 ellipse_min_ratio = 1.25; % Forced-ratio ellipse candidate (default 1.25, 0 = off): when the fitted ellipse is rounder than this (long/short axis),
                  % the ellipse tip candidate comes from a second ellipse with the ratio fixed at this value, fitted to the same border points.
@@ -399,8 +400,8 @@ ellipse_seed_per_frame = 1; % 1 (default) = seed the random generator with the f
 ellipse_off_when_wide = 1; % 1 (default) = in frames where the ellipse search radius (1.25 * window radius) is already above the cap 2 * diamo_est (tip end wider
                  % than ~2.5 tube widths, HV209_116) the ellipse candidate -- which locate_tip.m would replace by the previous tip -- is left out of the vote, the recovery
                  % pool and the gate; the log ends with the number of such frames. 0 = old behaviour. Stacks that stay within the cap are unchanged.
-qef_by_continuity = 0; % 1 = the ellipse-search seed Qef is the thin-skeleton endpoint nearest to the previous tip (base endpoint excluded) instead of what branch_removal
-                 % leaves (default 0 = off). On a bulb branch_removal flips between a prong pointing at the tip and one high in the bulb (HV209_116 F792/F786/F780).
+qef_by_continuity = 1; % 1 (default) = the ellipse-search seed Qef is the thin-skeleton endpoint nearest to the previous tip (base endpoint excluded) instead of
+                 % what branch_removal leaves; 0 = branch_removal's choice. On a bulb branch_removal flips between a prong pointing at the tip and one high in the bulb (HV209_116 F792/F786/F780).
 ellipse_first_on_frames = 3; % The ellipse-first gate switches ON only after this many consecutive frames with ratio >= ellipse_first_min_ratio
                  % (default 3; 1 = old immediate switch-on). One elongated fit between round ones (HV209_62 F3037) then cannot flip it.
 
@@ -409,10 +410,11 @@ side_memory_windowed = 1; % 1 (default) = the side memory only enforces near a k
                  % side_memory_after_cross_D * D (0.3) of tip travel past that crossing and side_memory_after_fire_D * D (1) of tip travel after it first
                  % refused the tip. Reason: just after a kink the axis line is off-centre by up to ~5 px (HV204_105), so enforcing there could push the tip.
 
-vote_ellipse_first = 1; % 1 (default) = the ellipse candidate always wins the vote; 0 = older continuity-first vote:
-                 % the candidate (ellipse pole, skeleton end, border midpoint) nearest to the previous tip wins. With 1, skeleton/border candidates only enter via the guard recovery pool when the ellipse
-                 % candidate fails a guard. Motivation: on HV200_4_5 the drifting border-midpoint candidate takes
-                 % over from the ellipse pole and walks the tip base-ward.
+vote_ellipse_first = 1; % 1 (default) = while the ellipse gate below is ON the ellipse candidate wins the vote; while it is OFF, and always with 0,
+                 % the candidate (ellipse pole, skeleton end, border midpoint, kept skeleton branch) nearest to the previous tip wins -- the
+                 % ellipse is not left out, it just gets no preference. While the gate is on, skeleton/border candidates only enter via the
+                 % guard recovery pool when the ellipse candidate fails a guard. Motivation: on HV200_4_5 the drifting border-midpoint
+                 % candidate takes over from the ellipse pole and walks the tip base-ward.
 
 ellipse_first_min_ratio = 1.30; % Ellipse gate for vote_ellipse_first: ellipse-first is used only while the ellipse's
 ellipse_first_off_ratio = 1.25; % long/short axis ratio is at least min_ratio (switches OFF again below off_ratio, hysteresis).
@@ -420,10 +422,23 @@ ellipse_first_off_ratio = 1.25; % long/short axis ratio is at least min_ratio (s
                  % tip flicker on HV209_62; there the older nearest-to-previous-tip vote is used. Measured ratios:
                  % HV200_4_5 1.33-1.9, HV209_62 hook 1.02-1.4. Set both to 0 for always-ellipse-first.
 
-jitter_smooth = 0; % Jitter-zone smoothing pass at the end of the run (0 = off). Zones = stretches where the finished tip track
+jitter_smooth = 1; % Jitter-zone smoothing pass at the end of the run (1 = on, default; 0 = off). Zones = stretches where the finished tip track
                  % flickers: >= jitter_zone_min_moves moves of >= jitter_zone_move_px px within any jitter_zone_span
                  % consecutive frames, padded by jitter_zone_pad frames. Tips in a zone become the median of the raw tips in a
                  % centered window of jitter_smooth_window frames, snapped to the mask border; centerline, ROI, diameter,
                  % intensities and video frames of those frames are recomputed. A smoothed tip is never further than the border-drift limit
                  % from the final tip of the previous frame (analysis order). Kymograph lines / arc length are NOT updated.
 jitter_smooth_window = 7; jitter_zone_move_px = 3; jitter_zone_min_moves = 3; jitter_zone_span = 11; jitter_zone_pad = 3;
+
+mask_retreat_max_factor = 0.5; % Mask dropout (default 0.5, 0 = off): a frame whose mask leaves the last good tip more than this
+                 % many D outside is a lost frame (results NaN, reference tip kept) -- the tube end dropped out of the mask
+                 % (HV202_1_2_29_cropped F298-F288). At most mask_retreat_max_frames (25) frames in a row. Known weakness: after
+                 % a stretch where the mask floods a large extra area the reference tip itself can be wrong, and good frames are
+                 % then dropped (HV197_1_20_cropped: ~100 frames).
+mask_retreat_max_frames = 25;
+reanchor_frames = 10; % Re-anchor (default 10, 0 = off): when the accepted tip has been more than reanchor_min_dist_factor * D (0.4)
+                 % from the ellipse candidate for this many frames in a row, and the ellipse candidate stayed within
+                 % reanchor_stable_factor * D (0.2) of its own median, the tip moves onto it (overrides side memory and the
+                 % border-drift limit; the side memory relearns its side). For the gate-off vote walking the tip away from a
+                 % steady ellipse candidate (HV204_3 F832-F523). Fires late on thin tubes (D ~12 px: HV207_58).
+reanchor_min_dist_factor = 0.4; reanchor_stable_factor = 0.2;
