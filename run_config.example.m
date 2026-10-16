@@ -430,12 +430,13 @@ jitter_smooth = 1; % Jitter-zone smoothing pass at the end of the run (1 = on, d
                  % from the final tip of the previous frame (analysis order). Kymograph lines / arc length are NOT updated.
 jitter_smooth_window = 7; jitter_zone_move_px = 3; jitter_zone_min_moves = 3; jitter_zone_span = 11; jitter_zone_pad = 3;
 
-mask_retreat_max_factor = 0.5; % Mask dropout (default 0.5, 0 = off): a frame whose mask leaves the last good tip more than this
-                 % many D outside is a lost frame (results NaN, reference tip kept) -- the tube end dropped out of the mask
-                 % (HV202_1_2_29_cropped F298-F288). At most mask_retreat_max_frames (25) frames in a row. Known weakness: after
-                 % a stretch where the mask floods a large extra area the reference tip itself can be wrong, and good frames are
-                 % then dropped (HV197_1_20_cropped: ~100 frames).
-mask_retreat_max_frames = 25;
+mask_change_max = 0.15; % Mask change check (default 0.15, 0 = off): each frame's mask is compared with the mask of the last good
+                 % frame; more than this share of new area (flood) or of missing area (dropout) makes it a lost frame (results
+                 % NaN, reference tip and mask kept). Clean stacks change by 2-4% per frame, at most ~12% (measured 2026-10-16).
+                 % The comparison is also written to the CSV as Frame_overlap_ratio (1 - the larger change).
+mask_change_max_s = 30; % ... for at most this many seconds in a row; then the frame is accepted and becomes the new reference.
+mask_change_radius_D = 4; % Only the mask within this many tube diameters of the last good tip is compared (Inf = whole mask):
+                 % the tube's far end near the image border can flicker without affecting tip or ROI.
 reanchor_frames = 10; % Re-anchor (default 10, 0 = off): when the accepted tip has been more than reanchor_min_dist_factor * D (0.4)
                  % from the ellipse candidate for this many frames in a row, and the ellipse candidate stayed within
                  % reanchor_stable_factor * D (0.2) of its own median, the tip moves onto it (overrides side memory and the

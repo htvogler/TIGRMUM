@@ -235,11 +235,20 @@ ellipse_off_count = 0; ellipse_off_frames = [];
 % endpoint with the largest column (the base). 0 = branch_removal's choice as before.
 % Default flipped to ON (2026-09-30): validated across the guard_test comparison runs, kept on ever since.
 if ~exist('qef_by_continuity', 'var'), qef_by_continuity = 1; end
-% Mask dropout (2026-10-02, HV202_1_2_29_cropped F298-F288): when the tube end drops out of the mask for a few frames, the
-% tracker followed the cut edge base-ward and afterwards compared every candidate with that wrong position. Going backward in
-% time the tube end can only retreat by growth, so a frame whose mask leaves the last good tip more than
-% mask_retreat_max_factor * diamo_est outside is a lost frame: it is flagged (results NaN) and the reference tip is kept, for at
-% most mask_retreat_max_frames frames in a row (then the frame is accepted, in case the reference itself was wrong). 0 = off.
+% Mask change check (2026-10-16; replaces the 2026-10-02 mask-dropout check, which trusted the last good TIP and dropped good
+% frames after a flood had put that tip somewhere wrong, HV197_1_20_cropped): each frame's mask is compared with the mask of the
+% last GOOD frame. If more than mask_change_max of this frame's mask is new (flood) or more than mask_change_max of the
+% reference mask is missing (dropout, HV202_1_2_29_cropped F298-F288), the frame is a lost frame: results NaN, reference tip and
+% reference mask kept. At most mask_change_max_s seconds in a row; then the frame is accepted and becomes the new reference.
+% Measured 2026-10-16 on growth movies: consecutive frames of clean stacks change by 2-4% (median), at most 12%; real floods and
+% dropouts by 15-100%. The same comparison is written to the CSV as Frame_overlap_ratio (1 - the larger change). 0 = off.
+% Only the mask within mask_change_radius_D tube diameters of the last good tip is compared: the far end of the tube near the
+% image border can flicker in and out of the mask without affecting tip or ROI (HV197_1_20_cropped F6942/F6897: whole-mask
+% comparison dropped those frames although the tip region was unchanged). Inf = whole mask.
+if ~exist('mask_change_max', 'var'), mask_change_max = 0.15; end
+if ~exist('mask_change_radius_D', 'var'), mask_change_radius_D = 4; end
+if ~exist('mask_change_max_s', 'var'), mask_change_max_s = 30; end
+U_ref = [];
 % Re-anchor (2026-10-02, HV204_3 F832-F523): with the ellipse gate off, the vote takes the candidate nearest to the previous tip,
 % so a small error becomes the next frame's reference and the tip walks away (there: off the apex and 30 px down the shank) while
 % the ellipse candidate stays at the true tip; the side memory and the step cap then block the way back. When the accepted tip
@@ -251,8 +260,6 @@ if ~exist('reanchor_frames', 'var'), reanchor_frames = 10; end
 if ~exist('reanchor_min_dist_factor', 'var'), reanchor_min_dist_factor = 0.4; end
 if ~exist('reanchor_stable_factor', 'var'), reanchor_stable_factor = 0.2; end
 reanchor_hist = zeros(0,2);
-if ~exist('mask_retreat_max_factor', 'var'), mask_retreat_max_factor = 0.5; end
-if ~exist('mask_retreat_max_frames', 'var'), mask_retreat_max_frames = 25; end
 if ~exist('ellipse_first_on_frames', 'var'), ellipse_first_on_frames = 3; end
 ellipse_first_streak = 0;
 % Jitter-zone smoothing (2026-09-25, default OFF): a pass at the END of the run, before the videos are written.
@@ -375,7 +382,7 @@ settings_groups = { ...
                                       'ellipse_candidate_max_jump_factor','qef_by_continuity'}; ...
     'Tip Guards',                    {'border_jitter_um','max_step_um','lateral_offset_max_factor','stationary_lock_n_frames', ...
                                       'stationary_pos_eps_px','stationary_diam_eps_px','stationary_nudge_um','nudge_max_cand_dist_factor', ...
-                                      'mask_retreat_max_factor','mask_retreat_max_frames','reanchor_frames','reanchor_min_dist_factor','reanchor_stable_factor'}; ...
+                                      'mask_change_max','mask_change_max_s','mask_change_radius_D','reanchor_frames','reanchor_min_dist_factor','reanchor_stable_factor'}; ...
     'Side Memory',                   {'side_memory','side_memory_windowed','side_memory_min_len_factor','side_memory_extrema_smooth_factor', ...
                                       'side_memory_extrema_prominence_factor','side_memory_bend_win_factor','side_memory_bend_thresh_deg_per_D', ...
                                       'side_memory_bend_min_D','side_memory_tol_factor','side_memory_tol_min_px','side_memory_hyst_factor', ...
@@ -859,15 +866,9 @@ for count = smp:-1:stp
         U_smp_border_rows = find(U(:,end));
     end
 
-    if (count == smp) Ub = logical(ones(size(P)));
-    else Ub = U;
-    end
-        
-    Urat = and(U,Ub);
-    Ucount(count) = nnz(Urat)/nnz(U);
-    if (Ucount(count) < 0.95 || count == smp) last_flag = 0;
-    else last_flag = 1;
-    end
+    % Continue from the previous tip on every frame but the anchor. (Until 2026-10-16 this came from an overlap of U with
+    % itself -- always 1 -- so the behaviour is unchanged; the real overlap is now the mask change check, see mask_change_max.)
+    last_flag = (count ~= smp);
     
     if weak_signal && ~any(U(:,end))
         % No signal reaches the tracking border at all this frame --
@@ -961,10 +962,9 @@ for count = smp:-1:stp
         % on a frame whose raw image was visually identical to its
         % neighbors -- a pure algorithmic failure exposed by walking the
         % entire tube, not a data problem.
-        % Reuses last_flag (Ucount(count)>=0.95, i.e. this frame's mask
-        % overlaps the previous one enough to trust it) as the outer gate --
-        % same signal the codebase already uses to decide tip_final_last is
-        % trustworthy, not a new parallel condition. force_base_walk
+        % Reuses last_flag (true on every frame but the anchor) as the
+        % outer gate -- same signal the codebase already uses to decide
+        % tip_final_last can be used, not a new parallel condition. force_base_walk
         % periodically forces a full walk regardless, to bound slow
         % systematic drift that per-frame jump-checking alone can't catch
         % (each seeded step can look individually fine while still
@@ -1997,15 +1997,28 @@ for count = smp:-1:stp
             end
         end
 
-        % Mask dropout (see mask_retreat_max_factor's doc near the top): lost frame, the reference tip is kept.
-        if mask_retreat_max_factor > 0 && isfinite(mask_retreat_max_factor) && ~frame_failed(count)
-            [u_r, u_c] = find(U);
-            retreat_px = min(hypot(u_r - tip_final_last(1), u_c - tip_final_last(2)));
-            if retreat_px > mask_retreat_max_factor * diamo_est && frames_since_last_good <= mask_retreat_max_frames
-                frame_failed(count) = true;
-                if debug_mode
-                    fprintf('  tip F%d: MASK DROPOUT -- last good tip [%d %d] is %.1fpx outside this mask (limit %.1fpx), frame %d of at most %d lost, reference kept\n', ...
-                        count, tip_final_last(1), tip_final_last(2), retreat_px, mask_retreat_max_factor * diamo_est, frames_since_last_good, mask_retreat_max_frames);
+        % Mask change check (see mask_change_max's doc near the top): lost frame, reference tip and mask are kept.
+        mc_U = []; mc_R = [];
+        if ~isempty(U_ref) && isequal(size(U_ref), size(U))
+            [mc_r, mc_c] = ndgrid(1:size(U,1), 1:size(U,2));
+            mc_near = hypot(mc_r - tip_final_last(1), mc_c - tip_final_last(2)) <= mask_change_radius_D * diamo_est;
+            mc_U = U & mc_near; mc_R = U_ref & mc_near;
+        end
+        if ~isempty(mc_U) && nnz(mc_U) > 0 && nnz(mc_R) > 0
+            mask_new_frac = nnz(mc_U & ~mc_R) / nnz(mc_U);
+            mask_lost_frac = nnz(mc_R & ~mc_U) / nnz(mc_R);
+            Ucount(count) = 1 - max(mask_new_frac, mask_lost_frac);
+            if mask_change_max > 0 && ~frame_failed(count) && max(mask_new_frac, mask_lost_frac) > mask_change_max
+                lost_s = frames_since_last_good * frame_rate;
+                if lost_s <= mask_change_max_s
+                    frame_failed(count) = true;
+                    if debug_mode
+                        fprintf('  tip F%d: MASK CHANGE -- %.0f%% new, %.0f%% missing vs the last good frame (limit %.0f%%), lost (%.1f s of at most %.0f s), reference kept\n', ...
+                            count, 100*mask_new_frac, 100*mask_lost_frac, 100*mask_change_max, lost_s, mask_change_max_s);
+                    end
+                elseif debug_mode
+                    fprintf('  tip F%d: MASK CHANGE -- %.0f%% new, %.0f%% missing, but already %.1f s lost (cap %.0f s): accepted as the new reference\n', ...
+                        count, 100*mask_new_frac, 100*mask_lost_frac, lost_s, mask_change_max_s);
                 end
             end
         end
@@ -2100,6 +2113,9 @@ for count = smp:-1:stp
         stationary_pos_ok_this_frame = exist('tip_final_last', 'var') && ...
             pdist2(tip_final(count,:), tip_final_last) < stationary_pos_eps_px;
         tip_final_last(:,:) = tip_final(count,:);
+        if isempty(U_ref), Ucount(count) = 1; end % anchor frame: it is the reference
+        U_ref = U; % reference mask for the mask change check
+
         frames_since_last_good = 1;
     else
         frames_since_last_good = frames_since_last_good + 1;
